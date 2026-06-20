@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
+from fastapi.responses import JSONResponse
 
+from tradingagents.api.config import ApiConfig, get_config
 from tradingagents.api.domain.services.analysis_service import AnalysisService
-from tradingagents.api.dependencies import get_analysis_service
+from tradingagents.api.domain.services.task_service import TaskService
+from tradingagents.api.dependencies import (
+    get_analysis_service,
+    get_task_manager,
+    get_task_service,
+)
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
+from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
+from tradingagents.api.core.task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +28,15 @@ router = APIRouter(
 )
 
 
+# ---------------------------------------------------------------------------
+# Synchronous analysis endpoint (legacy)
+# ---------------------------------------------------------------------------
+
+
 @router.post(
     "",
     response_model=AnalyzeResponse,
-    summary="Run full analysis pipeline",
+    summary="Run full analysis pipeline (synchronous)",
     description=(
         "Execute the complete multi-agent trading analysis pipeline for a given "
         "ticker and date. This runs all selected analysts, the research debate, "
@@ -42,14 +56,15 @@ router = APIRouter(
         "5. **Risk Management** (aggressive/conservative/neutral) - debate risk factors\n"
         "6. **Portfolio Manager** - produce final trade decision\n\n"
         "Note: This endpoint may take significant time to respond (30s+) depending "
-        "on the LLM provider and analysis depth."
+        "on the LLM provider and analysis depth. "
+        "For async operation, use `POST /analyze/tasks` instead."
     ),
 )
 async def analyze(
     request: AnalyzeRequest,
     analysis_service: AnalysisService = Depends(get_analysis_service),
 ) -> AnalyzeResponse:
-    """Run the full trading analysis pipeline."""
+    """Run the full trading analysis pipeline (synchronous)."""
     # Convert enum values to strings for the service function
     selected = tuple(a.value for a in request.selected_analysts)
 
@@ -61,3 +76,138 @@ async def analyze(
     )
 
     return AnalyzeResponse(**result.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Async task endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tasks",
+    response_model=TaskResponse,
+    summary="Create an analysis task (async)",
+    description=(
+        "Create a new analysis task that runs in the background. "
+        "Returns immediately with a task_id. "
+        "If a task with the same ticker, trade_date, and asset_type is already "
+        "active (pending, queued, or processing), returns the existing task_id instead "
+        "of creating a duplicate.\n\n"
+        "If the task queue is full (task_max_tasks limit exceeded), returns "
+        "429 Too Many Requests.\n\n"
+        "Tasks are queued automatically when concurrency limit is reached. "
+        "Use `GET /analyze/tasks/{task_id}` to check the status and retrieve "
+        "results when completed."
+    ),
+)
+async def create_analysis_task(
+    request: TaskCreateRequest,
+    background_tasks: BackgroundTasks,
+    task_service: TaskService = Depends(get_task_service),
+    task_manager: TaskManager = Depends(get_task_manager),
+    config: ApiConfig = Depends(get_config),
+) -> JSONResponse:
+    """Create an analysis task or return existing one if duplicate."""
+    max_tasks = int(config.config.get("task_max_tasks", 100))
+
+    # Check if queue is full (excluding currently completed/failed tasks)
+    if task_manager.total_task_count >= max_tasks:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": "Task queue is full",
+                "detail": (
+                    f"Maximum task limit ({max_tasks}) reached. "
+                    "Wait for some tasks to complete or delete finished tasks."
+                ),
+            },
+        )
+
+    task, is_new = task_service.create_task(request)
+
+    if is_new:
+        # New task: set status to queued and queue for background execution
+        task_manager.update_task(task.task_id, status=TaskStatus.QUEUED)
+        background_tasks.add_task(
+            task_service.execute_analysis,
+            task.task_id,
+            request,
+        )
+        status_code = status.HTTP_202_ACCEPTED
+    else:
+        # Existing active task found: return it without queuing
+        status_code = status.HTTP_200_OK
+
+    return JSONResponse(
+        status_code=status_code,
+        content=task.model_dump(mode="json"),
+    )
+
+
+@router.get(
+    "/tasks",
+    response_model=list[TaskResponse],
+    summary="List analysis tasks",
+    description="List analysis tasks with optional filters for status and ticker.",
+)
+async def list_analysis_tasks(
+    status_filter: TaskStatus | None = Query(
+        default=None,
+        alias="status",
+        description="Filter by task status",
+    ),
+    ticker: str | None = Query(
+        default=None,
+        description="Filter by ticker symbol",
+    ),
+    task_service: TaskService = Depends(get_task_service),
+) -> list[TaskResponse]:
+    """List analysis tasks with optional filters."""
+    return task_service.list_tasks(status=status_filter, ticker=ticker)
+
+
+@router.get(
+    "/tasks/{task_id}",
+    response_model=TaskResponse,
+    summary="Get analysis task status",
+    description=(
+        "Get the current status and result of an analysis task. "
+        "Poll this endpoint until status is 'completed' or 'failed'."
+    ),
+)
+async def get_analysis_task(
+    task_id: str,
+    task_service: TaskService = Depends(get_task_service),
+) -> TaskResponse:
+    """Get the status and result of an analysis task."""
+    task = task_service.get_task(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+    return task
+
+
+@router.delete(
+    "/tasks/{task_id}",
+    summary="Delete an analysis task",
+    description=(
+        "Delete an analysis task. "
+        "Warning: Deleting a queued/processing task will not stop the "
+        "background execution, but the result will be discarded."
+    ),
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_analysis_task(
+    task_id: str,
+    task_service: TaskService = Depends(get_task_service),
+) -> Response:
+    """Delete an analysis task."""
+    deleted = task_service.delete_task(task_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
