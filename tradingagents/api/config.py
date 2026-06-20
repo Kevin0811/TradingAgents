@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.default_api_config import DEFAULT_API_CONFIG
 
 
 class ApiConfig:
@@ -17,10 +18,12 @@ class ApiConfig:
     def __init__(self, overrides: dict[str, Any] | None = None):
         """Initialize API configuration.
 
+        Merges core DEFAULT_CONFIG with API-specific DEFAULT_API_CONFIG.
+
         Args:
             overrides: Optional dict to override default config values.
         """
-        self._config: dict[str, Any] = {**DEFAULT_CONFIG}
+        self._config: dict[str, Any] = {**DEFAULT_CONFIG, **DEFAULT_API_CONFIG}
         if overrides:
             self._config.update(overrides)
 

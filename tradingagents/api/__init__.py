@@ -30,6 +30,11 @@ from tradingagents.api.core.exceptions import (
     TradingAgentsAPIError,
 )
 
+# Task management exports
+from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.domain.services.task_service import TaskService
+from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
+
 # Domain exports
 from tradingagents.api.domain.entities import (
     AnalysisResult,
@@ -45,6 +50,7 @@ from tradingagents.api.domain.services import (
     AnalystService,
     DecisionService,
     MarketDataService,
+    TaskService,
 )
 
 # Infrastructure exports
@@ -73,8 +79,14 @@ __all__ = [
     "AnalystService",
     "DecisionService",
     "MarketDataService",
+    "TaskService",
     # Infrastructure
     "AgentFactory",
     "FileStateRepository",
     "LLMProviderFactory",
+    # Task management
+    "TaskManager",
+    "TaskCreateRequest",
+    "TaskResponse",
+    "TaskStatus",
 ]
