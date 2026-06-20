@@ -39,6 +39,7 @@ dev = [
     "ruff>=0.15",
     "pytest>=8.0",
     "pytest-subtests>=0.13",
+    "pytest-asyncio>=0.24.0",
 ]
 api = [
     "fastapi>=0.115.0",
@@ -66,10 +67,12 @@ markers = [
     "unit: fast isolated unit tests",
     "integration: tests requiring external services",
     "smoke: quick sanity-check tests",
+    "asyncio: async tests with pytest-asyncio",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
