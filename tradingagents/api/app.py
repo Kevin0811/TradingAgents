@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI
 
 from tradingagents.api.config import ApiConfig, get_config, set_config
+from tradingagents.api.core.error_handlers import register_exception_handlers
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,9 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
         openapi_url=f"/api/{api_version}/openapi.json",
     )
     app.state.api_config = config
+
+    # Register global exception handlers
+    register_exception_handlers(app)
 
     # Include routers with versioned prefix
     app.include_router(analyze_router, prefix=f"/api/{api_version}")

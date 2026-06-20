@@ -1,4 +1,8 @@
-"""FastAPI dependency injection for the TradingAgents API."""
+"""FastAPI dependency injection for the TradingAgents API.
+
+This module provides dependency providers for FastAPI, creating
+service instances using the infrastructure layer.
+"""
 
 from __future__ import annotations
 
@@ -7,155 +11,81 @@ from typing import Any
 
 from fastapi import Depends
 
-from tradingagents.agents import (
-    create_fundamentals_analyst,
-    create_market_analyst,
-    create_news_analyst,
-    create_sentiment_analyst,
-)
 from tradingagents.api.config import ApiConfig, get_config
-from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.llm_clients import create_llm_client
+from tradingagents.api.domain.services.analysis_service import AnalysisService
+from tradingagents.api.domain.services.analyst_service import AnalystService
+from tradingagents.api.domain.services.decision_service import DecisionService
+from tradingagents.api.domain.services.market_data_service import MarketDataService
+from tradingagents.api.domain.repositories import StateRepository
+from tradingagents.api.infrastructure.llm_provider import LLMProviderFactory
+from tradingagents.api.infrastructure.repositories.file_state_repository import FileStateRepository
 
 
 # ---------------------------------------------------------------------------
-# LLM client dependencies
+# Infrastructure dependencies
 # ---------------------------------------------------------------------------
 
 
-@lru_cache
-def get_llm_deep(
+def get_llm_provider_factory(
     config: ApiConfig = Depends(get_config),
-) -> Any:
-    """Create a deep-thinking LLM client."""
-    llm_kwargs = _get_provider_kwargs(config.config)
-    client = create_llm_client(
-        provider=config.llm_provider,
-        model=config.config.get("deep_thinkllm", config.config.get("deep_think_lmm", "o3-mini")),
-        base_url=config.config.get("backend_url"),
-        **llm_kwargs,
-    )
-    return client.get_llm()
+) -> LLMProviderFactory:
+    """Create an LLM provider factory."""
+    return LLMProviderFactory(config=config.config)
 
 
-@lru_cache
-def get_llm_quick(
+def get_state_repository(
     config: ApiConfig = Depends(get_config),
-) -> Any:
-    """Create a quick-thinking LLM client."""
-    llm_kwargs = _get_provider_kwargs(config.config)
-    client = create_llm_client(
-        provider=config.llm_provider,
-        model=config.config.get("quick_think_llm", "gpt-4o-mini"),
-        base_url=config.config.get("backend_url"),
-        **llm_kwargs,
-    )
-    return client.get_llm()
-
-
-def _get_provider_kwargs(config: dict[str, Any]) -> dict[str, Any]:
-    """Extract provider-specific kwargs from config."""
-    kwargs = {}
-    provider = config.get("llm_provider", "").lower()
-
-    if provider == "google":
-        thinking_level = config.get("google_thinking_level")
-        if thinking_level:
-            kwargs["thinking_level"] = thinking_level
-    elif provider == "openai":
-        reasoning_effort = config.get("openai_reasoning_effort")
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-    elif provider == "anthropic":
-        effort = config.get("anthropic_effort")
-        if effort:
-            kwargs["effort"] = effort
-
-    temperature = config.get("temperature")
-    if temperature is not None and temperature != "":
-        kwargs["temperature"] = float(temperature)
-
-    return kwargs
+) -> StateRepository:
+    """Create a file-based state repository."""
+    return FileStateRepository(results_dir=config.results_dir)
 
 
 # ---------------------------------------------------------------------------
-# Analyst dependencies
+# Domain service dependencies
 # ---------------------------------------------------------------------------
 
 
-def get_market_analyst(
+def get_analysis_service(
     config: ApiConfig = Depends(get_config),
-) -> callable:
-    """Create a market analyst node factory."""
-    from tradingagents.api.services import _create_market_analyst_node
-    llm_kwargs = _get_provider_kwargs(config.config)
-    client = create_llm_client(
-        provider=config.llm_provider,
-        model=config.config.get("deep_think_llm", "o3-mini"),
-        base_url=config.config.get("backend_url"),
-        **llm_kwargs,
-    )
-    return lambda: _create_market_analyst_node(client.get_llm())
-
-
-def get_sentiment_analyst(
-    config: ApiConfig = Depends(get_config),
-) -> callable:
-    """Create a sentiment analyst node factory."""
-    llm_kwargs = _get_provider_kwargs(config.config)
-    client = create_llm_client(
-        provider=config.llm_provider,
-        model=config.config.get("deep_think_llm", "o3-mini"),
-        base_url=config.config.get("backend_url"),
-        **llm_kwargs,
-    )
-    return lambda: create_sentiment_analyst(client.get_llm())
-
-
-def get_news_analyst(
-    config: ApiConfig = Depends(get_config),
-) -> callable:
-    """Create a news analyst node factory."""
-    llm_kwargs = _get_provider_kwargs(config.config)
-    client = create_llm_client(
-        provider=config.llm_provider,
-        model=config.config.get("deep_think_llm", "o3-mini"),
-        base_url=config.config.get("backend_url"),
-        **llm_kwargs,
-    )
-    return lambda: create_news_analyst(client.get_llm())
-
-
-def get_fundamentals_analyst(
-    config: ApiConfig = Depends(get_config),
-) -> callable:
-    """Create a fundamentals analyst node factory."""
-    llm_kwargs = _get_provider_kwargs(config.config)
-    client = create_llm_client(
-        provider=config.llm_provider,
-        model=config.config.get("deep_think_llm", "o3-mini"),
-        base_url=config.config.get("backend_url"),
-        **llm_kwargs,
-    )
-    return lambda: create_fundamentals_analyst(client.get_llm())
-
-
-# ---------------------------------------------------------------------------
-# Graph dependency
-# ---------------------------------------------------------------------------
-
-
-def get_trading_graph(
-    config: ApiConfig = Depends(get_config),
-) -> TradingAgentsGraph:
-    """Create a TradingAgentsGraph instance.
-
-    Note: This creates a new graph on each call. For production, consider
-    caching or using a singleton pattern.
-    """
-    return TradingAgentsGraph(
-        selected_analysts=("market", "social", "news", "fundamentals"),
+) -> AnalysisService:
+    """Create an analysis service."""
+    return AnalysisService(
+        config=config.config,
         debug=config.debug,
+    )
+
+
+def get_llm_factory(
+    config: ApiConfig = Depends(get_config),
+) -> callable:
+    """Create an LLM factory function for AnalystService.
+    
+    Uses .env configuration via DEFAULT_CONFIG.
+    """
+    # LLMProviderFactory now uses DEFAULT_CONFIG (.env) by default
+    # Pass config.config only if you want to override .env settings
+    provider = LLMProviderFactory()
+    return provider.create_llm
+
+
+def get_analyst_service(
+    llm_factory: callable = Depends(get_llm_factory),
+    config: ApiConfig = Depends(get_config),
+) -> AnalystService:
+    """Create an analyst service."""
+    return AnalystService(
+        llm_factory=llm_factory,
         config=config.config,
     )
+
+
+def get_market_data_service() -> MarketDataService:
+    """Create a market data service."""
+    return MarketDataService()
+
+
+def get_decision_service(
+    state_repo: StateRepository = Depends(get_state_repository),
+) -> DecisionService:
+    """Create a decision service."""
+    return DecisionService(state_repository=state_repo)

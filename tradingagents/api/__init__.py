@@ -6,6 +6,13 @@ This module provides HTTP endpoints for:
 - Querying market data and fundamentals
 - Retrieving structured trading decisions
 
+Architecture:
+    The API follows Clean Architecture principles with the following layers:
+    - Core: Global exceptions, error handlers, middlewares
+    - Domain: Business logic (services), entities, repository interfaces
+    - Infrastructure: LLM provider, agent factory, repository implementations
+    - Interface: FastAPI routers, request/response schemas
+
 Usage:
     from tradingagents.api import create_app
 
@@ -16,4 +23,58 @@ Usage:
 
 from tradingagents.api.app import create_app
 
-__all__ = ["create_app"]
+# Core exports
+from tradingagents.api.core.exceptions import (
+    AnalysisError,
+    DataNotFoundError,
+    TradingAgentsAPIError,
+)
+
+# Domain exports
+from tradingagents.api.domain.entities import (
+    AnalysisResult,
+    AnalystReport,
+    DecisionState,
+    MarketData,
+)
+from tradingagents.api.domain.repositories import StateRepository
+
+# Service exports
+from tradingagents.api.domain.services import (
+    AnalysisService,
+    AnalystService,
+    DecisionService,
+    MarketDataService,
+)
+
+# Infrastructure exports
+from tradingagents.api.infrastructure import (
+    AgentFactory,
+    FileStateRepository,
+    LLMProviderFactory,
+)
+
+__all__ = [
+    # App factory
+    "create_app",
+    # Exceptions
+    "AnalysisError",
+    "DataNotFoundError",
+    "TradingAgentsAPIError",
+    # Entities
+    "AnalysisResult",
+    "AnalystReport",
+    "DecisionState",
+    "MarketData",
+    # Repository interfaces
+    "StateRepository",
+    # Services
+    "AnalysisService",
+    "AnalystService",
+    "DecisionService",
+    "MarketDataService",
+    # Infrastructure
+    "AgentFactory",
+    "FileStateRepository",
+    "LLMProviderFactory",
+]
