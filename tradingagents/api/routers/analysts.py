@@ -4,75 +4,19 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends
 
-from tradingagents.api.config import get_config
-from tradingagents.api.schemas import (
-    AnalystReportResponse,
-    ErrorResponse,
-    SingleAnalystRequest,
-)
-from tradingagents.api.services import (
-    run_fundamentals_analyst,
-    run_market_analyst,
-    run_news_analyst,
-    run_sentiment_analyst,
-)
+from tradingagents.api.domain.services.analyst_service import AnalystService
+from tradingagents.api.dependencies import get_analyst_service
+from tradingagents.api.schemas.request import SingleAnalystRequest
+from tradingagents.api.schemas.response import AnalystReportResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/analysts",
     tags=["Analysts"],
-    responses={500: {"model": ErrorResponse, "description": "Internal server error"}},
 )
-
-# Map of analyst type to service function
-ANALYST_SERVICES = {
-    "market": run_market_analyst,
-    "sentiment": run_sentiment_analyst,
-    "news": run_news_analyst,
-    "fundamentals": run_fundamentals_analyst,
-}
-
-
-def _run_analyst(analyst_type: str, request: SingleAnalystRequest) -> AnalystReportResponse:
-    """Run a single analyst.
-
-    Args:
-        analyst_type: Type of analyst to run.
-        request: Analyst request parameters.
-
-    Returns:
-        Analyst report response.
-
-    Raises:
-        HTTPException: If analyst type is unknown or execution fails.
-    """
-    try:
-        config = get_config()
-        service = ANALYST_SERVICES.get(analyst_type)
-
-        if service is None:
-            raise ValueError(f"Unknown analyst type: {analyst_type}")
-
-        result = service(
-            ticker=request.ticker,
-            trade_date=request.trade_date,
-            asset_type=request.asset_type.value,
-            config=config.config,
-        )
-
-        return AnalystReportResponse(**result)
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception(
-            "%s analyst failed for %s on %s",
-            analyst_type, request.ticker, request.trade_date,
-        )
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post(
@@ -82,12 +26,30 @@ def _run_analyst(analyst_type: str, request: SingleAnalystRequest) -> AnalystRep
     description=(
         "Run the market analyst to analyze technical indicators, price action, "
         "and market conditions. The analyst selects relevant indicators and "
-        "produces a detailed market report."
+        "produces a detailed market report.\n\n"
+        "**Parameters:**\n"
+        "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
+        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def market_analyst(request: SingleAnalystRequest) -> AnalystReportResponse:
+async def market_analyst(
+    request: SingleAnalystRequest,
+    analyst_service: AnalystService = Depends(get_analyst_service),
+) -> AnalystReportResponse:
     """Run market analysis."""
-    return _run_analyst("market", request)
+    report = analyst_service.run_analyst(
+        analyst_type="market",
+        ticker=request.ticker,
+        trade_date=request.trade_date,
+        asset_type=request.asset_type.value,
+    )
+    return AnalystReportResponse(
+        ticker=report.ticker,
+        trade_date=report.trade_date,
+        analyst_type=report.analyst_type,
+        report=report.report_content,
+    )
 
 
 @router.post(
@@ -97,12 +59,30 @@ async def market_analyst(request: SingleAnalystRequest) -> AnalystReportResponse
     description=(
         "Run the sentiment analyst to analyze social media, stocktwits, and "
         "other sentiment sources. Produces an overall sentiment band, score, "
-        "confidence level, and detailed narrative."
+        "confidence level, and detailed narrative.\n\n"
+        "**Parameters:**\n"
+        "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
+        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def sentiment_analyst(request: SingleAnalystRequest) -> AnalystReportResponse:
+async def sentiment_analyst(
+    request: SingleAnalystRequest,
+    analyst_service: AnalystService = Depends(get_analyst_service),
+) -> AnalystReportResponse:
     """Run sentiment analysis."""
-    return _run_analyst("sentiment", request)
+    report = analyst_service.run_analyst(
+        analyst_type="sentiment",
+        ticker=request.ticker,
+        trade_date=request.trade_date,
+        asset_type=request.asset_type.value,
+    )
+    return AnalystReportResponse(
+        ticker=report.ticker,
+        trade_date=report.trade_date,
+        analyst_type=report.analyst_type,
+        report=report.report_content,
+    )
 
 
 @router.post(
@@ -112,12 +92,30 @@ async def sentiment_analyst(request: SingleAnalystRequest) -> AnalystReportRespo
     description=(
         "Run the news analyst to analyze news articles, insider transactions, "
         "and macro indicators. Produces a comprehensive news report with "
-        "actionable insights."
+        "actionable insights.\n\n"
+        "**Parameters:**\n"
+        "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
+        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def news_analyst(request: SingleAnalystRequest) -> AnalystReportResponse:
+async def news_analyst(
+    request: SingleAnalystRequest,
+    analyst_service: AnalystService = Depends(get_analyst_service),
+) -> AnalystReportResponse:
     """Run news analysis."""
-    return _run_analyst("news", request)
+    report = analyst_service.run_analyst(
+        analyst_type="news",
+        ticker=request.ticker,
+        trade_date=request.trade_date,
+        asset_type=request.asset_type.value,
+    )
+    return AnalystReportResponse(
+        ticker=report.ticker,
+        trade_date=report.trade_date,
+        analyst_type=report.analyst_type,
+        report=report.report_content,
+    )
 
 
 @router.post(
@@ -127,9 +125,27 @@ async def news_analyst(request: SingleAnalystRequest) -> AnalystReportResponse:
     description=(
         "Run the fundamentals analyst to analyze financial statements, "
         "balance sheets, cashflow, and income statements. Produces a detailed "
-        "fundamentals report with valuation insights."
+        "fundamentals report with valuation insights.\n\n"
+        "**Parameters:**\n"
+        "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
+        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def fundamentals_analyst(request: SingleAnalystRequest) -> AnalystReportResponse:
+async def fundamentals_analyst(
+    request: SingleAnalystRequest,
+    analyst_service: AnalystService = Depends(get_analyst_service),
+) -> AnalystReportResponse:
     """Run fundamentals analysis."""
-    return _run_analyst("fundamentals", request)
+    report = analyst_service.run_analyst(
+        analyst_type="fundamentals",
+        ticker=request.ticker,
+        trade_date=request.trade_date,
+        asset_type=request.asset_type.value,
+    )
+    return AnalystReportResponse(
+        ticker=report.ticker,
+        trade_date=report.trade_date,
+        analyst_type=report.analyst_type,
+        report=report.report_content,
+    )
