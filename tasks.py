@@ -10,11 +10,12 @@ Usage:
     invoke api -r               # start API server with auto-reload
     invoke test                 # run test suite
     invoke test-unit            # run unit tests only
+    invoke test-api             # run API tests only
     invoke docker               # run with Docker
     invoke env                  # copy .env.example to .env
 """
 
-from invoke import task
+from invoke.tasks import task
 import os
 import sys
 
@@ -174,6 +175,12 @@ def test_integration(c):
 def test_smoke(c):
     """Run smoke tests only."""
     c.run("python -m pytest tests/ -v -m smoke")
+
+
+@task
+def test_api(c):
+    """Run API tests only."""
+    c.run("python -m pytest tests/ -v -k test_api")
 
 
 # ---------------------------------------------------------------------------
