@@ -198,8 +198,9 @@ class TaskManager:
             if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                 if task.completed_at and task.completed_at < cutoff:
                     to_remove.append(task_id)
-            elif task.status == TaskStatus.PENDING:
-                # Clean up stale pending tasks (older than TTL)
+            elif task.status == TaskStatus.PENDING and self._ttl > 0:
+                # Only clean up stale pending tasks when TTL is enabled
+                # Avoids removing freshly created tasks when ttl=0 (test scenarios)
                 if task.created_at < cutoff:
                     to_remove.append(task_id)
 
