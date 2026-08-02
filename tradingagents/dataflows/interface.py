@@ -165,6 +165,13 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+# Routing sentinels. The agent path consumes these as prose, so they are
+# returned rather than raised; callers that need typed failures (the HTTP API)
+# match on these prefixes. Kept as constants so both sides cannot drift.
+NO_DATA_SENTINEL = "NO_DATA_AVAILABLE:"
+UNAVAILABLE_SENTINEL = "DATA_UNAVAILABLE:"
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support."""
     category = get_category_for_method(method)
@@ -240,7 +247,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         # coverage, or stale data — not just a generic "unavailable".
         reason = f" ({last_no_data.detail})" if last_no_data.detail else ""
         return (
-            f"NO_DATA_AVAILABLE: No usable market data for '{sym}'{resolved} from "
+            f"{NO_DATA_SENTINEL} No usable market data for '{sym}'{resolved} from "
             f"any configured vendor{reason}. The symbol may be invalid, delisted, "
             f"not covered, or the vendor returned stale data. Do not estimate or "
             f"fabricate values — report that data is unavailable for this symbol."
@@ -254,7 +261,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         if category in OPTIONAL_CATEGORIES:
             logger.warning("Optional %s unavailable for %s: %s", category, method, first_error)
             return (
-                f"DATA_UNAVAILABLE: optional {category} could not be retrieved "
+                f"{UNAVAILABLE_SENTINEL} optional {category} could not be retrieved "
                 f"({first_error}). Proceed without it; do not fabricate values."
             )
         raise first_error

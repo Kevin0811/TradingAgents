@@ -25,41 +25,39 @@ class ReportType(str, Enum):
     """Type of fundamental data to retrieve."""
 
     ALL = "all"
+    OVERVIEW = "overview"
     BALANCE_SHEET = "balance_sheet"
     CASHFLOW = "cashflow"
     INCOME_STATEMENT = "income_statement"
 
 
-class Country(str, Enum):
-    """Country codes for global news and macro indicators."""
+class ReportFreq(str, Enum):
+    """Reporting frequency for financial statements."""
 
-    US = "US"
-    CN = "CN"
-    JP = "JP"
-    GB = "GB"
-    DE = "DE"
-    FR = "FR"
-    TW = "TW"
-    KR = "KR"
-    SG = "SG"
+    ANNUAL = "annual"
+    QUARTERLY = "quarterly"
 
 
 class IndicatorName(str, Enum):
-    """Common technical indicator names."""
+    """Technical indicator names accepted by the data vendors.
 
-    RSI = "rsi"
-    MACD = "macd"
-    SIGNAL = "signal"
-    HISTOGRAM = "histogram"
+    These are the exact keys both vendor implementations key off — see
+    ``best_ind_params`` in ``dataflows/y_finance.py`` and
+    ``supported_indicators`` in ``dataflows/alpha_vantage_indicator.py``.
+    Anything outside this set is rejected by the vendor, so the enum must
+    track it rather than invent friendlier aliases.
+    """
+
     CLOSE_50_SMA = "close_50_sma"
     CLOSE_200_SMA = "close_200_sma"
-    CLOSE_10_SMA = "close_10_sma"
-    CLOSE_20_SMA = "close_20_sma"
-    BOLLINGER_UPPER = "bollinger_upper"
-    BOLLINGER_MIDDLE = "bollinger_middle"
-    BOLLINGER_LOWER = "bollinger_lower"
-    VOLUME = "volume"
+    CLOSE_10_EMA = "close_10_ema"
+    MACD = "macd"
+    MACDS = "macds"
+    MACDH = "macdh"
+    RSI = "rsi"
+    BOLL = "boll"
+    BOLL_UB = "boll_ub"
+    BOLL_LB = "boll_lb"
     ATR = "atr"
-    ADX = "adx"
-    STOCH_K = "stoch_k"
-    STOCH_D = "stoch_d"
+    VWMA = "vwma"
+    MFI = "mfi"  # yfinance only

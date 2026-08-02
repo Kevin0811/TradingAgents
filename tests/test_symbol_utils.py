@@ -6,6 +6,7 @@ import pytest
 
 from tradingagents.dataflows.symbol_utils import (
     NoMarketDataError,
+    bare_crypto_to_pair,
     crypto_base,
     is_yahoo_safe,
     normalize_symbol,
@@ -96,6 +97,26 @@ class TestCryptoBase(unittest.TestCase):
         # crypto_base is the shared primitive behind the -USD normalization.
         self.assertEqual(normalize_symbol("BTCUSD"), "BTC-USD")
         self.assertEqual(crypto_base("BTCUSD"), "BTC")
+
+
+@pytest.mark.unit
+class TestBareCryptoToPair(unittest.TestCase):
+    """Opt-in convenience for callers that know the input is a coin."""
+
+    def test_resolves_bare_bases(self):
+        self.assertEqual(bare_crypto_to_pair("BTC"), "BTC-USD")
+        self.assertEqual(bare_crypto_to_pair("eth"), "ETH-USD")
+        self.assertEqual(bare_crypto_to_pair("  SOL  "), "SOL-USD")
+        self.assertEqual(bare_crypto_to_pair("BTC+"), "BTC-USD")
+
+    def test_non_bases_return_none(self):
+        for raw in ("AAPL", "BTC-USD", "BTCUSD", "EURUSD", "GOLD", "", None):
+            self.assertIsNone(bare_crypto_to_pair(raw))
+
+    def test_normalize_symbol_still_leaves_bare_bases_alone(self):
+        # Deliberate: BTC is also a listed spot-bitcoin ETF, so the global
+        # normalizer must not rewrite it. Only opt-in callers get the coin.
+        self.assertEqual(normalize_symbol("BTC"), "BTC")
 
 
 if __name__ == "__main__":

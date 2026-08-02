@@ -101,6 +101,21 @@ def _normalize_crypto(s: str) -> str | None:
     return f"{base}-USD" if base else None
 
 
+def bare_crypto_to_pair(raw: str) -> str | None:
+    """Return ``<BASE>-USD`` for an unquoted crypto base like ``BTC``, else None.
+
+    ``normalize_symbol`` deliberately leaves a bare base alone: several of them
+    double as real exchange tickers (``BTC`` is a listed spot-bitcoin ETF), so
+    rewriting them globally would misprice equity requests. Callers that know
+    their input is a crypto asset — the HTTP API, where a user typing ``BTC``
+    plainly means the coin — can opt in to this convenience explicitly.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().upper().rstrip("+")
+    return f"{s}-USD" if s in _CRYPTO_BASES else None
+
+
 def normalize_symbol(raw: str) -> str:
     """Map a user/broker symbol to its canonical Yahoo Finance symbol.
 
