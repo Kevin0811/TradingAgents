@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # Re-use structured schemas from agents package
 from tradingagents.agents.schemas import (
@@ -55,18 +55,69 @@ class AnalyzeResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class OHLCVBar(BaseModel):
+    """A single price observation.
+
+    Extra keys are allowed on purpose: vendors carry their own columns
+    (``dividends``, ``split_coefficient``, ...) and dropping them would lose
+    data the caller asked for. ``date`` plus OHLCV are the guaranteed fields.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    date: str
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
+    volume: float | None = None
+    adj_close: float | None = None
+
+
 class StockDataResponse(BaseModel):
     """Stock OHLCV data response."""
 
-    ticker: str
-    data: str | None = None  # CSV format
+    ticker: str = Field(description="Ticker exactly as requested")
+    symbol: str = Field(description="Canonical symbol the vendor was queried with")
+    start_date: str
+    end_date: str
+    count: int
+    rows: list[OHLCVBar] = Field(default_factory=list)
+
+
+class IndicatorPoint(BaseModel):
+    """One indicator observation.
+
+    ``value`` is null when the vendor reported a placeholder instead of a
+    number (a non-trading day, or a window where the indicator is undefined);
+    the placeholder text is kept in ``note`` so the reason is not lost.
+    """
+
+    date: str
+    value: float | None = None
+    note: str | None = None
+
+
+class IndicatorSeries(BaseModel):
+    """One indicator's values over the requested window."""
+
+    name: str
+    description: str | None = None
+    points: list[IndicatorPoint] = Field(default_factory=list)
 
 
 class IndicatorsResponse(BaseModel):
     """Technical indicators response."""
 
-    ticker: str
-    indicators: str | None = None  # CSV format
+    ticker: str = Field(description="Ticker exactly as requested")
+    symbol: str = Field(description="Canonical symbol the vendor was queried with")
+    trade_date: str
+    look_back_days: int
+    indicators: list[IndicatorSeries] = Field(default_factory=list)
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Per-indicator failures, e.g. an unsupported indicator name",
+    )
 
 
 class FundamentalsResponse(BaseModel):
@@ -83,17 +134,24 @@ class NewsResponse(BaseModel):
     news_items: list[dict] | str | None = None
 
 
+class GlobalNewsResponse(BaseModel):
+    """Global/macro market news response."""
+
+    trade_date: str
+    news_items: str | None = None
+
+
 class MacroIndicatorsResponse(BaseModel):
     """Macro indicators response."""
 
-    country: str
+    indicator: str
     data: str | None = None
 
 
 class PredictionMarketsResponse(BaseModel):
     """Prediction market data response."""
 
-    ticker: str
+    topic: str
     markets: str | None = None
 
 

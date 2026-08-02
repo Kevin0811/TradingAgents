@@ -15,13 +15,14 @@ from pydantic import ValidationError
 from tradingagents.api.schemas.enums import (
     AnalystType,
     AssetType,
-    Country,
     IndicatorName,
+    ReportFreq,
     ReportType,
 )
 from tradingagents.api.schemas.request import (
     AnalyzeRequest,
     FundamentalsRequest,
+    GlobalNewsRequest,
     IndicatorsRequest,
     MacroIndicatorsRequest,
     NewsRequest,
@@ -32,6 +33,7 @@ from tradingagents.api.schemas.request import (
 from tradingagents.api.schemas.response import (
     AnalyzeResponse,
     FundamentalsResponse,
+    GlobalNewsResponse,
     IndicatorsResponse,
     MacroIndicatorsResponse,
     NewsResponse,
@@ -104,11 +106,9 @@ class TestReportTypeEnum:
 
 
 @pytest.mark.unit
-class TestCountryEnum:
-    def test_all_country_values(self):
-        expected = {"US", "CN", "JP", "GB", "DE", "FR", "TW", "KR", "SG"}
-        actual = {c.value for c in Country}
-        assert actual == expected
+class TestReportFreqEnum:
+    def test_values(self):
+        assert {f.value for f in ReportFreq} == {"annual", "quarterly"}
 
 
 @pytest.mark.unit
@@ -119,11 +119,19 @@ class TestIndicatorNameEnum:
     def test_macd_value(self):
         assert IndicatorName.MACD.value == "macd"
 
-    def test_bollinger_upper_value(self):
-        assert IndicatorName.BOLLINGER_UPPER.value == "bollinger_upper"
+    def test_values_match_vendor_keys(self):
+        """The enum must track the vendors' own indicator keys exactly.
 
-    def test_volume_value(self):
-        assert IndicatorName.VOLUME.value == "volume"
+        A friendly-looking alias here (e.g. 'bollinger_upper') would be
+        accepted by the API and then rejected by the vendor.
+        """
+        expected = {
+            "close_50_sma", "close_200_sma", "close_10_ema",
+            "macd", "macds", "macdh", "rsi",
+            "boll", "boll_ub", "boll_lb",
+            "atr", "vwma", "mfi",
+        }
+        assert {i.value for i in IndicatorName} == expected
 
 
 @pytest.mark.unit
@@ -237,6 +245,10 @@ class TestIndicatorsRequest:
         req = IndicatorsRequest(ticker="AAPL", trade_date="2026-06-01")
         assert req.indicator_names == []
 
+    def test_default_look_back_days(self):
+        req = IndicatorsRequest(ticker="AAPL", trade_date="2026-06-01")
+        assert req.look_back_days == 30
+
     def test_custom_indicator_names(self):
         req = IndicatorsRequest(
             ticker="AAPL",
@@ -257,6 +269,10 @@ class TestFundamentalsRequest:
         req = FundamentalsRequest(ticker="AAPL", trade_date="2026-06-01")
         assert req.report_type == ReportType.ALL
 
+    def test_default_freq_quarterly(self):
+        req = FundamentalsRequest(ticker="AAPL", trade_date="2026-06-01")
+        assert req.freq == ReportFreq.QUARTERLY
+
 
 @pytest.mark.unit
 class TestNewsRequest:
@@ -265,32 +281,58 @@ class TestNewsRequest:
         assert req.ticker == "AAPL"
         assert req.trade_date == "2026-06-01"
 
-    def test_default_country_none(self):
+    def test_default_look_back_days(self):
         req = NewsRequest(ticker="AAPL", trade_date="2026-06-01")
-        assert req.country is None
+        assert req.look_back_days == 7
 
-    def test_custom_country(self):
-        req = NewsRequest(ticker="AAPL", trade_date="2026-06-01", country=Country.US)
-        assert req.country == Country.US
+    def test_look_back_days_lower_bound(self):
+        with pytest.raises(ValidationError):
+            NewsRequest(ticker="AAPL", trade_date="2026-06-01", look_back_days=0)
+
+
+@pytest.mark.unit
+class TestGlobalNewsRequest:
+    def test_required_fields(self):
+        req = GlobalNewsRequest(trade_date="2026-06-01")
+        assert req.trade_date == "2026-06-01"
+
+    def test_optional_fields_default_to_none(self):
+        """None means "inherit the configured default", not "zero"."""
+        req = GlobalNewsRequest(trade_date="2026-06-01")
+        assert req.look_back_days is None
+        assert req.limit is None
 
 
 @pytest.mark.unit
 class TestMacroIndicatorsRequest:
-    def test_default_country_us(self):
-        req = MacroIndicatorsRequest()
-        assert req.country == Country.US
+    def test_required_fields(self):
+        req = MacroIndicatorsRequest(indicator="cpi", trade_date="2026-06-01")
+        assert req.indicator == "cpi"
+        assert req.trade_date == "2026-06-01"
 
-    def test_custom_country(self):
-        req = MacroIndicatorsRequest(country=Country.JP)
-        assert req.country == Country.JP
+    def test_indicator_is_required(self):
+        with pytest.raises(ValidationError):
+            MacroIndicatorsRequest(trade_date="2026-06-01")
+
+    def test_raw_fred_series_id_accepted(self):
+        req = MacroIndicatorsRequest(indicator="CPIAUCSL", trade_date="2026-06-01")
+        assert req.indicator == "CPIAUCSL"
+
+    def test_default_look_back_days_none(self):
+        req = MacroIndicatorsRequest(indicator="cpi", trade_date="2026-06-01")
+        assert req.look_back_days is None
 
 
 @pytest.mark.unit
 class TestPredictionMarketRequest:
     def test_required_fields(self):
-        req = PredictionMarketRequest(ticker="AAPL", trade_date="2026-06-01")
-        assert req.ticker == "AAPL"
-        assert req.trade_date == "2026-06-01"
+        req = PredictionMarketRequest(topic="Fed rate cut")
+        assert req.topic == "Fed rate cut"
+        assert req.limit is None
+
+    def test_topic_is_required(self):
+        with pytest.raises(ValidationError):
+            PredictionMarketRequest()
 
 
 @pytest.mark.unit
@@ -347,20 +389,76 @@ class TestAnalyzeResponse:
 
 @pytest.mark.unit
 class TestStockDataResponse:
-    def test_data_can_be_none(self):
-        resp = StockDataResponse(ticker="AAPL")
-        assert resp.data is None
+    def _resp(self, **rows):
+        return StockDataResponse(
+            ticker="AAPL",
+            symbol="AAPL",
+            start_date="2026-06-01",
+            end_date="2026-06-01",
+            count=1,
+            **rows,
+        )
 
-    def test_data_can_be_string(self):
-        resp = StockDataResponse(ticker="AAPL", data="Date,Close\n2026-06-01,100")
-        assert resp.data == "Date,Close\n2026-06-01,100"
+    def test_rows_are_records(self):
+        resp = self._resp(rows=[{"date": "2026-06-01", "close": 100.5}])
+        assert resp.rows[0].date == "2026-06-01"
+        assert resp.rows[0].close == 100.5
+        assert resp.rows[0].open is None
+
+    def test_vendor_extra_columns_are_preserved(self):
+        """Dropping unknown vendor columns would lose requested data."""
+        resp = self._resp(rows=[{"date": "2026-06-01", "dividends": 0.24}])
+        assert resp.rows[0].model_dump()["dividends"] == 0.24
+
+    def test_rows_default_to_empty(self):
+        assert self._resp().rows == []
+
+    def test_date_is_required_on_a_bar(self):
+        with pytest.raises(ValidationError):
+            self._resp(rows=[{"close": 100.5}])
 
 
 @pytest.mark.unit
 class TestIndicatorsResponse:
-    def test_indicators_can_be_none(self):
-        resp = IndicatorsResponse(ticker="AAPL")
-        assert resp.indicators is None
+    def _resp(self, **kwargs):
+        return IndicatorsResponse(
+            ticker="AAPL",
+            symbol="AAPL",
+            trade_date="2026-06-01",
+            look_back_days=30,
+            **kwargs,
+        )
+
+    def test_series_are_records(self):
+        resp = self._resp(
+            indicators=[
+                {
+                    "name": "rsi",
+                    "description": "RSI: ...",
+                    "points": [{"date": "2026-06-01", "value": 43.2}],
+                }
+            ]
+        )
+        assert resp.indicators[0].name == "rsi"
+        assert resp.indicators[0].points[0].value == 43.2
+
+    def test_point_value_may_be_null_with_a_note(self):
+        resp = self._resp(
+            indicators=[
+                {
+                    "name": "rsi",
+                    "points": [{"date": "2026-06-01", "note": "Not a trading day"}],
+                }
+            ]
+        )
+        point = resp.indicators[0].points[0]
+        assert point.value is None
+        assert point.note == "Not a trading day"
+
+    def test_collections_default_to_empty(self):
+        resp = self._resp()
+        assert resp.indicators == []
+        assert resp.errors == []
 
 
 @pytest.mark.unit
@@ -388,6 +486,30 @@ class TestNewsResponse:
     def test_news_items_can_be_list(self):
         resp = NewsResponse(ticker="AAPL", news_items=[{"title": "News"}])
         assert len(resp.news_items) == 1
+
+
+@pytest.mark.unit
+class TestGlobalNewsResponse:
+    def test_keyed_by_date_not_ticker(self):
+        resp = GlobalNewsResponse(trade_date="2026-06-01", news_items="## News")
+        assert resp.trade_date == "2026-06-01"
+        assert resp.news_items == "## News"
+
+
+@pytest.mark.unit
+class TestMacroIndicatorsResponse:
+    def test_keyed_by_indicator_not_country(self):
+        resp = MacroIndicatorsResponse(indicator="cpi", data="## CPI")
+        assert resp.indicator == "cpi"
+        assert resp.data == "## CPI"
+
+
+@pytest.mark.unit
+class TestPredictionMarketsResponse:
+    def test_keyed_by_topic_not_ticker(self):
+        resp = PredictionMarketsResponse(topic="Fed rate cut", markets="## Markets")
+        assert resp.topic == "Fed rate cut"
+        assert resp.markets == "## Markets"
 
 
 @pytest.mark.unit
