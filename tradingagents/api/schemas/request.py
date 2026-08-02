@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field
 from tradingagents.api.schemas.enums import (
     AnalystType,
     AssetType,
-    Country,
     IndicatorName,
+    ReportFreq,
     ReportType,
 )
 
@@ -66,12 +66,17 @@ class IndicatorsRequest(BaseModel):
     indicator_names: list[IndicatorName] = Field(
         default_factory=list,
         description=(
-            "List of indicator names. "
-            "Available: 'rsi', 'macd', 'signal', 'histogram', 'close_50_sma', "
-            "'close_200_sma', 'close_10_sma', 'close_20_sma', 'bollinger_upper', "
-            "'bollinger_middle', 'bollinger_lower', 'volume', 'atr', 'adx', "
-            "'stoch_k', 'stoch_d'"
+            "List of indicator names; empty uses a default set. "
+            "Available: 'close_50_sma', 'close_200_sma', 'close_10_ema', 'macd', "
+            "'macds', 'macdh', 'rsi', 'boll', 'boll_ub', 'boll_lb', 'atr', "
+            "'vwma', 'mfi'"
         ),
+    )
+    look_back_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="How many days of indicator values to return",
     )
 
 
@@ -84,39 +89,77 @@ class FundamentalsRequest(BaseModel):
         default=ReportType.ALL,
         description=(
             "Type of fundamental data to retrieve. "
-            "Available: 'all', 'balance_sheet', 'cashflow', 'income_statement'"
+            "Available: 'all', 'overview', 'balance_sheet', 'cashflow', "
+            "'income_statement'"
         ),
+    )
+    freq: ReportFreq = Field(
+        default=ReportFreq.QUARTERLY,
+        description="Reporting frequency for the statements: 'annual' or 'quarterly'",
     )
 
 
 class NewsRequest(BaseModel):
-    """Request body for news queries."""
+    """Request body for ticker news queries."""
 
     ticker: str = Field(..., description="Ticker symbol")
-    trade_date: str = Field(..., description="Trading date in YYYY-MM-DD format")
-    country: Country | None = Field(
+    trade_date: str = Field(..., description="End of the window, YYYY-MM-DD")
+    look_back_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="How many days before trade_date to include",
+    )
+
+
+class GlobalNewsRequest(BaseModel):
+    """Request body for global/macro news queries."""
+
+    trade_date: str = Field(..., description="End of the window, YYYY-MM-DD")
+    look_back_days: int | None = Field(
         default=None,
-        description=(
-            "Country code for global news. "
-            "Available: 'US', 'CN', 'JP', 'GB', 'DE', 'FR', 'TW', 'KR', 'SG'"
-        ),
+        ge=1,
+        le=365,
+        description="Window length; omit to use the configured default",
+    )
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description="Max articles; omit to use the configured default",
     )
 
 
 class MacroIndicatorsRequest(BaseModel):
-    """Request body for macro indicators."""
+    """Request body for macro indicators (FRED)."""
 
-    country: Country = Field(
-        default=Country.US,
+    indicator: str = Field(
+        ...,
         description=(
-            "Country code. "
-            "Available: 'US', 'CN', 'JP', 'GB', 'DE', 'FR', 'TW', 'KR', 'SG'"
+            "Friendly alias ('cpi', 'core_pce', 'unemployment', 'fed_funds_rate', "
+            "'10y_treasury', 'yield_curve', 'real_gdp', 'vix') or a raw FRED "
+            "series ID such as 'CPIAUCSL'"
         ),
+    )
+    trade_date: str = Field(..., description="End of the window, YYYY-MM-DD")
+    look_back_days: int | None = Field(
+        default=None,
+        ge=1,
+        le=3650,
+        description="Window length; omit for a 1-year window",
     )
 
 
 class PredictionMarketRequest(BaseModel):
     """Request body for prediction market queries."""
 
-    ticker: str = Field(..., description="Ticker symbol")
-    trade_date: str = Field(..., description="Trading date in YYYY-MM-DD format")
+    topic: str = Field(
+        ...,
+        description="Event topic/keyword, e.g. 'Fed rate cut', 'recession 2026'",
+    )
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=50,
+        description="Max markets to return; omit for the vendor default",
+    )
