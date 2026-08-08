@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tradingagents.api.schemas.enums import (
     AnalystType,
@@ -11,6 +11,7 @@ from tradingagents.api.schemas.enums import (
     ReportFreq,
     ReportType,
 )
+from tradingagents.api.schemas.validators import validate_ticker_shape
 
 
 class AnalyzeRequest(BaseModel):
@@ -32,6 +33,8 @@ class AnalyzeRequest(BaseModel):
         description="List of analysts to include: 'market', 'sentiment', 'news', 'fundamentals'",
     )
     debug: bool = Field(default=False, description="Enable debug mode with verbose output")
+
+    _validate_ticker = field_validator("ticker")(validate_ticker_shape)
 
 
 class SingleAnalystRequest(BaseModel):
