@@ -10,6 +10,8 @@ from fastapi import FastAPI
 
 from tradingagents.api.config import ApiConfig, get_config, set_config
 from tradingagents.api.core.error_handlers import register_exception_handlers
+from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.task_worker import TaskWorker
 
 logger = logging.getLogger(__name__)
 
@@ -18,13 +20,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan manager.
 
-    Initializes API config and ensures required directories exist.
+    Ensures required directories exist and tears down the task worker on exit.
     """
     config: ApiConfig = app.state.api_config
     config.ensure_directories()
     logger.info("TradingAgents API started")
-    yield
-    logger.info("TradingAgents API shutting down")
+    try:
+        yield
+    finally:
+        logger.info("TradingAgents API shutting down")
+        # Don't wait: an in-flight analysis can take minutes and would
+        # otherwise hold up shutdown.
+        app.state.task_worker.shutdown(wait=False)
 
 
 def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
@@ -57,6 +64,17 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
         openapi_url=f"/api/{api_version}/openapi.json",
     )
     app.state.api_config = config
+
+    # Task state and the worker pool are per-app, not module globals, so tests
+    # and reloads never share state. Created here rather than in the lifespan
+    # handler so they exist even when the app is used without one.
+    app.state.task_manager = TaskManager(
+        ttl_minutes=config.config.get("task_ttl_minutes", 60),
+        max_tasks=config.config.get("task_max_tasks", 100),
+    )
+    app.state.task_worker = TaskWorker(
+        max_workers=int(config.config.get("task_max_concurrent", 2)),
+    )
 
     # Register global exception handlers
     register_exception_handlers(app)
