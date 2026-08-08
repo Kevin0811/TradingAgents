@@ -26,19 +26,8 @@ from tradingagents.api.domain.entities import AnalysisResult
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
 
 
-# ---------------------------------------------------------------------------
-# Task manager singleton reset fixture
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _reset_task_manager_singleton():
-    """Reset the TaskManager singleton between tests so state doesn't leak."""
-    import tradingagents.api.dependencies as deps
-    original = deps._task_manager
-    deps._task_manager = None
-    yield
-    deps._task_manager = original
+# The task manager and worker now live on app.state, so each create_app() call
+# gets its own and no cross-test reset fixture is needed.
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +129,9 @@ class TestCreateAnalysisTask:
     """POST /analyze/tasks must create a task and queue it."""
 
     def test_create_task_returns_202_accepted(self, monkeypatch):
-        """New task must return 202 Accepted."""
+        """New task must return 202 Accepted and hand the work to the worker."""
         mock_task = _make_task_response(status=TaskStatus.PENDING)
+        submitted = []
 
         def fake_create_task(self, request):
             return mock_task, True
@@ -149,6 +139,9 @@ class TestCreateAnalysisTask:
         with patch(
             "tradingagents.api.domain.services.task_service.TaskService.create_task",
             fake_create_task,
+        ), patch(
+            "tradingagents.api.domain.services.task_service.TaskService.execute_analysis",
+            lambda self, task_id, request: submitted.append(task_id),
         ):
             app = create_app()
             client = TestClient(app)
@@ -159,8 +152,10 @@ class TestCreateAnalysisTask:
                     "trade_date": "2026-06-01",
                 },
             )
+            app.state.task_worker.shutdown(wait=True)
 
         assert resp.status_code == 202
+        assert submitted == [mock_task.task_id]
 
     def test_create_task_returns_200_for_duplicate(self, monkeypatch):
         """Existing active task must return 200 OK (not 202)."""
@@ -187,9 +182,9 @@ class TestCreateAnalysisTask:
 
     def test_create_task_returns_429_when_queue_full(self, monkeypatch):
         """When task queue is full, must return 429."""
-        # Patch TaskManager.total_task_count to return 100
+        # Patch TaskManager.active_task_count to return 100
         monkeypatch.setattr(
-            "tradingagents.api.core.task_manager.TaskManager.total_task_count",
+            "tradingagents.api.core.task_manager.TaskManager.active_task_count",
             property(lambda self: 100),
         )
 

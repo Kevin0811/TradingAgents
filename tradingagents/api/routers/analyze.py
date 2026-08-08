@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
 from tradingagents.api.config import ApiConfig, get_config
@@ -14,11 +14,13 @@ from tradingagents.api.dependencies import (
     get_analysis_service,
     get_task_manager,
     get_task_service,
+    get_task_worker,
 )
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
 from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.task_worker import TaskWorker
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +58,13 @@ router = APIRouter(
         "5. **Risk Management** (aggressive/conservative/neutral) - debate risk factors\n"
         "6. **Portfolio Manager** - produce final trade decision\n\n"
         "Note: This endpoint may take significant time to respond (30s+) depending "
-        "on the LLM provider and analysis depth. "
+        "on the LLM provider and analysis depth. It runs on the threadpool, so it "
+        "does not block other requests, but it holds the connection open for the "
+        "whole run and is not subject to `task_max_concurrent`. "
         "For async operation, use `POST /analyze/tasks` instead."
     ),
 )
-async def analyze(
+def analyze(
     request: AnalyzeRequest,
     analysis_service: AnalysisService = Depends(get_analysis_service),
 ) -> AnalyzeResponse:
@@ -102,16 +106,15 @@ async def analyze(
 )
 async def create_analysis_task(
     request: TaskCreateRequest,
-    background_tasks: BackgroundTasks,
     task_service: TaskService = Depends(get_task_service),
     task_manager: TaskManager = Depends(get_task_manager),
+    task_worker: TaskWorker = Depends(get_task_worker),
     config: ApiConfig = Depends(get_config),
 ) -> JSONResponse:
     """Create an analysis task or return existing one if duplicate."""
     max_tasks = int(config.config.get("task_max_tasks", 100))
 
-    # Check if queue is full (excluding currently completed/failed tasks)
-    if task_manager.total_task_count >= max_tasks:
+    def queue_full_response() -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={
@@ -123,16 +126,21 @@ async def create_analysis_task(
             },
         )
 
-    task, is_new = task_service.create_task(request)
+    # Only in-flight tasks count against the limit; completed ones are just
+    # results waiting for their TTL to expire.
+    if task_manager.active_task_count >= max_tasks:
+        return queue_full_response()
+
+    try:
+        task, is_new = task_service.create_task(request)
+    except ValueError:
+        # TaskManager enforces its own max_tasks on total retained records.
+        return queue_full_response()
 
     if is_new:
-        # New task: set status to queued and queue for background execution
+        # Queued in the worker pool; it starts once a slot frees up.
         task_manager.update_task(task.task_id, status=TaskStatus.QUEUED)
-        background_tasks.add_task(
-            task_service.execute_analysis,
-            task.task_id,
-            request,
-        )
+        task_worker.submit(task_service.execute_analysis, task.task_id, request)
         status_code = status.HTTP_202_ACCEPTED
     else:
         # Existing active task found: return it without queuing

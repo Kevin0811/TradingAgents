@@ -7,6 +7,7 @@ to prevent redundant analysis tasks with the same parameters.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 from uuid import uuid4
@@ -17,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 
 class TaskManager:
-    """In-memory task manager with deduplication and TTL cleanup."""
+    """In-memory task manager with deduplication and TTL cleanup.
+
+    Thread-safe: worker threads mutate tasks while request handlers read them,
+    so every access to ``_tasks`` is guarded by ``_lock``.
+    """
 
     def __init__(self, ttl_minutes: int = 60, max_tasks: int = 100):
         """Initialize the task manager.
@@ -29,6 +34,8 @@ class TaskManager:
         self._tasks: dict[str, TaskResponse] = {}
         self._ttl = ttl_minutes
         self._max_tasks = max_tasks
+        # Reentrant: create_task() calls find_active_task() and _cleanup_expired().
+        self._lock = threading.RLock()
 
     def find_active_task(
         self, ticker: str, trade_date: str, asset_type: str
@@ -43,22 +50,24 @@ class TaskManager:
         Returns:
             Existing TaskResponse if found, None otherwise.
         """
-        for task in self._tasks.values():
-            if (
-                task.ticker == ticker
-                and task.trade_date == trade_date
-                and task.asset_type == asset_type
-                and task.status in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.PROCESSING)
-            ):
-                logger.info(
-                    "Found existing active task %s for %s/%s/%s",
-                    task.task_id,
-                    ticker,
-                    trade_date,
-                    asset_type,
-                )
-                return task
-        return None
+        with self._lock:
+            for task in self._tasks.values():
+                if (
+                    task.ticker == ticker
+                    and task.trade_date == trade_date
+                    and task.asset_type == asset_type
+                    and task.status
+                    in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.PROCESSING)
+                ):
+                    logger.info(
+                        "Found existing active task %s for %s/%s/%s",
+                        task.task_id,
+                        ticker,
+                        trade_date,
+                        asset_type,
+                    )
+                    return task
+            return None
 
     def create_task(self, request: TaskCreateRequest) -> tuple[TaskResponse, bool]:
         """Create a new analysis task or return existing one if duplicate.
@@ -71,37 +80,38 @@ class TaskManager:
             is_new is True if a new task was created, False if an existing
             task was returned (deduplication).
         """
-        # Check for duplicate active task
-        existing = self.find_active_task(
-            request.ticker, request.trade_date, request.asset_type
-        )
-        if existing is not None:
-            return existing, False
-
-        # Cleanup expired tasks
-        self._cleanup_expired()
-
-        # Check capacity
-        if len(self._tasks) >= self._max_tasks:
-            raise ValueError(
-                f"Task queue is full (max_tasks={self._max_tasks}). "
-                "Wait for some tasks to complete or delete finished tasks."
+        with self._lock:
+            # Check for duplicate active task
+            existing = self.find_active_task(
+                request.ticker, request.trade_date, request.asset_type
             )
+            if existing is not None:
+                return existing, False
 
-        task_id = str(uuid4())
-        now = datetime.now()
-        task = TaskResponse(
-            task_id=task_id,
-            status=TaskStatus.PENDING,
-            ticker=request.ticker,
-            trade_date=request.trade_date,
-            asset_type=request.asset_type,
-            created_at=now,
-            updated_at=now,
-        )
-        self._tasks[task_id] = task
-        logger.info("Created new task %s for %s/%s/%s", task_id, request.ticker, request.trade_date, request.asset_type)
-        return task, True
+            # Cleanup expired tasks
+            self._cleanup_expired()
+
+            # Check capacity
+            if len(self._tasks) >= self._max_tasks:
+                raise ValueError(
+                    f"Task queue is full (max_tasks={self._max_tasks}). "
+                    "Wait for some tasks to complete or delete finished tasks."
+                )
+
+            task_id = str(uuid4())
+            now = datetime.now()
+            task = TaskResponse(
+                task_id=task_id,
+                status=TaskStatus.PENDING,
+                ticker=request.ticker,
+                trade_date=request.trade_date,
+                asset_type=request.asset_type,
+                created_at=now,
+                updated_at=now,
+            )
+            self._tasks[task_id] = task
+            logger.info("Created new task %s for %s/%s/%s", task_id, request.ticker, request.trade_date, request.asset_type)
+            return task, True
 
     def get_task(self, task_id: str) -> Optional[TaskResponse]:
         """Get a task by ID.
@@ -112,7 +122,8 @@ class TaskManager:
         Returns:
             TaskResponse if found, None otherwise.
         """
-        return self._tasks.get(task_id)
+        with self._lock:
+            return self._tasks.get(task_id)
 
     def list_tasks(
         self, status: Optional[TaskStatus] = None, ticker: Optional[str] = None
@@ -126,7 +137,8 @@ class TaskManager:
         Returns:
             List of matching TaskResponse objects.
         """
-        tasks = list(self._tasks.values())
+        with self._lock:
+            tasks = list(self._tasks.values())
         if status is not None:
             tasks = [t for t in tasks if t.status == status]
         if ticker is not None:
@@ -145,25 +157,26 @@ class TaskManager:
         Returns:
             True if task was found and updated, False otherwise.
         """
-        if task_id not in self._tasks:
-            return False
+        with self._lock:
+            if task_id not in self._tasks:
+                return False
 
-        task = self._tasks[task_id]
-        for key, value in kwargs.items():
-            if hasattr(task, key):
-                setattr(task, key, value)
+            task = self._tasks[task_id]
+            for key, value in kwargs.items():
+                if hasattr(task, key):
+                    setattr(task, key, value)
 
-        task.updated_at = datetime.now()
+            task.updated_at = datetime.now()
 
-        if kwargs.get("status") in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-            task.completed_at = datetime.now()
-            logger.info(
-                "Task %s completed with status: %s",
-                task_id,
-                kwargs.get("status"),
-            )
+            if kwargs.get("status") in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                task.completed_at = datetime.now()
+                logger.info(
+                    "Task %s completed with status: %s",
+                    task_id,
+                    kwargs.get("status"),
+                )
 
-        return True
+            return True
 
     def delete_task(self, task_id: str) -> bool:
         """Delete a task.
@@ -174,15 +187,16 @@ class TaskManager:
         Returns:
             True if task was deleted, False if not found.
         """
-        if task_id not in self._tasks:
-            return False
+        with self._lock:
+            if task_id not in self._tasks:
+                return False
 
-        task = self._tasks[task_id]
-        if task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING):
-            logger.warning("Deleting active task %s", task_id)
+            task = self._tasks[task_id]
+            if task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING):
+                logger.warning("Deleting active task %s", task_id)
 
-        del self._tasks[task_id]
-        return True
+            del self._tasks[task_id]
+            return True
 
     def cleanup(self) -> int:
         """Remove expired completed/failed tasks.
@@ -193,19 +207,20 @@ class TaskManager:
         now = datetime.now()
         cutoff = now - timedelta(minutes=self._ttl)
 
-        to_remove = []
-        for task_id, task in self._tasks.items():
-            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                if task.completed_at and task.completed_at < cutoff:
-                    to_remove.append(task_id)
-            elif task.status == TaskStatus.PENDING and self._ttl > 0:
-                # Only clean up stale pending tasks when TTL is enabled
-                # Avoids removing freshly created tasks when ttl=0 (test scenarios)
-                if task.created_at < cutoff:
-                    to_remove.append(task_id)
+        with self._lock:
+            to_remove = []
+            for task_id, task in self._tasks.items():
+                if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                    if task.completed_at and task.completed_at < cutoff:
+                        to_remove.append(task_id)
+                elif task.status == TaskStatus.PENDING and self._ttl > 0:
+                    # Only clean up stale pending tasks when TTL is enabled
+                    # Avoids removing freshly created tasks when ttl=0 (test scenarios)
+                    if task.created_at < cutoff:
+                        to_remove.append(task_id)
 
-        for task_id in to_remove:
-            del self._tasks[task_id]
+            for task_id in to_remove:
+                del self._tasks[task_id]
 
         if to_remove:
             logger.info("Cleaned up %d expired tasks", len(to_remove))
@@ -219,22 +234,26 @@ class TaskManager:
     @property
     def active_task_count(self) -> int:
         """Get the number of active (pending/processing/queued) tasks."""
-        return sum(
-            1
-            for task in self._tasks.values()
-            if task.status in (TaskStatus.PENDING, TaskStatus.PROCESSING, TaskStatus.QUEUED)
-        )
+        with self._lock:
+            return sum(
+                1
+                for task in self._tasks.values()
+                if task.status
+                in (TaskStatus.PENDING, TaskStatus.PROCESSING, TaskStatus.QUEUED)
+            )
 
     @property
     def processing_count(self) -> int:
-        """Get the number of currently processing tasks (holding a semaphore slot)."""
-        return sum(
-            1
-            for task in self._tasks.values()
-            if task.status == TaskStatus.PROCESSING
-        )
+        """Get the number of tasks currently occupying a worker slot."""
+        with self._lock:
+            return sum(
+                1
+                for task in self._tasks.values()
+                if task.status == TaskStatus.PROCESSING
+            )
 
     @property
     def total_task_count(self) -> int:
         """Get the total number of tasks in memory."""
-        return len(self._tasks)
+        with self._lock:
+            return len(self._tasks)

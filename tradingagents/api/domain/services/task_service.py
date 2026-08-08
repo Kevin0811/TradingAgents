@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import logging
-import threading
-from typing import Any, Optional
+from typing import Any
 
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.exceptions import AnalysisError
@@ -17,27 +16,23 @@ logger = logging.getLogger(__name__)
 class TaskService:
     """Service for managing and executing analysis tasks.
 
-    Wraps the AnalysisService with task lifecycle management and
-    concurrency control via a shared threading.Semaphore.
+    Wraps the AnalysisService with task lifecycle management. Concurrency is
+    bounded by the TaskWorker's thread pool, not here.
     """
 
     def __init__(
         self,
         task_manager: TaskManager,
         analysis_service: AnalysisService,
-        semaphore: Optional[threading.Semaphore] = None,
     ):
         """Initialize the task service.
 
         Args:
             task_manager: Task manager instance.
             analysis_service: Analysis service instance.
-            semaphore: Shared threading.Semaphore for concurrency control.
-                       If None, no concurrency limit is applied.
         """
         self._task_manager = task_manager
         self._analysis_service = analysis_service
-        self._semaphore = semaphore
 
     def create_task(
         self, request: TaskCreateRequest
@@ -53,35 +48,22 @@ class TaskService:
         return self._task_manager.create_task(request)
 
     def execute_analysis(self, task_id: str, request: TaskCreateRequest) -> None:
-        """Execute analysis in background and update task status.
+        """Execute analysis and update task status.
 
-        This method is designed to be run as a FastAPI BackgroundTask.
-        Uses a semaphore to limit concurrent task executions. Tasks wait
-        for an available slot before starting execution.
+        Runs inside a TaskWorker thread. Tasks beyond the worker's concurrency
+        limit wait in the executor's queue, so they occupy no thread while
+        queued and never block request handling.
 
         Args:
             task_id: Task UUID.
             request: Original task creation request.
         """
-        if self._semaphore is not None:
-            logger.info(
-                "Task %s waiting for execution slot (concurrent limit active)",
-                task_id,
-            )
-            self._semaphore.acquire()
-            logger.info("Task %s acquired execution slot", task_id)
-
-        try:
-            self._run_analysis_with_status_updates(task_id, request)
-        finally:
-            if self._semaphore is not None:
-                self._semaphore.release()
-                logger.info("Task %s released execution slot", task_id)
+        self._run_analysis_with_status_updates(task_id, request)
 
     def _run_analysis_with_status_updates(
         self, task_id: str, request: TaskCreateRequest
     ) -> None:
-        """Run analysis and update status. Called after acquiring semaphore."""
+        """Run analysis and update the task record with the outcome."""
         try:
             # Update status to processing
             self._task_manager.update_task(task_id, status=TaskStatus.PROCESSING)
