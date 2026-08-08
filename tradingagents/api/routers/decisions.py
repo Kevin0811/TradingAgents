@@ -37,7 +37,7 @@ router = APIRouter(
         "Run the /analyze endpoint first to generate the data."
     ),
 )
-async def get_research_plan(
+def get_research_plan(
     ticker: str = Query(..., description="Ticker symbol"),
     trade_date: str = Query(..., description="Trading date in YYYY-MM-DD format"),
     decision_service: DecisionService = Depends(get_decision_service),
@@ -66,7 +66,7 @@ async def get_research_plan(
         "Run the /analyze endpoint first to generate the data."
     ),
 )
-async def get_trader_proposal(
+def get_trader_proposal(
     ticker: str = Query(..., description="Ticker symbol"),
     trade_date: str = Query(..., description="Trading date in YYYY-MM-DD format"),
     decision_service: DecisionService = Depends(get_decision_service),
@@ -96,7 +96,7 @@ async def get_trader_proposal(
         "Run the /analyze endpoint first to generate the data."
     ),
 )
-async def get_portfolio_decision(
+def get_portfolio_decision(
     ticker: str = Query(..., description="Ticker symbol"),
     trade_date: str = Query(..., description="Trading date in YYYY-MM-DD format"),
     decision_service: DecisionService = Depends(get_decision_service),
@@ -125,7 +125,7 @@ async def get_portfolio_decision(
         "Run the /analyze endpoint first to generate the data."
     ),
 )
-async def get_sentiment_report(
+def get_sentiment_report(
     ticker: str = Query(..., description="Ticker symbol"),
     trade_date: str = Query(..., description="Trading date in YYYY-MM-DD format"),
     decision_service: DecisionService = Depends(get_decision_service),

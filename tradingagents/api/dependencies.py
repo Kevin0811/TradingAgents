@@ -2,17 +2,20 @@
 
 This module provides dependency providers for FastAPI, creating
 service instances using the infrastructure layer.
+
+Every provider here is declared ``async`` on purpose. FastAPI resolves sync
+dependencies on the shared AnyIO threadpool; since these providers only
+construct objects and perform no I/O, keeping them on the event loop means
+request handling never competes for a threadpool slot.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any
-
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from tradingagents.api.config import ApiConfig, get_config
 from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.task_worker import TaskWorker
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.analyst_service import AnalystService
 from tradingagents.api.domain.services.decision_service import DecisionService
@@ -28,14 +31,14 @@ from tradingagents.api.infrastructure.repositories.file_state_repository import 
 # ---------------------------------------------------------------------------
 
 
-def get_llm_provider_factory(
+async def get_llm_provider_factory(
     config: ApiConfig = Depends(get_config),
 ) -> LLMProviderFactory:
     """Create an LLM provider factory."""
     return LLMProviderFactory(config=config.config)
 
 
-def get_state_repository(
+async def get_state_repository(
     config: ApiConfig = Depends(get_config),
 ) -> StateRepository:
     """Create a file-based state repository."""
@@ -47,7 +50,7 @@ def get_state_repository(
 # ---------------------------------------------------------------------------
 
 
-def get_analysis_service(
+async def get_analysis_service(
     config: ApiConfig = Depends(get_config),
 ) -> AnalysisService:
     """Create an analysis service."""
@@ -57,7 +60,7 @@ def get_analysis_service(
     )
 
 
-def get_llm_factory(
+async def get_llm_factory(
     config: ApiConfig = Depends(get_config),
 ) -> callable:
     """Create an LLM factory function for AnalystService.
@@ -70,7 +73,7 @@ def get_llm_factory(
     return provider.create_llm
 
 
-def get_analyst_service(
+async def get_analyst_service(
     llm_factory: callable = Depends(get_llm_factory),
     config: ApiConfig = Depends(get_config),
 ) -> AnalystService:
@@ -81,12 +84,12 @@ def get_analyst_service(
     )
 
 
-def get_market_data_service() -> MarketDataService:
+async def get_market_data_service() -> MarketDataService:
     """Create a market data service."""
     return MarketDataService()
 
 
-def get_decision_service(
+async def get_decision_service(
     state_repo: StateRepository = Depends(get_state_repository),
 ) -> DecisionService:
     """Create a decision service."""
@@ -97,50 +100,27 @@ def get_decision_service(
 # Task management dependencies
 # ---------------------------------------------------------------------------
 
-import threading
-
-# Global task manager singleton
-_task_manager: TaskManager | None = None
-
-# Global semaphore for concurrency control
-_execution_semaphore: threading.Semaphore | None = None
+# The task manager and worker are owned by the app (created in create_app,
+# shut down in the lifespan handler) rather than by module globals, so each
+# app instance gets its own and there is no lazy-init race between requests.
 
 
-def get_execution_semaphore(
-    config: ApiConfig = Depends(get_config),
-) -> threading.Semaphore:
-    """Get or create the global execution semaphore.
-
-    This semaphore controls the maximum number of concurrent task executions.
-    """
-    global _execution_semaphore
-    if _execution_semaphore is None:
-        max_concurrent = int(config.config.get("task_max_concurrent", 4))
-        _execution_semaphore = threading.Semaphore(max_concurrent)
-    return _execution_semaphore
+async def get_task_manager(request: Request) -> TaskManager:
+    """Get the app's task manager."""
+    return request.app.state.task_manager
 
 
-def get_task_manager(
-    config: ApiConfig = Depends(get_config),
-) -> TaskManager:
-    """Get or create the global task manager."""
-    global _task_manager
-    if _task_manager is None:
-        _task_manager = TaskManager(
-            ttl_minutes=config.config.get("task_ttl_minutes", 60),
-            max_tasks=config.config.get("task_max_tasks", 100),
-        )
-    return _task_manager
+async def get_task_worker(request: Request) -> TaskWorker:
+    """Get the app's background task worker."""
+    return request.app.state.task_worker
 
 
-def get_task_service(
+async def get_task_service(
     task_manager: TaskManager = Depends(get_task_manager),
     analysis_service: AnalysisService = Depends(get_analysis_service),
-    semaphore: threading.Semaphore = Depends(get_execution_semaphore),
 ) -> TaskService:
-    """Create a task service with concurrency control."""
+    """Create a task service."""
     return TaskService(
         task_manager=task_manager,
         analysis_service=analysis_service,
-        semaphore=semaphore,
     )

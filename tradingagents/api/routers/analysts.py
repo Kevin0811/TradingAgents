@@ -33,7 +33,7 @@ router = APIRouter(
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def market_analyst(
+def market_analyst(
     request: SingleAnalystRequest,
     analyst_service: AnalystService = Depends(get_analyst_service),
 ) -> AnalystReportResponse:
@@ -66,7 +66,7 @@ async def market_analyst(
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def sentiment_analyst(
+def sentiment_analyst(
     request: SingleAnalystRequest,
     analyst_service: AnalystService = Depends(get_analyst_service),
 ) -> AnalystReportResponse:
@@ -99,7 +99,7 @@ async def sentiment_analyst(
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def news_analyst(
+def news_analyst(
     request: SingleAnalystRequest,
     analyst_service: AnalystService = Depends(get_analyst_service),
 ) -> AnalystReportResponse:
@@ -132,7 +132,7 @@ async def news_analyst(
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
-async def fundamentals_analyst(
+def fundamentals_analyst(
     request: SingleAnalystRequest,
     analyst_service: AnalystService = Depends(get_analyst_service),
 ) -> AnalystReportResponse:

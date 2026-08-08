@@ -50,7 +50,7 @@ _TICKER_NOTE = (
         "(`dividends`, `split_coefficient`, ...) are passed through as-is."
     ),
 )
-async def get_stock_data(
+def get_stock_data(
     ticker: str,
     trade_date: str = Query(..., description="End of the window, YYYY-MM-DD"),
     period: int = Query(default=365, ge=1, le=3650, description="Window length in days"),
@@ -82,7 +82,7 @@ async def get_stock_data(
         "`errors` rather than failing the whole request."
     ),
 )
-async def get_indicators(
+def get_indicators(
     ticker: str,
     trade_date: str = Query(..., description="Trading date in YYYY-MM-DD format"),
     indicator_names: str | None = Query(
@@ -117,7 +117,7 @@ async def get_indicators(
         "(default: 'quarterly'). Ignored for 'overview'."
     ),
 )
-async def get_fundamentals(
+def get_fundamentals(
     ticker: str,
     trade_date: str = Query(..., description="Trading date in YYYY-MM-DD format"),
     report_type: str = Query(
@@ -148,7 +148,7 @@ async def get_fundamentals(
         "For market-wide news use `/data/global-news`."
     ),
 )
-async def get_news(
+def get_news(
     ticker: str,
     trade_date: str = Query(..., description="End of the window, YYYY-MM-DD"),
     look_back_days: int = Query(default=7, ge=1, le=365, description="Window length"),
@@ -175,7 +175,7 @@ async def get_news(
         "`global_news_article_limit`"
     ),
 )
-async def get_global_news(
+def get_global_news(
     trade_date: str = Query(..., description="End of the window, YYYY-MM-DD"),
     look_back_days: int | None = Query(default=None, ge=1, le=365),
     limit: int | None = Query(default=None, ge=1, le=100),
@@ -203,7 +203,7 @@ async def get_global_news(
         "- `look_back_days`: Window length; omit for a 1-year window"
     ),
 )
-async def get_macro_indicators(
+def get_macro_indicators(
     indicator: str = Query(..., description="Alias or raw FRED series ID"),
     trade_date: str = Query(..., description="End of the window, YYYY-MM-DD"),
     look_back_days: int | None = Query(default=None, ge=1, le=3650),
@@ -228,7 +228,7 @@ async def get_macro_indicators(
         "- `limit`: Max markets to return; omit for the vendor default"
     ),
 )
-async def get_prediction_markets(
+def get_prediction_markets(
     topic: str = Query(..., description="Event topic/keyword"),
     limit: int | None = Query(default=None, ge=1, le=50),
     market_data_service: MarketDataService = Depends(get_market_data_service),

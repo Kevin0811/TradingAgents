@@ -79,6 +79,16 @@ def main():
         )
         sys.exit(1)
 
+    if args.workers > 1 and not args.reload:
+        print(
+            f"Warning: --workers {args.workers} is not supported by the task API.\n"
+            "  Task state lives in process memory, so a task created in one worker\n"
+            "  returns 404 when the status poll lands on another, and the effective\n"
+            "  concurrency becomes task_max_concurrent x workers.\n"
+            "  Raise TRADINGAGENTS_TASK_MAX_CONCURRENT instead of adding workers.",
+            file=sys.stderr,
+        )
+
     print(f"Starting TradingAgents API server on {args.host}:{args.port}")
     print(f"API docs: http://{args.host}:{args.port}/api/v1/docs")
     print(f"Health check: http://{args.host}:{args.port}/health")
