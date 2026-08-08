@@ -6,7 +6,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from tradingagents.api.schemas.validators import validate_ticker_shape
 
 
 class TaskStatus(str, Enum):
@@ -33,6 +35,8 @@ class TaskCreateRequest(BaseModel):
         description="List of analysts to include",
     )
     debug: bool = Field(default=False, description="Enable debug mode with verbose output")
+
+    _validate_ticker = field_validator("ticker")(validate_ticker_shape)
 
 
 class TaskResponse(BaseModel):
