@@ -50,6 +50,27 @@ DATE_FORMAT = "%Y-%m-%d"
 # without fanning out into a dozen vendor calls.
 DEFAULT_INDICATORS = ("close_50_sma", "close_200_sma", "macd", "rsi", "boll", "atr")
 
+# The chart default, kept separate from DEFAULT_INDICATORS. That set answers
+# "tell me something useful about this symbol" in as few vendor calls as
+# possible; this one has to *draw*, so it carries the Bollinger envelope and
+# the MACD signal/histogram that a plot needs and a summary does not.
+CHART_INDICATORS = (
+    "close_50_sma",
+    "close_200_sma",
+    "boll",
+    "boll_ub",
+    "boll_lb",
+    "rsi",
+    "macd",
+    "macds",
+    "macdh",
+)
+
+# Indicators are computed from ``stockstats_utils.load_ohlcv``, which downloads a
+# fixed five-year window. Asking for a longer history would silently return bars
+# with no indicator values attached, so the window is refused instead.
+MAX_HISTORY_DAYS = 1825
+
 DEFAULT_NEWS_LOOKBACK_DAYS = 7
 
 
@@ -204,6 +225,96 @@ class MarketDataService:
             "symbol": symbol,
             "trade_date": trade_date,
             "look_back_days": look_back_days,
+            "indicators": series,
+            "errors": errors,
+        }
+
+    def get_price_history(
+        self,
+        ticker: str,
+        start_date: str,
+        end_date: str,
+        indicator_names: list[str] | None = None,
+    ) -> dict:
+        """Fetch OHLCV bars and indicator series over one explicit window.
+
+        The two existing endpoints cannot be combined by a caller without
+        re-deriving the window: ``get_stock_data`` counts calendar days back
+        from ``trade_date``, ``get_indicators`` counts ``look_back_days`` back
+        from it, and the two are capped differently. A chart needs both series
+        over the *same* dates, so the alignment is done here once rather than in
+        every consumer.
+
+        Args:
+            ticker: Ticker symbol.
+            start_date: Start of the window, YYYY-MM-DD (inclusive).
+            end_date: End of the window, YYYY-MM-DD (inclusive).
+            indicator_names: Indicator names; ``None`` means CHART_INDICATORS,
+                an empty list means bars only. The distinction matters — a
+                caller that wants a bare price line should not pay for nine
+                vendor calls to discard them.
+
+        Returns:
+            Dict with the resolved symbol, the window, ``bars``, ``indicators``
+            and any per-indicator failures under ``errors``.
+        """
+        symbol = self._resolve_ticker(ticker)
+        start_dt = self._parse_date(start_date, "start_date")
+        end_dt = self._parse_date(end_date, "end_date")
+
+        span = (end_dt - start_dt).days
+        if span < 0:
+            raise InvalidRequestError(
+                "Invalid date range",
+                detail=f"start_date {start_date} is after end_date {end_date}",
+            )
+        if span > MAX_HISTORY_DAYS:
+            raise InvalidRequestError(
+                "Date range too long",
+                detail=(
+                    f"Requested {span} days; the indicator source only holds "
+                    f"{MAX_HISTORY_DAYS} days of history"
+                ),
+            )
+
+        report = self._call(
+            get_stock_data,
+            {"symbol": symbol, "start_date": start_date, "end_date": end_date},
+        )
+        bars = parse_ohlcv_csv(report)
+        if not bars:
+            # Same reasoning as get_stock_data: the vendors raise
+            # NoMarketDataError for an empty result, so an unparsable report is
+            # a format change on our side, not an absent symbol.
+            raise ExternalServiceError(
+                "Unreadable vendor response",
+                detail=f"No price rows could be parsed for {symbol}",
+            )
+
+        names = list(CHART_INDICATORS) if indicator_names is None else indicator_names
+        series: list[dict] = []
+        errors: list[str] = []
+        if names:
+            indicator_report = self._call(
+                get_indicators,
+                {
+                    "symbol": symbol,
+                    "indicator": ",".join(names),
+                    # The indicator window walks backwards from curr_date, so
+                    # the end of the price window is where it has to start.
+                    "curr_date": end_date,
+                    "look_back_days": span,
+                },
+            )
+            series, errors = parse_indicator_report(indicator_report)
+
+        return {
+            "ticker": ticker,
+            "symbol": symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "count": len(bars),
+            "bars": bars,
             "indicators": series,
             "errors": errors,
         }
