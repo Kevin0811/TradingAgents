@@ -120,6 +120,28 @@ class IndicatorsResponse(BaseModel):
     )
 
 
+class PriceHistoryResponse(BaseModel):
+    """OHLCV bars and indicator series over one window, aligned for charting.
+
+    ``bars`` and every series in ``indicators`` cover the same window, which is
+    what separates this from combining ``StockDataResponse`` with
+    ``IndicatorsResponse`` by hand — those two describe their windows with
+    different parameters.
+    """
+
+    ticker: str = Field(description="Ticker exactly as requested")
+    symbol: str = Field(description="Canonical symbol the vendor was queried with")
+    start_date: str
+    end_date: str
+    count: int = Field(description="Number of bars, not of calendar days")
+    bars: list[OHLCVBar] = Field(default_factory=list)
+    indicators: list[IndicatorSeries] = Field(default_factory=list)
+    errors: list[str] = Field(
+        default_factory=list,
+        description="Per-indicator failures, e.g. an unsupported indicator name",
+    )
+
+
 class FundamentalsResponse(BaseModel):
     """Fundamentals data response."""
 
