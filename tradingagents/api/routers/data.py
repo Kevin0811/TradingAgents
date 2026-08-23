@@ -15,6 +15,7 @@ from tradingagents.api.schemas.response import (
     MacroIndicatorsResponse,
     NewsResponse,
     PredictionMarketsResponse,
+    PriceHistoryResponse,
     StockDataResponse,
 )
 
@@ -97,6 +98,56 @@ def get_indicators(
     return IndicatorsResponse(
         **market_data_service.get_indicators(
             ticker, trade_date, indicator_names=names, look_back_days=look_back_days
+        )
+    )
+
+
+@router.get(
+    "/history/{ticker}",
+    response_model=PriceHistoryResponse,
+    summary="Price History for Charting",
+    description=(
+        "Get OHLCV bars and technical indicators over one window, aligned to "
+        "the same dates.\n\n"
+        "Prefer this over combining `/data/stock` with `/data/indicators`: "
+        "those two describe their windows with different parameters, so a "
+        "caller that wants both has to re-derive the overlap.\n\n"
+        "**Parameters:**\n"
+        f"- {_TICKER_NOTE}\n"
+        "- `start_date`: Start of the window, YYYY-MM-DD (inclusive)\n"
+        "- `end_date`: End of the window, YYYY-MM-DD (inclusive)\n"
+        "- `indicators`: Comma-separated indicator names. Omit for the chart "
+        "default set; pass an empty value for bars only. Available: "
+        "'close_50_sma', 'close_200_sma', 'close_10_ema', 'macd', 'macds', "
+        "'macdh', 'rsi', 'boll', 'boll_ub', 'boll_lb', 'atr', 'vwma', 'mfi' "
+        "('mfi' is yfinance-only)\n\n"
+        "The window may not exceed 1825 days, which is as far back as the "
+        "indicator source reaches. Indicator points carry a null `value` on "
+        "non-trading days; unsupported names are reported in `errors` rather "
+        "than failing the request."
+    ),
+)
+def get_price_history(
+    ticker: str,
+    start_date: str = Query(..., description="Start of the window, YYYY-MM-DD"),
+    end_date: str = Query(..., description="End of the window, YYYY-MM-DD"),
+    indicators: str | None = Query(
+        default=None,
+        description="Comma-separated indicator names; empty for bars only",
+    ),
+    market_data_service: MarketDataService = Depends(get_market_data_service),
+) -> PriceHistoryResponse:
+    """Get aligned price bars and indicator series."""
+    # None and "" mean different things here: no parameter asks for the chart
+    # default set, an empty one asks for no indicators at all.
+    names = (
+        None
+        if indicators is None
+        else [n.strip() for n in indicators.split(",") if n.strip()]
+    )
+    return PriceHistoryResponse(
+        **market_data_service.get_price_history(
+            ticker, start_date, end_date, indicator_names=names
         )
     )
 

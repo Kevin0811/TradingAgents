@@ -317,6 +317,264 @@ class TestIndicatorsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# GET /data/history/{ticker}
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestPriceHistoryEndpoint:
+    """The charting endpoint, which is the only one that fans out to two tools.
+
+    Its whole reason to exist is that the bars and the indicator series come
+    back over the *same* window, so the payload assertions here are mostly
+    about the window arithmetic: the indicator tool counts backwards from
+    ``curr_date``, so that has to be the price window's end, and its
+    ``look_back_days`` has to be the width of that window.
+    """
+
+    def test_returns_bars_and_indicators_together(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2026-07-30", "end_date": "2026-08-01"},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ticker"] == "AAPL"
+        assert body["symbol"] == "AAPL"
+        assert body["start_date"] == "2026-07-30"
+        assert body["end_date"] == "2026-08-01"
+        assert body["count"] == 1
+        assert body["bars"][0]["close"] == 62828.44
+        assert [s["name"] for s in body["indicators"]] == ["rsi"]
+        assert body["errors"] == []
+
+    def test_both_tools_see_the_same_window(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2026-07-02", "end_date": "2026-08-01"},
+            )
+
+        assert stock.payload == {
+            "symbol": "AAPL",
+            "start_date": "2026-07-02",
+            "end_date": "2026-08-01",
+        }
+        # The indicator window walks backwards from curr_date, so it starts
+        # where the price window ends and reaches back across its full width.
+        assert indicators.payload["curr_date"] == "2026-08-01"
+        assert indicators.payload["look_back_days"] == 30
+
+    def test_defaults_to_the_chart_indicator_set(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2026-07-30", "end_date": "2026-08-01"},
+            )
+
+        # A chart needs the Bollinger envelope and the MACD signal/histogram,
+        # which the summary-oriented DEFAULT_INDICATORS deliberately omits.
+        assert indicators.payload["indicator"] == ",".join(mds.CHART_INDICATORS)
+        assert "boll_ub" in indicators.payload["indicator"]
+        assert "macds" in indicators.payload["indicator"]
+
+    def test_named_indicators_replace_the_default_set(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            client.get(
+                "/api/v1/data/history/AAPL",
+                params={
+                    "start_date": "2026-07-30",
+                    "end_date": "2026-08-01",
+                    "indicators": "rsi, macd",
+                },
+            )
+
+        assert indicators.payload["indicator"] == "rsi,macd"
+
+    def test_empty_indicators_skips_the_tool_entirely(self, client):
+        """An empty value and an absent one mean different things.
+
+        Absent asks for the default set; empty asks for none at all. A caller
+        drawing a bare price line should not pay for nine vendor calls only to
+        discard the results.
+        """
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={
+                    "start_date": "2026-07-30",
+                    "end_date": "2026-08-01",
+                    "indicators": "",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["indicators"] == []
+        assert indicators.calls == []
+        # The bars still come back — only the indicator half was skipped.
+        assert resp.json()["count"] == 1
+
+    def test_reversed_range_is_rejected(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        with _patch("get_stock_data", stock):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2026-08-01", "end_date": "2026-07-30"},
+            )
+
+        assert resp.status_code == 400
+        # Rejected before any vendor call, not after one that returns nothing.
+        assert stock.calls == []
+
+    def test_range_beyond_the_indicator_source_is_rejected(self, client):
+        """Indicators come from a fixed five-year download.
+
+        A longer window would return bars with no indicator values attached,
+        which reads as "this symbol has no RSI" rather than "you asked for more
+        history than exists".
+        """
+        stock = _FakeTool(OHLCV_CSV)
+        with _patch("get_stock_data", stock):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2016-08-01", "end_date": "2026-08-01"},
+            )
+
+        assert resp.status_code == 400
+        assert stock.calls == []
+
+    def test_range_at_the_limit_is_accepted(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2021-08-01", "end_date": "2026-07-31"},
+            )
+
+        assert resp.status_code == 200
+        assert indicators.payload["look_back_days"] == mds.MAX_HISTORY_DAYS
+
+    def test_malformed_date_is_rejected(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        with _patch("get_stock_data", stock):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "01/08/2026", "end_date": "2026-08-01"},
+            )
+
+        assert resp.status_code == 400
+        assert stock.calls == []
+
+    def test_unsupported_indicator_name_is_reported_not_fatal(self, client):
+        """One bad name must not cost the caller the whole chart."""
+        report = (
+            "Indicator adx is not supported. Please choose from: [...]\n\n"
+            + INDICATOR_REPORT
+        )
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(report)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={
+                    "start_date": "2026-07-30",
+                    "end_date": "2026-08-01",
+                    "indicators": "adx,rsi",
+                },
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [s["name"] for s in body["indicators"]] == ["rsi"]
+        assert any("adx" in err for err in body["errors"])
+
+    def test_non_trading_days_keep_their_explanation(self, client):
+        report = (
+            "## rsi values from 2026-08-01 to 2026-08-02:\n"
+            "\n"
+            "2026-08-02: N/A: Not a trading day (weekend or holiday)\n"
+            "2026-08-01: 43.24595007666022\n"
+        )
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(report)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2026-08-01", "end_date": "2026-08-02"},
+            )
+
+        points = {p["date"]: p for p in resp.json()["indicators"][0]["points"]}
+        assert points["2026-08-02"]["value"] is None
+        assert "Not a trading day" in points["2026-08-02"]["note"]
+        assert points["2026-08-01"]["value"] == 43.24595007666022
+
+    def test_unknown_symbol_is_404(self, client):
+        stock = _FakeTool(error=NoMarketDataError("ZZZZ", "ZZZZ", "delisted"))
+        with _patch("get_stock_data", stock):
+            resp = client.get(
+                "/api/v1/data/history/ZZZZ",
+                params={"start_date": "2026-07-30", "end_date": "2026-08-01"},
+            )
+
+        assert resp.status_code == 404
+
+    def test_unparsable_price_report_is_503_not_404(self, client):
+        """An empty result raises upstream, so a report we cannot read is ours.
+
+        Reporting it as "no data" would hide a vendor format change behind a
+        status code that says the symbol does not exist.
+        """
+        stock = _FakeTool("not a csv at all")
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/AAPL",
+                params={"start_date": "2026-07-30", "end_date": "2026-08-01"},
+            )
+
+        assert resp.status_code == 503
+        # Bars failed, so the indicator call is never worth making.
+        assert indicators.calls == []
+
+    def test_vendor_sentinel_becomes_a_status_code(self, client):
+        stock = _FakeTool(f"{NO_DATA_SENTINEL} nothing for ZZZZ")
+        with _patch("get_stock_data", stock):
+            resp = client.get(
+                "/api/v1/data/history/ZZZZ",
+                params={"start_date": "2026-07-30", "end_date": "2026-08-01"},
+            )
+
+        assert resp.status_code == 404
+
+    def test_bare_crypto_base_resolves_for_both_tools(self, client):
+        stock = _FakeTool(OHLCV_CSV)
+        indicators = _FakeTool(INDICATOR_REPORT)
+        with _patch("get_stock_data", stock), _patch("get_indicators", indicators):
+            resp = client.get(
+                "/api/v1/data/history/BTC",
+                params={"start_date": "2026-07-30", "end_date": "2026-08-01"},
+            )
+
+        assert stock.payload["symbol"] == "BTC-USD"
+        assert indicators.payload["symbol"] == "BTC-USD"
+        assert resp.json()["ticker"] == "BTC"
+        assert resp.json()["symbol"] == "BTC-USD"
+
+
+# ---------------------------------------------------------------------------
 # GET /data/fundamentals/{ticker}
 # ---------------------------------------------------------------------------
 
