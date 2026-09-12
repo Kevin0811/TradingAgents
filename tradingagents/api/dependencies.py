@@ -64,12 +64,11 @@ async def get_llm_factory(
     config: ApiConfig = Depends(get_config),
 ) -> callable:
     """Create an LLM factory function for AnalystService.
-    
-    Uses .env configuration via DEFAULT_CONFIG.
+
+    Honors ApiConfig overrides (llm_provider/deep_think_llm/quick_think_llm/...),
+    matching get_llm_provider_factory's behavior for the full-pipeline path.
     """
-    # LLMProviderFactory now uses DEFAULT_CONFIG (.env) by default
-    # Pass config.config only if you want to override .env settings
-    provider = LLMProviderFactory()
+    provider = LLMProviderFactory(config=config.config)
     return provider.create_llm
 
 

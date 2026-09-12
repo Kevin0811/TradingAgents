@@ -8,6 +8,7 @@ from typing import Any
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.exceptions import AnalysisError
 from tradingagents.api.domain.services.analysis_service import AnalysisService
+from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,7 @@ class TaskService:
                 trade_date=request.trade_date,
                 asset_type=request.asset_type,
                 selected_analysts=tuple(request.selected_analysts),
+                overrides=resolve_overrides(request),
             )
 
             # Update task with result
