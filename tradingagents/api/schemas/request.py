@@ -11,10 +11,11 @@ from tradingagents.api.schemas.enums import (
     ReportFreq,
     ReportType,
 )
+from tradingagents.api.schemas.overrides import RunOverridesMixin
 from tradingagents.api.schemas.validators import validate_ticker_shape
 
 
-class AnalyzeRequest(BaseModel):
+class AnalyzeRequest(RunOverridesMixin):
     """Request body for the full analysis pipeline."""
 
     ticker: str = Field(..., description="Ticker symbol to analyze (e.g. 'AAPL', 'BTC')")

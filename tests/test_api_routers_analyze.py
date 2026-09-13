@@ -118,6 +118,63 @@ class TestAnalyzeEndpoint:
 
         assert captured["asset_type"] == "crypto"
 
+    def test_analyze_resolves_and_passes_overrides(self, monkeypatch):
+        """research_depth/max_tokens/etc. must reach run_analysis as `overrides`."""
+        captured = {}
+
+        def fake_run_analysis(self, **kwargs):
+            captured.update(kwargs)
+            return _make_analysis_result()
+
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.AnalysisService.run_analysis",
+            fake_run_analysis,
+        ):
+            app = create_app()
+            client = TestClient(app)
+            client.post(
+                "/api/v1/analyze",
+                json={
+                    "ticker": "AAPL",
+                    "trade_date": "2026-06-01",
+                    "research_depth": "deep",
+                    "max_tokens": 500,
+                },
+            )
+
+        assert captured["overrides"] == {
+            "max_debate_rounds": 5,
+            "max_risk_discuss_rounds": 5,
+            "max_tokens": 500,
+        }
+
+    def test_analyze_explicit_rounds_win_over_research_depth(self, monkeypatch):
+        """An explicit max_debate_rounds must override the research_depth preset."""
+        captured = {}
+
+        def fake_run_analysis(self, **kwargs):
+            captured.update(kwargs)
+            return _make_analysis_result()
+
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.AnalysisService.run_analysis",
+            fake_run_analysis,
+        ):
+            app = create_app()
+            client = TestClient(app)
+            client.post(
+                "/api/v1/analyze",
+                json={
+                    "ticker": "AAPL",
+                    "trade_date": "2026-06-01",
+                    "research_depth": "deep",
+                    "max_debate_rounds": 2,
+                },
+            )
+
+        assert captured["overrides"]["max_debate_rounds"] == 2
+        assert captured["overrides"]["max_risk_discuss_rounds"] == 5
+
 
 # ---------------------------------------------------------------------------
 # POST /analyze/tasks (async task creation)
@@ -201,6 +258,40 @@ class TestCreateAnalysisTask:
         assert resp.status_code == 429
         body = resp.json()
         assert "Task queue is full" in body["error"]
+
+    def test_create_task_passes_overrides_through_to_graph(self, monkeypatch):
+        """Overrides on TaskCreateRequest must reach TradingAgentsGraph's config,
+        exercising the full async path: router -> TaskService -> AnalysisService.
+        """
+        captured = {}
+
+        def fake_graph(*args, **kwargs):
+            captured["config"] = kwargs.get("config")
+            mock_graph = MagicMock()
+            mock_graph.propagate.return_value = ({"market_report": "ok"}, "Buy")
+            return mock_graph
+
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.TradingAgentsGraph",
+            side_effect=fake_graph,
+        ):
+            app = create_app()
+            client = TestClient(app)
+            resp = client.post(
+                "/api/v1/analyze/tasks",
+                json={
+                    "ticker": "AAPL",
+                    "trade_date": "2026-06-01",
+                    "deep_think_llm": "claude-test-model",
+                    "max_debate_rounds": 3,
+                },
+            )
+            task_id = resp.json()["task_id"]
+            app.state.task_worker.shutdown(wait=True)
+
+        assert resp.status_code == 202
+        assert captured["config"]["deep_think_llm"] == "claude-test-model"
+        assert captured["config"]["max_debate_rounds"] == 3
 
 
 # ---------------------------------------------------------------------------
