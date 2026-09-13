@@ -85,7 +85,9 @@ def parse_ohlcv_csv(report: str) -> list[dict[str, Any]]:
     for raw in reader:
         if not any(cell.strip() for cell in raw):
             continue
-        row = {key: _coerce(cell) for key, cell in zip(header, raw) if key}
+        # strict=False: vendor rows can be shorter/longer than the header
+        # (ragged CSV from an external source), truncate rather than raise.
+        row = {key: _coerce(cell) for key, cell in zip(header, raw, strict=False) if key}
         # A row without a date is a trailing artefact, not an observation.
         if row.get("date") is not None:
             row["date"] = str(row["date"])

@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI
 
-from tradingagents.api.config import ApiConfig, get_config, set_config
+from tradingagents.api.config import ApiConfig, set_config
 from tradingagents.api.core.error_handlers import register_exception_handlers
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
@@ -47,8 +47,8 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     set_config(config)
 
     # Import routers here to avoid circular imports
-    from tradingagents.api.routers.analyze import router as analyze_router
     from tradingagents.api.routers.analysts import router as analysts_router
+    from tradingagents.api.routers.analyze import router as analyze_router
     from tradingagents.api.routers.config import router as config_router
     from tradingagents.api.routers.data import router as data_router
     from tradingagents.api.routers.decisions import router as decisions_router

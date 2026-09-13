@@ -6,8 +6,8 @@ import logging
 
 from fastapi import APIRouter, Depends
 
-from tradingagents.api.domain.services.analyst_service import AnalystService
 from tradingagents.api.dependencies import get_analyst_service
+from tradingagents.api.domain.services.analyst_service import AnalystService
 from tradingagents.api.schemas.request import SingleAnalystRequest
 from tradingagents.api.schemas.response import AnalystReportResponse
 

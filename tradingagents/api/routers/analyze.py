@@ -8,20 +8,20 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
 from tradingagents.api.config import ApiConfig, get_config
-from tradingagents.api.domain.services.analysis_service import AnalysisService
-from tradingagents.api.domain.services.config_overrides import resolve_overrides
-from tradingagents.api.domain.services.task_service import TaskService
+from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.task_worker import TaskWorker
 from tradingagents.api.dependencies import (
     get_analysis_service,
     get_task_manager,
     get_task_service,
     get_task_worker,
 )
+from tradingagents.api.domain.services.analysis_service import AnalysisService
+from tradingagents.api.domain.services.config_overrides import resolve_overrides
+from tradingagents.api.domain.services.task_service import TaskService
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
-from tradingagents.api.core.task_manager import TaskManager
-from tradingagents.api.core.task_worker import TaskWorker
 
 logger = logging.getLogger(__name__)
 

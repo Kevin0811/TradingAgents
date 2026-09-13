@@ -16,15 +16,14 @@ from fastapi import Depends, Request
 from tradingagents.api.config import ApiConfig, get_config
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
+from tradingagents.api.domain.repositories import StateRepository
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.analyst_service import AnalystService
 from tradingagents.api.domain.services.decision_service import DecisionService
 from tradingagents.api.domain.services.market_data_service import MarketDataService
 from tradingagents.api.domain.services.task_service import TaskService
-from tradingagents.api.domain.repositories import StateRepository
 from tradingagents.api.infrastructure.llm_provider import LLMProviderFactory
 from tradingagents.api.infrastructure.repositories.file_state_repository import FileStateRepository
-
 
 # ---------------------------------------------------------------------------
 # Infrastructure dependencies

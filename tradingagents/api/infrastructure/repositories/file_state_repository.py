@@ -48,5 +48,5 @@ class FileStateRepository(StateRepository):
                 f"Run the analysis first: POST /analyze"
             )
 
-        with open(log_path, "r", encoding="utf-8") as f:
+        with open(log_path, encoding="utf-8") as f:
             return json.load(f)

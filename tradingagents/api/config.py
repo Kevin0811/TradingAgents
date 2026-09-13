@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.default_api_config import DEFAULT_API_CONFIG
+from tradingagents.default_config import DEFAULT_CONFIG
 
 
 class ApiConfig:

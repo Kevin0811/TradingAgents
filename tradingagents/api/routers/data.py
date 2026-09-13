@@ -6,8 +6,8 @@ import logging
 
 from fastapi import APIRouter, Depends, Query
 
-from tradingagents.api.domain.services.market_data_service import MarketDataService
 from tradingagents.api.dependencies import get_market_data_service
+from tradingagents.api.domain.services.market_data_service import MarketDataService
 from tradingagents.api.schemas.response import (
     FundamentalsResponse,
     GlobalNewsResponse,

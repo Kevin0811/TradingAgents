@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from pydantic import BaseModel
 
@@ -99,7 +98,7 @@ class DecisionService:
         except FileNotFoundError as e:
             raise DataNotFoundError(
                 message=f"No analysis state found for {ticker} on {trade_date}",
-                detail=f"Run the analysis first: POST /analyze",
+                detail="Run the analysis first: POST /analyze",
             ) from e
 
         return DecisionState(
@@ -263,10 +262,7 @@ class DecisionService:
                     pass
             elif "**confidence**" in line_lower or "confidence:" in line_lower:
                 conf_value = line_stripped.split(":", 1)[-1].strip().lower()
-                if conf_value in ("low", "medium", "high"):
-                    confidence = conf_value
-                else:
-                    confidence = "medium"
+                confidence = conf_value if conf_value in ("low", "medium", "high") else "medium"
             elif not line_lower.startswith("**"):
                 narrative += line_stripped + "\n"
 
