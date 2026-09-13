@@ -62,9 +62,9 @@ jobs:
       - name: Install ruff
         run: pip install "ruff>=0.15"
       - name: Lint the API layer
-        # Scoped to this fork's actual focus (the API layer + CLI), not the
-        # full upstream trading-agent codebase.
-        run: ruff check tradingagents/api cli
+        # Scoped to this fork's actual focus (the API layer), not the full
+        # upstream trading-agent codebase.
+        run: ruff check tradingagents/api
 
   gitleaks:
     name: gitleaks (secret scanning)
@@ -121,33 +121,27 @@ jobs:
         run: pip install bandit
       - name: Scan the API layer for common security issues
         # Report-only, same rationale as pip-audit above. Scoped to this
-        # fork's actual focus (the API layer + CLI), not the full upstream
+        # fork's actual focus (the API layer), not the full upstream
         # trading-agent codebase.
         continue-on-error: true
         run: |
           set -o pipefail
-          bandit -r tradingagents/api cli -ll -f txt | tee -a "$GITHUB_STEP_SUMMARY"
+          bandit -r tradingagents/api -ll -f txt | tee -a "$GITHUB_STEP_SUMMARY"
 
   docker-build:
-    name: docker build (${{ matrix.dockerfile }})
+    name: docker build (Dockerfile.api)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - dockerfile: Dockerfile
-            tag: tradingagents:ci
-          - dockerfile: Dockerfile.api
-            tag: tradingagents-api:ci
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Build image
+      - name: Build API image
+        # Only the API image: this fork's CI is scoped to the API layer, the
+        # core CLI image (Dockerfile) isn't part of that.
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
+          file: Dockerfile.api
           push: false
-          tags: ${{ matrix.tag }}
+          tags: tradingagents-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max

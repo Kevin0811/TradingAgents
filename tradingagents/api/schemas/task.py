@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -49,8 +48,8 @@ class TaskResponse(BaseModel):
     trade_date: str
     asset_type: str
     created_at: datetime
-    updated_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    error: Optional[str] = None
-    result: Optional[dict] = None
-    message: Optional[str] = None
+    updated_at: datetime | None = None
+    completed_at: datetime | None = None
+    error: str | None = None
+    result: dict | None = None
+    message: str | None = None
