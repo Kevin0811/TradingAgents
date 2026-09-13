@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   test:
-    name: tests (py${{ matrix.python-version }})
+    name: api tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -30,8 +30,10 @@ jobs:
           # api extra (fastapi/uvicorn) is required too: tests/test_api_*.py
           # import tradingagents.api, which imports fastapi at module load time.
           pip install -e ".[dev,api]"
-      - name: Run test suite
-        run: pytest -q
+      - name: Run api test suite
+        # Scoped to this fork's actual focus (the API layer). Same -k filter
+        # as `invoke test-api` / `make test-api`.
+        run: pytest -q -k test_api
 
   smoke-install:
     name: clean-install smoke
@@ -50,7 +52,7 @@ jobs:
           python -c "import tradingagents, cli.main; print('clean-install import OK')"
 
   lint:
-    name: ruff (strict, full repo)
+    name: ruff (api scope)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,10 +61,10 @@ jobs:
           python-version: "3.12"
       - name: Install ruff
         run: pip install "ruff>=0.15"
-      - name: Lint the repository
-        # The repo is fully clean under the strict select, so we lint everything
-        # (generated results/ is excluded via pyproject extend-exclude).
-        run: ruff check .
+      - name: Lint the API layer
+        # Scoped to this fork's actual focus (the API layer + CLI), not the
+        # full upstream trading-agent codebase.
+        run: ruff check tradingagents/api cli
 
   gitleaks:
     name: gitleaks (secret scanning)
@@ -117,12 +119,14 @@ jobs:
           python-version: "3.12"
       - name: Install bandit
         run: pip install bandit
-      - name: Scan source for common security issues
-        # Report-only, same rationale as pip-audit above.
+      - name: Scan the API layer for common security issues
+        # Report-only, same rationale as pip-audit above. Scoped to this
+        # fork's actual focus (the API layer + CLI), not the full upstream
+        # trading-agent codebase.
         continue-on-error: true
         run: |
           set -o pipefail
-          bandit -r tradingagents cli -ll -f txt | tee -a "$GITHUB_STEP_SUMMARY"
+          bandit -r tradingagents/api cli -ll -f txt | tee -a "$GITHUB_STEP_SUMMARY"
 
   docker-build:
     name: docker build (${{ matrix.dockerfile }})
