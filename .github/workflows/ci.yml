@@ -16,16 +16,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # Only the newest supported interpreter; pyproject still declares
+        # requires-python >= 3.10 for users, we just don't matrix-test it in CI.
+        python-version: ["3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install (with dev extras)
+      - name: Install (with dev + api extras)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # api extra (fastapi/uvicorn) is required too: tests/test_api_*.py
+          # import tradingagents.api, which imports fastapi at module load time.
+          pip install -e ".[dev,api]"
       - name: Run test suite
         run: pytest -q
 
@@ -82,10 +86,6 @@ jobs:
   pip-audit:
     name: pip-audit (dependency vulnerabilities)
     runs-on: ubuntu-latest
-    # Report-only: known CVEs in the (largely third-party) dependency tree
-    # aren't something we can always fix on our own schedule, so this
-    # surfaces findings in the job summary without blocking merges.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -96,6 +96,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[api,dev,bedrock]" pip-audit
       - name: Audit installed dependencies
+        # Report-only: known CVEs in the (largely third-party) dependency tree
+        # aren't something we can always fix on our own schedule, so this
+        # surfaces findings in the job summary without blocking merges.
+        # continue-on-error must live on the step, not the job: a job-level
+        # continue-on-error still leaves the job's own check red, it only
+        # keeps the overall workflow conclusion from being dragged down.
+        continue-on-error: true
         run: |
           set -o pipefail
           pip-audit --desc --format markdown | tee -a "$GITHUB_STEP_SUMMARY"
@@ -103,9 +110,6 @@ jobs:
   bandit:
     name: bandit (Python SAST)
     runs-on: ubuntu-latest
-    # Report-only, same rationale as pip-audit: surfaced in the job summary,
-    # doesn't block merges.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -114,6 +118,8 @@ jobs:
       - name: Install bandit
         run: pip install bandit
       - name: Scan source for common security issues
+        # Report-only, same rationale as pip-audit above.
+        continue-on-error: true
         run: |
           set -o pipefail
           bandit -r tradingagents cli -ll -f txt | tee -a "$GITHUB_STEP_SUMMARY"
