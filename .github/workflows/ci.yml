@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 concurrency:
@@ -59,3 +59,85 @@ jobs:
         # The repo is fully clean under the strict select, so we lint everything
         # (generated results/ is excluded via pyproject extend-exclude).
         run: ruff check .
+
+  gitleaks:
+    name: gitleaks (secret scanning)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so leaked secrets in past commits are caught too.
+          fetch-depth: 0
+      - name: Download gitleaks
+        run: |
+          set -euo pipefail
+          curl -sSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf gitleaks.tar.gz gitleaks
+      - name: Scan for secrets
+        # A real leak fails the job outright; this one is a hard gate, not a
+        # report-only check.
+        run: ./gitleaks detect --source . --redact -v
+
+  pip-audit:
+    name: pip-audit (dependency vulnerabilities)
+    runs-on: ubuntu-latest
+    # Report-only: known CVEs in the (largely third-party) dependency tree
+    # aren't something we can always fix on our own schedule, so this
+    # surfaces findings in the job summary without blocking merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project + pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api,dev,bedrock]" pip-audit
+      - name: Audit installed dependencies
+        run: |
+          set -o pipefail
+          pip-audit --desc --format markdown | tee -a "$GITHUB_STEP_SUMMARY"
+
+  bandit:
+    name: bandit (Python SAST)
+    runs-on: ubuntu-latest
+    # Report-only, same rationale as pip-audit: surfaced in the job summary,
+    # doesn't block merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bandit
+        run: pip install bandit
+      - name: Scan source for common security issues
+        run: |
+          set -o pipefail
+          bandit -r tradingagents cli -ll -f txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+  docker-build:
+    name: docker build (${{ matrix.dockerfile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            tag: tradingagents:ci
+          - dockerfile: Dockerfile.api
+            tag: tradingagents-api:ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: ${{ matrix.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
