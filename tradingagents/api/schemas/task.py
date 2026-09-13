@@ -8,6 +8,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from tradingagents.api.schemas.overrides import RunOverridesMixin
 from tradingagents.api.schemas.validators import validate_ticker_shape
 
 
@@ -21,7 +22,7 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
-class TaskCreateRequest(BaseModel):
+class TaskCreateRequest(RunOverridesMixin):
     """Request body for creating an analysis task."""
 
     ticker: str = Field(..., description="Ticker symbol to analyze (e.g. 'AAPL', 'BTC')")

@@ -44,6 +44,7 @@ class AnalysisService:
         trade_date: str,
         asset_type: str = "stock",
         selected_analysts: tuple[str, ...] = ("market", "social", "news", "fundamentals"),
+        overrides: dict[str, Any] | None = None,
     ) -> AnalysisResult:
         """Run the full trading analysis pipeline.
 
@@ -52,6 +53,9 @@ class AnalysisService:
             trade_date: Trading date in YYYY-MM-DD format.
             asset_type: Asset type ("stock" or "crypto").
             selected_analysts: Tuple of analyst types to include.
+            overrides: Optional per-run config overrides (e.g. max_debate_rounds,
+                deep_think_llm) merged on top of the service's base config. None
+                values are ignored, so callers can pass a sparse dict.
 
         Returns:
             AnalysisResult with all reports and decisions.
@@ -60,10 +64,16 @@ class AnalysisService:
             AnalysisError: If the analysis fails.
         """
         try:
+            effective_config = self._config
+            if overrides:
+                clean_overrides = {k: v for k, v in overrides.items() if v is not None}
+                if clean_overrides:
+                    effective_config = {**(self._config or {}), **clean_overrides}
+
             graph = TradingAgentsGraph(
                 selected_analysts=selected_analysts,
                 debug=self._debug,
-                config=self._config,
+                config=effective_config,
             )
 
             final_state, signal = graph.propagate(ticker, trade_date, asset_type=asset_type)

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from tradingagents.api.config import ApiConfig, get_config
 from tradingagents.api.domain.services.analysis_service import AnalysisService
+from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.domain.services.task_service import TaskService
 from tradingagents.api.dependencies import (
     get_analysis_service,
@@ -50,6 +51,15 @@ router = APIRouter(
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')\n"
         "- `selected_analysts`: List of 'market', 'sentiment', 'news', 'fundamentals'\n"
         "- `debug`: Enable debug mode (default: false)\n\n"
+        "**Performance overrides (all optional; see `GET /config` for current server "
+        "defaults):**\n"
+        "- `research_depth`: 'shallow'/'medium'/'deep' preset for debate/risk rounds "
+        "(1/3/5)\n"
+        "- `max_debate_rounds`, `max_risk_discuss_rounds`: explicit round counts "
+        "(1-5), take precedence over `research_depth`\n"
+        "- `deep_think_llm`, `quick_think_llm`: override the models used for this run\n"
+        "- `max_tokens`, `llm_max_retries`: cap output tokens / retry attempts for "
+        "this run\n\n"
         "**Pipeline Steps:**\n"
         "1. **Analysts** (market, sentiment, news, fundamentals) - gather data and produce reports\n"
         "2. **Researchers** (bull/bear) - debate the investment thesis\n"
@@ -77,6 +87,7 @@ def analyze(
         trade_date=request.trade_date,
         asset_type=request.asset_type.value,
         selected_analysts=selected,
+        overrides=resolve_overrides(request),
     )
 
     return AnalyzeResponse(**result.to_dict())
