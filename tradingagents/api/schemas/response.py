@@ -2,17 +2,48 @@
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 # Re-use structured schemas from agents package
-from tradingagents.agents.schemas import (
-    PortfolioDecision,
-    ResearchPlan,
-    SentimentReport,
-    TraderProposal,
-)
+from tradingagents.agents.schemas import SentimentReport, TraderProposal
+
+
+# ---------------------------------------------------------------------------
+# Rating enums for markdown-parsed decisions
+# ---------------------------------------------------------------------------
+#
+# The core agents.schemas.PortfolioRating enum is intentionally kept to the
+# strict 5-tier scale because it is also the LLM structured-output schema
+# (json_schema/response_schema/tool-use) the Research Manager and Portfolio
+# Manager are constrained to answer with -- widening it to include REVIEW
+# would let a model choose "no rating" as if it were a legitimate answer.
+# REVIEW is instead a sentinel the API adds on its own when it cannot parse a
+# rating out of the rendered markdown, so it needs its own, API-only enum.
+
+
+class ResearchPlanRecommendation(str, Enum):
+    """5-tier recommendation plus REVIEW when it could not be parsed from the report."""
+
+    BUY = "Buy"
+    OVERWEIGHT = "Overweight"
+    HOLD = "Hold"
+    UNDERWEIGHT = "Underweight"
+    SELL = "Sell"
+    REVIEW = "REVIEW"
+
+
+class PortfolioDecisionRating(str, Enum):
+    """5-tier rating plus REVIEW when it could not be parsed from the report."""
+
+    BUY = "Buy"
+    OVERWEIGHT = "Overweight"
+    HOLD = "Hold"
+    UNDERWEIGHT = "Underweight"
+    SELL = "Sell"
+    REVIEW = "REVIEW"
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +213,16 @@ class PredictionMarketsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ResearchPlanResponse(ResearchPlan):
-    """Research plan with metadata."""
+class ResearchPlanResponse(BaseModel):
+    """Research plan with metadata.
 
+    ``recommendation`` may be ``REVIEW`` when the saved report's recommendation
+    could not be parsed -- see ResearchPlanRecommendation.
+    """
+
+    recommendation: ResearchPlanRecommendation
+    rationale: str
+    strategic_actions: str
     ticker: str | None = None
     trade_date: str | None = None
 
@@ -196,9 +234,18 @@ class TraderProposalResponse(TraderProposal):
     trade_date: str | None = None
 
 
-class PortfolioDecisionResponse(PortfolioDecision):
-    """Portfolio decision with metadata."""
+class PortfolioDecisionResponse(BaseModel):
+    """Portfolio decision with metadata.
 
+    ``rating`` may be ``REVIEW`` when the saved report's rating could not be
+    parsed -- see PortfolioDecisionRating.
+    """
+
+    rating: PortfolioDecisionRating
+    executive_summary: str
+    investment_thesis: str
+    price_target: float | None = None
+    time_horizon: str | None = None
     ticker: str | None = None
     trade_date: str | None = None
 
