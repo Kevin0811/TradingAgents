@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Python dependencies (pyproject.toml). Grouped so routine minor/patch
+  # bumps across the (large) langchain-* dependency tree land as one PR
+  # instead of flooding the queue.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-dependencies:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Actions used in .github/workflows/*.yml
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Dockerfile and Dockerfile.api both live at the repo root, so a single
+  # entry covers both base images.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
