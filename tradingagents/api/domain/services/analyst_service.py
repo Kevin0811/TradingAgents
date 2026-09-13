@@ -107,7 +107,11 @@ class AnalystService:
         asset_type: str,
     ) -> str:
         """Run market analyst with tool-calling capability."""
-        from tradingagents.agents.utils.agent_utils import get_indicators, get_stock_data, get_verified_market_snapshot
+        from tradingagents.agents.utils.agent_utils import (
+            get_indicators,
+            get_stock_data,
+            get_verified_market_snapshot,
+        )
 
         identity = resolve_instrument_identity(ticker)
         instrument_context = build_instrument_context(ticker, asset_type, identity)

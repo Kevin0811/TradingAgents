@@ -6,8 +6,8 @@ import logging
 
 from fastapi import APIRouter, Depends, Query
 
-from tradingagents.api.domain.services.decision_service import DecisionService
 from tradingagents.api.dependencies import get_decision_service
+from tradingagents.api.domain.services.decision_service import DecisionService
 from tradingagents.api.schemas.response import (
     PortfolioDecisionResponse,
     ResearchPlanResponse,
