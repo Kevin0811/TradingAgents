@@ -5,17 +5,25 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pydantic import BaseModel
+
 from tradingagents.agents.schemas import (
-    PortfolioDecision,
-    ResearchPlan,
     SentimentReport,
     TraderProposal,
+    _coerce_optional_float,
 )
+from tradingagents.agents.utils.rating import RATING_REVIEW, RATINGS_5_TIER, extract_rating
 from tradingagents.api.core.exceptions import DataNotFoundError
 from tradingagents.api.domain.entities import DecisionState
 from tradingagents.api.domain.repositories import StateRepository
+from tradingagents.api.schemas.response import (
+    PortfolioDecisionRating,
+    ResearchPlanRecommendation,
+)
 
 logger = logging.getLogger(__name__)
+
+_RATING_WORDS = {r.lower() for r in RATINGS_5_TIER}
 
 
 def _clean_enum_value(value: str) -> str:
@@ -28,6 +36,38 @@ def _clean_enum_value(value: str) -> str:
         The cleaned string with markdown symbols removed.
     """
     return value.replace("**", "").replace("*", "").strip()
+
+
+def _parse_price(raw: str) -> float | None:
+    """Clean and parse an optional price field the same way the core Trader/Portfolio
+    schemas do: strip currency symbols and thousands separators, and never salvage
+    a percentage into an absolute price (see tradingagents.agents.schemas._coerce_optional_float).
+    """
+    cleaned = _coerce_optional_float(raw)
+    if cleaned is None:
+        return None
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+class ParsedResearchPlan(BaseModel):
+    """Research plan parsed from markdown; recommendation may be REVIEW."""
+
+    recommendation: ResearchPlanRecommendation
+    rationale: str
+    strategic_actions: str
+
+
+class ParsedPortfolioDecision(BaseModel):
+    """Portfolio decision parsed from markdown; rating may be REVIEW."""
+
+    rating: PortfolioDecisionRating
+    executive_summary: str
+    investment_thesis: str
+    price_target: float | None = None
+    time_horizon: str | None = None
 
 
 class DecisionService:
@@ -72,29 +112,37 @@ class DecisionService:
             raw_state=raw_state,
         )
 
-    def parse_research_plan(self, text: str) -> ResearchPlan:
+    def parse_research_plan(self, text: str) -> ParsedResearchPlan:
         """Parse a research plan from markdown text.
 
         Args:
             text: Markdown-formatted research plan.
 
         Returns:
-            Parsed ResearchPlan.
+            Parsed ResearchPlan. ``recommendation`` is ``"REVIEW"`` rather than a
+            fabricated ``"Hold"`` when no recognizable recommendation is found
+            (mirrors the core graph's rating fix, tradingagents.agents.utils.rating).
         """
-        recommendation = "Hold"
+        recommendation_raw: str | None = None
         rationale = ""
         strategic_actions = ""
 
         for line in text.splitlines():
             line_lower = line.lower().strip()
             if "**recommendation**" in line_lower or "recommendation:" in line_lower:
-                recommendation = _clean_enum_value(line.split(":", 1)[-1].strip())
+                recommendation_raw = _clean_enum_value(line.split(":", 1)[-1].strip())
             elif "**rationale**" in line_lower or "rationale:" in line_lower:
                 rationale = line.split(":", 1)[-1].strip()
             elif "**strategic actions**" in line_lower or "strategic actions:" in line_lower:
                 strategic_actions = line.split(":", 1)[-1].strip()
 
-        return ResearchPlan(
+        recommendation = (
+            recommendation_raw.capitalize()
+            if recommendation_raw and recommendation_raw.lower() in _RATING_WORDS
+            else RATING_REVIEW
+        )
+
+        return ParsedResearchPlan(
             recommendation=recommendation,
             rationale=rationale or "Could not parse rationale from report.",
             strategic_actions=strategic_actions or "Could not parse strategic actions from report.",
@@ -123,15 +171,9 @@ class DecisionService:
             elif "**reasoning**" in line_lower or "reasoning:" in line_lower:
                 reasoning = line_stripped.split(":", 1)[-1].strip()
             elif "**entry price**" in line_lower or "entry price:" in line_lower:
-                try:
-                    entry_price = float(line_stripped.split(":", 1)[-1].strip())
-                except (ValueError, TypeError):
-                    pass
+                entry_price = _parse_price(line_stripped.split(":", 1)[-1].strip())
             elif "**stop loss**" in line_lower or "stop loss:" in line_lower:
-                try:
-                    stop_loss = float(line_stripped.split(":", 1)[-1].strip())
-                except (ValueError, TypeError):
-                    pass
+                stop_loss = _parse_price(line_stripped.split(":", 1)[-1].strip())
             elif "**position sizing**" in line_lower or "position sizing:" in line_lower:
                 position_sizing = line_stripped.split(":", 1)[-1].strip()
 
@@ -153,16 +195,17 @@ class DecisionService:
             position_sizing=position_sizing,
         )
 
-    def parse_portfolio_decision(self, text: str) -> PortfolioDecision:
+    def parse_portfolio_decision(self, text: str) -> ParsedPortfolioDecision:
         """Parse a portfolio decision from markdown text.
 
         Args:
             text: Markdown-formatted portfolio decision.
 
         Returns:
-            Parsed PortfolioDecision.
+            Parsed PortfolioDecision. ``rating`` is ``"REVIEW"`` rather than a
+            fabricated ``"Hold"`` when no recognizable rating is found (see
+            tradingagents.agents.utils.rating.extract_rating).
         """
-        rating = "Hold"
         executive_summary = ""
         investment_thesis = ""
         price_target = None
@@ -171,21 +214,18 @@ class DecisionService:
         for line in text.splitlines():
             line_stripped = line.strip()
             line_lower = line_stripped.lower()
-            if "**rating**" in line_lower or "rating:" in line_lower:
-                rating = _clean_enum_value(line_stripped.split(":", 1)[-1].strip())
-            elif "**executive summary**" in line_lower or "executive summary:" in line_lower:
+            if "**executive summary**" in line_lower or "executive summary:" in line_lower:
                 executive_summary = line_stripped.split(":", 1)[-1].strip()
             elif "**investment thesis**" in line_lower or "investment thesis:" in line_lower:
                 investment_thesis = line_stripped.split(":", 1)[-1].strip()
             elif "**price target**" in line_lower or "price target:" in line_lower:
-                try:
-                    price_target = float(line_stripped.split(":", 1)[-1].strip())
-                except (ValueError, TypeError):
-                    pass
+                price_target = _parse_price(line_stripped.split(":", 1)[-1].strip())
             elif "**time horizon**" in line_lower or "time horizon:" in line_lower:
                 time_horizon = line_stripped.split(":", 1)[-1].strip()
 
-        return PortfolioDecision(
+        rating = extract_rating(text) or RATING_REVIEW
+
+        return ParsedPortfolioDecision(
             rating=rating,
             executive_summary=executive_summary or "Could not parse executive summary from report.",
             investment_thesis=investment_thesis or "Could not parse investment thesis from report.",

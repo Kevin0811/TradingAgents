@@ -49,6 +49,7 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     # Import routers here to avoid circular imports
     from tradingagents.api.routers.analyze import router as analyze_router
     from tradingagents.api.routers.analysts import router as analysts_router
+    from tradingagents.api.routers.config import router as config_router
     from tradingagents.api.routers.data import router as data_router
     from tradingagents.api.routers.decisions import router as decisions_router
 
@@ -82,6 +83,7 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     # Include routers with versioned prefix
     app.include_router(analyze_router, prefix=f"/api/{api_version}")
     app.include_router(analysts_router, prefix=f"/api/{api_version}")
+    app.include_router(config_router, prefix=f"/api/{api_version}")
     app.include_router(data_router, prefix=f"/api/{api_version}")
     app.include_router(decisions_router, prefix=f"/api/{api_version}")
 
