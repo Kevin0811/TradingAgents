@@ -89,6 +89,11 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]   # intentional re-exports
+# FastAPI's Depends()/Query()/Body() in argument defaults is the framework's
+# own documented pattern for dependency injection, not the mutable-default
+# footgun B008 exists to catch.
+"tradingagents/api/routers/*.py" = ["B008"]
+"tradingagents/api/dependencies.py" = ["B008"]
 
 [tool.ruff.lint.isort]
 # Keep multiple aliased names from one module in a single combined import block
