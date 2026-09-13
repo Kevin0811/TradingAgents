@@ -32,8 +32,6 @@ from tradingagents.api.core.exceptions import (
 
 # Task management exports
 from tradingagents.api.core.task_manager import TaskManager
-from tradingagents.api.domain.services.task_service import TaskService
-from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
 
 # Domain exports
 from tradingagents.api.domain.entities import (
@@ -59,6 +57,7 @@ from tradingagents.api.infrastructure import (
     FileStateRepository,
     LLMProviderFactory,
 )
+from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
 
 __all__ = [
     # App factory

@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timedelta
-from typing import Optional
 from uuid import uuid4
 
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
@@ -39,7 +38,7 @@ class TaskManager:
 
     def find_active_task(
         self, ticker: str, trade_date: str, asset_type: str
-    ) -> Optional[TaskResponse]:
+    ) -> TaskResponse | None:
         """Find an existing task with the same parameters that is still running.
 
         Args:
@@ -113,7 +112,7 @@ class TaskManager:
             logger.info("Created new task %s for %s/%s/%s", task_id, request.ticker, request.trade_date, request.asset_type)
             return task, True
 
-    def get_task(self, task_id: str) -> Optional[TaskResponse]:
+    def get_task(self, task_id: str) -> TaskResponse | None:
         """Get a task by ID.
 
         Args:
@@ -126,7 +125,7 @@ class TaskManager:
             return self._tasks.get(task_id)
 
     def list_tasks(
-        self, status: Optional[TaskStatus] = None, ticker: Optional[str] = None
+        self, status: TaskStatus | None = None, ticker: str | None = None
     ) -> list[TaskResponse]:
         """List tasks with optional filters.
 
@@ -213,11 +212,10 @@ class TaskManager:
                 if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                     if task.completed_at and task.completed_at < cutoff:
                         to_remove.append(task_id)
-                elif task.status == TaskStatus.PENDING and self._ttl > 0:
-                    # Only clean up stale pending tasks when TTL is enabled
-                    # Avoids removing freshly created tasks when ttl=0 (test scenarios)
-                    if task.created_at < cutoff:
-                        to_remove.append(task_id)
+                # Only clean up stale pending tasks when TTL is enabled.
+                # Avoids removing freshly created tasks when ttl=0 (test scenarios).
+                elif task.status == TaskStatus.PENDING and self._ttl > 0 and task.created_at < cutoff:
+                    to_remove.append(task_id)
 
             for task_id in to_remove:
                 del self._tasks[task_id]

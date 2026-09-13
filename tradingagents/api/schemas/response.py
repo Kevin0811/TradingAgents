@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 # Re-use structured schemas from agents package
 from tradingagents.agents.schemas import SentimentReport, TraderProposal
-
 
 # ---------------------------------------------------------------------------
 # Rating enums for markdown-parsed decisions

@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.exceptions import AnalysisError
+from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus

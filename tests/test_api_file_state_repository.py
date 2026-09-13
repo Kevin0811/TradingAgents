@@ -53,17 +53,25 @@ class TestFileStateRepositoryLoadState:
             repo.load_state("NONEXISTENT", "2026-06-01")
 
     def test_uses_safe_ticker_component(self, tmp_path):
-        """The repository must apply safe_ticker_component() to the ticker."""
+        """The repository must run the ticker through safe_ticker_component()
+        (path-traversal safety) rather than interpolating it directly.
+
+        safe_ticker_component() validates but does not change casing (see
+        tradingagents/dataflows/utils.py), and neither does the write side
+        (trading_graph.py writes results under whatever case the caller
+        passed in) -- so, unlike checkpointer.py's own ticker handling, a
+        ticker here is matched case-sensitively end to end. The fixture
+        directory case must therefore match the ticker passed to
+        load_state().
+        """
         results_dir = tmp_path / "results"
-        # safe_ticker_component uppercases and normalizes
-        ticker_dir = results_dir / "AAPL" / "TradingAgentsStrategy_logs"
+        ticker_dir = results_dir / "aapl" / "TradingAgentsStrategy_logs"
         ticker_dir.mkdir(parents=True)
 
         state_file = ticker_dir / "full_states_log_2026-06-01.json"
         state_file.write_text(json.dumps({"test": "value"}), encoding="utf-8")
 
         repo = FileStateRepository(results_dir=results_dir)
-        # lowercase ticker should still work because safe_ticker_component uppercases it
         state = repo.load_state("aapl", "2026-06-01")
         assert state == {"test": "value"}
 
