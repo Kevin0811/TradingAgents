@@ -5,10 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tradingagents.api.schemas.overrides import RunOverridesMixin
-from tradingagents.api.schemas.validators import validate_ticker_shape
+from tradingagents.api.schemas.validators import (
+    validate_ticker_shape,
+    validate_ticker_supported,
+)
 
 
 class TaskStatus(str, Enum):
@@ -37,6 +40,7 @@ class TaskCreateRequest(RunOverridesMixin):
     debug: bool = Field(default=False, description="Enable debug mode with verbose output")
 
     _validate_ticker = field_validator("ticker")(validate_ticker_shape)
+    _check_ticker_supported = model_validator(mode="after")(validate_ticker_supported)
 
 
 class TaskResponse(BaseModel):

@@ -2,11 +2,43 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
-from tradingagents.default_api_config import DEFAULT_API_CONFIG
+from tradingagents.default_api_config import DEFAULT_API_CONFIG, _coerce
 from tradingagents.default_config import DEFAULT_CONFIG
+
+# Supported-symbols list settings. Kept in the API package (rather than in
+# default_api_config.py) so the feature stays self-contained; the env vars
+# follow the same TRADINGAGENTS_* convention and are coerced the same way.
+_SYMBOLS_ENV_OVERRIDES = {
+    "TRADINGAGENTS_SYMBOLS_CACHE_DIR": "symbols_cache_dir",
+    "TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS": "symbols_cache_ttl_days",
+    "TRADINGAGENTS_SYMBOLS_AUTO_REFRESH": "symbols_auto_refresh",
+    "TRADINGAGENTS_SYMBOLS_INCLUDE_OTC": "symbols_include_otc",
+    "TRADINGAGENTS_SYMBOLS_PAGE_DELAY_SECONDS": "symbols_page_delay_seconds",
+    "TRADINGAGENTS_SYMBOLS_MAX_PAGES": "symbols_max_pages",
+}
+
+
+def _symbols_defaults() -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "symbols_cache_dir": None,  # None -> <data_cache_dir>/symbols
+        "symbols_cache_ttl_days": 7,
+        "symbols_auto_refresh": True,
+        "symbols_include_otc": False,
+        "symbols_page_delay_seconds": 1.0,
+        "symbols_max_pages": 200,  # per screener query (250 rows a page)
+    }
+    for env_var, key in _SYMBOLS_ENV_OVERRIDES.items():
+        raw = os.environ.get(env_var)
+        if raw:
+            defaults[key] = _coerce(raw, defaults[key])
+    return defaults
+
+
+SYMBOLS_DEFAULT_CONFIG = _symbols_defaults()
 
 
 class ApiConfig:
@@ -23,7 +55,11 @@ class ApiConfig:
         Args:
             overrides: Optional dict to override default config values.
         """
-        self._config: dict[str, Any] = {**DEFAULT_CONFIG, **DEFAULT_API_CONFIG}
+        self._config: dict[str, Any] = {
+            **DEFAULT_CONFIG,
+            **DEFAULT_API_CONFIG,
+            **SYMBOLS_DEFAULT_CONFIG,
+        }
         if overrides:
             self._config.update(overrides)
 
@@ -76,6 +112,22 @@ class ApiConfig:
     def analyst_concurrency_limit(self) -> int:
         """Return the analyst concurrency limit."""
         return int(self._config.get("analyst_concurrency_limit", 4))
+
+    @property
+    def symbols_cache_dir(self) -> Path:
+        """Return the directory holding the supported-symbols cache files."""
+        configured = self._config.get("symbols_cache_dir")
+        return Path(configured) if configured else self.data_cache_dir / "symbols"
+
+    @property
+    def symbols_cache_ttl_days(self) -> float:
+        """Return the age (days) after which a cached symbol list is stale."""
+        return float(self._config.get("symbols_cache_ttl_days", 7))
+
+    @property
+    def symbols_auto_refresh(self) -> bool:
+        """Return whether missing/stale symbol lists refresh in the background."""
+        return bool(self._config.get("symbols_auto_refresh", True))
 
     def ensure_directories(self) -> None:
         """Create required directories if they don't exist."""

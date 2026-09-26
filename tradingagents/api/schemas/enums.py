@@ -61,3 +61,30 @@ class IndicatorName(str, Enum):
     ATR = "atr"
     VWMA = "vwma"
     MFI = "mfi"  # yfinance only
+
+
+class SymbolMarket(str, Enum):
+    """Markets covered by the supported-symbols list."""
+
+    TW = "tw"
+    US = "us"
+    JP = "jp"
+    CRYPTO = "crypto"
+    FX = "fx"
+
+
+class SymbolType(str, Enum):
+    """Instrument types on the supported-symbols list."""
+
+    EQUITY = "equity"
+    ETF = "etf"
+    CRYPTO = "crypto"
+    CURRENCY = "currency"
+
+
+class SymbolListStatus(str, Enum):
+    """Load state of one market's supported-symbols list."""
+
+    READY = "ready"  # list loaded (it may still be stale; see ``stale``)
+    LOADING = "loading"  # no list yet; a background fetch is queued or running
+    UNAVAILABLE = "unavailable"  # no list and no fetch in progress (e.g. it failed)
