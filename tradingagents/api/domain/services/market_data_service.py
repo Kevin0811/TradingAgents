@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from tradingagents.agents.utils.agent_utils import (
+from tradingagents.agents.tools import (
     get_balance_sheet,
     get_cashflow,
     get_fundamentals,
@@ -29,8 +29,10 @@ from tradingagents.api.core.exceptions import (
     ExternalServiceError,
     InvalidRequestError,
 )
-from tradingagents.api.domain.symbols import to_yahoo_symbol
+from tradingagents.api.domain.symbols import bare_crypto_to_pair, to_yahoo_symbol
 from tradingagents.api.domain.vendor_reports import (
+    NO_DATA_SENTINEL,
+    UNAVAILABLE_SENTINEL,
     parse_indicator_report,
     parse_ohlcv_csv,
 )
@@ -39,8 +41,6 @@ from tradingagents.dataflows.errors import (
     VendorNotConfiguredError,
     VendorRateLimitError,
 )
-from tradingagents.dataflows.interface import NO_DATA_SENTINEL, UNAVAILABLE_SENTINEL
-from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair
 
 logger = logging.getLogger(__name__)
 
@@ -353,9 +353,7 @@ class MarketDataService:
         def _statement(tool):
             # freq and curr_date are passed by name: positionally, trade_date
             # would land in the tool's `freq` slot.
-            return self._call(
-                tool, {"ticker": symbol, "freq": freq, "curr_date": trade_date}
-            )
+            return self._call(tool, {"ticker": symbol, "freq": freq, "curr_date": trade_date})
 
         if report_type == "all":
             return {

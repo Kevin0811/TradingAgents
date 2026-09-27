@@ -25,13 +25,18 @@ from tradingagents.api.domain.services.symbol_catalog import (
     get_active_catalog,
     set_active_catalog,
 )
-from tradingagents.api.domain.symbols import api_forex_symbol, classify_market, list_key
+from tradingagents.api.domain.symbols import (
+    api_forex_symbol,
+    bare_crypto_to_pair,
+    classify_market,
+    list_key,
+)
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.task import TaskCreateRequest
-from tradingagents.dataflows.symbol_utils import normalize_symbol
+from tradingagents.dataflows.symbols import normalize_symbol
 
 DATE = "2026-09-25"
 LISTS = {
@@ -311,3 +316,27 @@ class TestSymbolRules:
     )
     def test_classify_market(self, key, market):
         assert classify_market(key) == market
+
+
+class TestBareCryptoToPair:
+    """Opt-in convenience for API callers whose input is known to be a coin.
+
+    Moved here from the core (``symbol_utils.bare_crypto_to_pair``) when the
+    core was re-synced from upstream, which has no such helper.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("BTC", "BTC-USD"), ("eth", "ETH-USD"), ("  SOL  ", "SOL-USD"), ("BTC+", "BTC-USD")],
+    )
+    def test_resolves_bare_bases(self, raw, expected):
+        assert bare_crypto_to_pair(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["AAPL", "BTC-USD", "BTCUSD", "EURUSD", "GOLD", "", "-", None])
+    def test_non_bases_return_none(self, raw):
+        assert bare_crypto_to_pair(raw) is None
+
+    def test_core_normalizer_still_leaves_bare_bases_alone(self):
+        # BTC is also a listed spot-bitcoin ETF, so the global normalizer must
+        # not rewrite it; only the API's crypto path opts in.
+        assert normalize_symbol("BTC") == "BTC"

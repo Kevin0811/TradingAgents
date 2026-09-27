@@ -14,7 +14,7 @@ from tradingagents.agents import (
     create_news_analyst,
     create_sentiment_analyst,
 )
-from tradingagents.agents.utils.agent_utils import (
+from tradingagents.agents.context import (
     build_instrument_context,
     get_language_instruction,
     resolve_instrument_identity,
@@ -108,7 +108,7 @@ class AnalystService:
         asset_type: str,
     ) -> str:
         """Run market analyst with tool-calling capability."""
-        from tradingagents.agents.utils.agent_utils import (
+        from tradingagents.agents.tools import (
             get_indicators,
             get_stock_data,
             get_verified_market_snapshot,
