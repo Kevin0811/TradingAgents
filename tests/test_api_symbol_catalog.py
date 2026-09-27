@@ -21,6 +21,7 @@ from tradingagents.api.domain.symbols import REJECT_UNLISTED_TICKERS
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
+from tradingagents.api.infrastructure.yahoo_symbol_source import SymbolSourceError
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
 
@@ -546,6 +547,66 @@ class TestRefreshGuard:
         source = FakeSource({"tw": _tw_list(1)})
         catalog, _ = make_catalog(tmp_path, source, auto_refresh=False)
         assert catalog.refresh_market("tw") is True
+
+    def test_force_accepts_a_real_shrink(self, tmp_path, caplog):
+        catalog, repo = self._catalog(tmp_path, _tw_list(9, 1), _tw_list(3))
+
+        assert catalog.refresh_market("tw", force=True) is True
+
+        assert len(repo.load("tw").entries) == 3  # below 80% and the ETF group gone
+        assert catalog.last_error("tw") is None
+        assert "Accepting the shrunken tw symbol list because the refresh was forced" in (
+            caplog.text
+        )
+
+    def test_force_never_accepts_a_failed_fetch(self, tmp_path):
+        catalog, repo = self._catalog(tmp_path, _tw_list(10), SymbolSourceError("page cap"))
+        before = (tmp_path / "tw.json").read_bytes()
+
+        assert catalog.refresh_market("tw", force=True) is False
+
+        assert (tmp_path / "tw.json").read_bytes() == before
+        assert "page cap" in catalog.last_error("tw")
+
+    def test_a_forced_manual_refresh_threads_force_through_the_queue(self, tmp_path):
+        catalog, repo = self._catalog(tmp_path, _tw_list(10), _tw_list(3))
+
+        assert catalog.request_manual_refresh(["tw"]) == (["tw"], [])
+        assert catalog.wait_idle(5)
+        assert len(repo.load("tw").entries) == 10  # not forced: refused
+        assert "refused a suspicious refresh" in catalog.last_error("tw")
+
+        assert catalog.request_manual_refresh(["tw"], force=True) == (["tw"], [])
+        assert catalog.wait_idle(5)
+        assert len(repo.load("tw").entries) == 3  # forced: accepted
+
+    def test_force_is_used_once_and_never_leaks_into_later_refreshes(self, tmp_path):
+        catalog, repo = self._catalog(tmp_path, _tw_list(10), _tw_list(9))
+        catalog.request_manual_refresh(["tw"], force=True)
+        assert catalog.wait_idle(5)
+        assert len(repo.load("tw").entries) == 9
+
+        catalog._source.results["tw"] = _tw_list(2)
+        assert catalog.request_manual_refresh(["tw"]) == ([], ["tw"])  # cooldown
+        catalog.request_refresh(["tw"])  # an automatic refresh
+        assert catalog.wait_idle(5)
+        assert len(repo.load("tw").entries) == 9
+
+    def test_forcing_a_market_mid_fetch_queues_a_forced_fetch(self, tmp_path):
+        source = FakeSource({"tw": _tw_list(3)})
+        source.gate = threading.Event()
+        catalog, repo = make_catalog(tmp_path, source, auto_refresh=False)
+        seed_cache(repo, entries=_tw_list(10))
+        catalog.start()
+
+        catalog.request_refresh(["tw"])  # an unforced fetch, held at the gate
+        assert source.entered.wait(5)
+        assert catalog.request_manual_refresh(["tw"], force=True) == (["tw"], [])
+        source.gate.set()
+        assert catalog.wait_idle(5)
+
+        assert source.calls == ["tw", "tw"]
+        assert len(repo.load("tw").entries) == 3
 
     def test_a_good_refresh_clears_the_last_error(self, tmp_path):
         catalog, _ = self._catalog(tmp_path, _tw_list(9, 1), _tw_list(1))

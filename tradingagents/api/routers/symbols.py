@@ -160,15 +160,19 @@ def check_symbol(
         "markets refresh one at a time. `market` limits it to one market; omit it to "
         "refresh all. A market whose list was fetched within the last 30 minutes is "
         "listed in `skipped` instead of `queued`, unless `force=true`. A failed "
-        "refresh, or one that looks truncated (under 80% of the previous entries, or an "
-        "exchange/type group gone empty), keeps the previous list and sets its "
-        "`last_error`. Poll `GET /symbols?market=...&limit=0` and watch `fetched_at` / "
+        "refresh keeps the previous list and sets its `last_error`, and so does one that "
+        "looks truncated (under 80% of the previous entries, or an exchange/type group "
+        "gone empty) unless `force=true`, which accepts such a shrink deliberately. A "
+        "fetch that fails or comes back incomplete is never saved, forced or not. Poll `GET /symbols?market=...&limit=0` and watch `fetched_at` / "
         "`refreshing` / `last_error`."
     ),
 )
 async def refresh_symbols(
     market: SymbolMarket | None = Query(default=None, description="Market; omit for all"),
-    force: bool = Query(default=False, description="Ignore the 30-minute cooldown"),
+    force: bool = Query(
+        default=False,
+        description="Ignore the 30-minute cooldown and accept a shrunken list",
+    ),
     catalog: SymbolCatalog = Depends(get_symbol_catalog),
 ) -> SymbolRefreshResponse:
     """Queue a background refresh of one or all markets."""

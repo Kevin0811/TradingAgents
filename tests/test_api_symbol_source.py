@@ -14,10 +14,14 @@ from yfinance import EquityQuery, ETFQuery
 
 from tradingagents.api.infrastructure.yahoo_symbol_source import (
     MARKET_EXCHANGES,
+    PAGE_RETRIES,
+    PAGE_RETRY_BASE_DELAY_SECONDS,
     PAGE_SIZE,
+    RETRY_AFTER_MAX_SECONDS,
     US_OTC_EXCHANGES,
     SymbolSourceError,
     YahooSymbolSource,
+    http_status,
 )
 
 
@@ -387,3 +391,163 @@ class TestLookupMarkets:
             src.fetch("fx")
         with pytest.raises(SymbolSourceError):
             src.fetch("crypto")
+
+
+# ---------------------------------------------------------------------------
+# Per-request retries on 5xx / 429
+# ---------------------------------------------------------------------------
+
+
+class _Response:
+    def __init__(self, status_code: int, headers: dict | None = None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+def _http_error(status: int, headers: dict | None = None):
+    """The exception yfinance's ``raise_for_status`` raises (curl_cffi's HTTPError)."""
+    from curl_cffi.requests.exceptions import HTTPError
+
+    return HTTPError(f"HTTP Error {status}: ", 0, _Response(status, headers))
+
+
+class FlakyScreen(FakeScreen):
+    """Fails the request at ``(exchange, kind, offset)`` with ``errors``, in order."""
+
+    def __init__(self, data, fail_at: tuple[str, str, int], errors: list[Exception]):
+        super().__init__(data)
+        self.fail_at = fail_at
+        self.errors = list(errors)
+
+    def __call__(self, query, offset=0, size=25, sortField=None, sortAsc=None):
+        kind = "etf" if isinstance(query, ETFQuery) else "equity"
+        if (_exchange_of(query.to_dict()), kind, offset) == self.fail_at and self.errors:
+            self.calls.append({"exchange": self.fail_at[0], "kind": kind, "offset": offset})
+            raise self.errors.pop(0)
+        return super().__call__(query, offset, size, sortField, sortAsc)
+
+
+def _page_calls(screen, exchange="TAI", kind="equity"):
+    return [c["offset"] for c in screen.calls if c["exchange"] == exchange and c["kind"] == kind]
+
+
+@pytest.mark.unit
+class TestRetries:
+    def test_constants(self):
+        assert (PAGE_RETRIES, PAGE_RETRY_BASE_DELAY_SECONDS) == (3, 2.0)
+
+    def test_a_500_mid_query_is_retried_and_the_fetch_completes(self, caplog):
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 600, ".TW")},
+            fail_at=("TAI", "equity", 250),
+            errors=[_http_error(500), _http_error(503)],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        entries = src.fetch("tw")
+
+        assert len(entries) == 600
+        assert _page_calls(screen) == [0, 250, 250, 250, 500]
+        assert sleeps == [2.0, 5.0]  # backoff before retries 1 and 2
+        assert "screener tw/TAI/equity offset=250 failed with HTTP 500" in caplog.text
+        assert "retry 1 of 3 in 2.0s" in caplog.text
+        assert "failed with HTTP 503" in caplog.text and "retry 2 of 3 in 5.0s" in caplog.text
+
+    def test_a_page_that_keeps_failing_fails_the_market_after_three_retries(self):
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 600, ".TW")},
+            fail_at=("TAI", "equity", 250),
+            errors=[_http_error(500)] * 10,
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        with pytest.raises(Exception, match="HTTP Error 500"):
+            src.fetch("tw")
+
+        assert _page_calls(screen) == [0, 250, 250, 250, 250]  # 1 try + 3 retries
+        assert sleeps == [2.0, 5.0, 10.0]
+
+    def test_429_is_retried_including_yfinance_rate_limit_errors(self):
+        from yfinance.exceptions import YFRateLimitError
+
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 10, ".TW")},
+            fail_at=("TAI", "equity", 0),
+            errors=[_http_error(429), YFRateLimitError()],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        assert len(src.fetch("tw")) == 10
+        assert sleeps == [2.0, 5.0]
+
+    @pytest.mark.parametrize(
+        "error", [_http_error(404), _http_error(400), _http_error(401), ValueError("bad json")]
+    )
+    def test_other_errors_are_not_retried(self, error):
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 10, ".TW")},
+            fail_at=("TAI", "equity", 0),
+            errors=[error],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        with pytest.raises(type(error)):
+            src.fetch("tw")
+        assert _page_calls(screen) == [0]
+        assert sleeps == []
+
+    @pytest.mark.parametrize(
+        ("retry_after", "slept"),
+        [
+            ("7", 7.0),
+            ("0", 0.0),
+            ("600", RETRY_AFTER_MAX_SECONDS),  # capped
+            ("Wed, 21 Oct 2026 07:28:00 GMT", 2.0),  # date form: fall back to backoff
+        ],
+    )
+    def test_retry_after_is_honoured(self, retry_after, slept):
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 10, ".TW")},
+            fail_at=("TAI", "equity", 0),
+            errors=[_http_error(503, {"Retry-After": retry_after})],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        src.fetch("tw")
+        assert sleeps == [slept]
+
+    def test_lookup_errors_are_retried_too(self, caplog):
+        from yfinance.exceptions import YFDataException
+
+        lookup = FakeLookup({"currency": [{"symbol": "TWD=X", "shortName": "USD/TWD"}]})
+        failures = [
+            YFDataException(
+                "USD: 'lookup' fetch returned error: {'code': 'Internal Server Error', "
+                "'description': 'Server caught an exception'}"
+            )
+        ]
+
+        def factory(query):
+            if failures:
+                raise failures.pop(0)
+            return lookup(query)
+
+        src, sleeps = _source(lookup_factory=factory, page_delay_seconds=0)
+
+        assert "TWD=X" in {e.symbol for e in src.fetch("fx")}
+        assert sleeps == [2.0]
+        assert "lookup fx count=1000 failed with HTTP 500" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            (_http_error(502), 502),
+            (RuntimeError("HTTP Error 500: "), 500),
+            (RuntimeError("503 Server Error: Service Unavailable for url"), 503),
+            (RuntimeError("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***"), 503),
+            (RuntimeError("Too Many Requests. Rate limited."), 429),
+            (RuntimeError("no data"), None),
+        ],
+    )
+    def test_http_status(self, error, status):
+        assert http_status(error) == status

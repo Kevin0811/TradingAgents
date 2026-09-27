@@ -49,12 +49,15 @@ class FakeSource:
         self.gate = threading.Event()
         self.gate.set()
         self.error: Exception | None = None
+        self.shrink_to: int | None = None
 
     def fetch(self, market):
         self.calls.append(market)
         self.gate.wait(5)
         if self.error is not None:
             raise self.error
+        if self.shrink_to is not None:
+            return DATA.get(market, [])[: self.shrink_to]
         return [*DATA.get(market, []), SymbolEntry("NEW1", "New", "NYQ", "equity", market)]
 
     def source_label(self, market):
@@ -282,6 +285,22 @@ class TestRefresh:
         assert resp.json() == {"queued": ["us"], "skipped": []}
         assert app.state.symbol_catalog.wait_idle(5)
         assert app.state.symbol_catalog._source.calls.count("us") == 2
+
+    def test_force_accepts_a_shrunken_list(self, make_client):
+        client, app = make_client()
+        catalog = app.state.symbol_catalog
+        catalog._source.shrink_to = 1  # the tw list comes back with 1 of 4 rows
+
+        client.post(f"{BASE}/refresh", params={"market": "tw"})
+        assert catalog.wait_idle(5)
+        assert client.get(BASE, params={"market": "tw", "limit": 0}).json()["total"] == 4
+        assert "refused a suspicious refresh" in catalog.last_error("tw")
+
+        resp = client.post(f"{BASE}/refresh", params={"market": "tw", "force": "true"})
+        assert resp.json() == {"queued": ["tw"], "skipped": []}
+        assert catalog.wait_idle(5)
+        body = client.get(BASE, params={"market": "tw", "limit": 0}).json()
+        assert (body["total"], body["last_error"]) == (1, None)
 
     def test_refresh_rejects_unknown_market(self, make_client):
         client, _ = make_client()

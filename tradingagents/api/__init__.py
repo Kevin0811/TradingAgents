@@ -24,14 +24,18 @@ Supported symbols:
       the list status)
     - ``POST /symbols/refresh[?market=][&force=true]`` queue a background
       refresh (202 with ``queued`` / ``skipped``; a market fetched within the
-      last 30 minutes is skipped unless forced)
+      last 30 minutes is skipped unless forced; ``force`` also accepts a
+      shrunken list, never an incomplete fetch)
 
     Lists are cached as ``<cache dir>/<market>.json`` (default
     ``<data_cache_dir>/symbols``, i.e. ``~/.tradingagents/cache/symbols``) and
     loaded at startup; missing or stale ones refresh in the background, one
     market at a time. A failed refresh keeps the previous list, and so does a
     refresh that looks truncated (under 80% of the previous entries, or an
-    exchange/type group gone empty); either sets ``last_error``. A miss in a
+    exchange/type group gone empty) unless the refresh was forced; either
+    sets ``last_error``. A screener page or lookup that fails with a 5xx or
+    429 is retried up to 3 times (2 s, 5 s, 10 s, or ``Retry-After``) before
+    the market's refresh fails. A miss in a
     list older than a day queues a (rate-limited) refresh of that market, so
     new listings show up. Requests never wait on the network. Settings (env
     var -> config key):

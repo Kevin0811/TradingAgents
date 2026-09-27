@@ -8,6 +8,12 @@ requests and a hard page cap, and raises on any failure, including a query
 that stops short of its reported total or runs into the page cap, so the
 caller keeps the previous list instead of saving a partial one.
 
+Yahoo also fails single pages transiently (HTTP 500 "Server caught an
+exception" deep into a query, or 429). Each screener page and lookup request
+is therefore retried on a 5xx or 429, up to ``PAGE_RETRIES`` times with a
+growing pause (2 s, 5 s, 10 s, or the server's ``Retry-After``); other errors,
+including every other 4xx, fail the market at once.
+
 Exchange codes (Yahoo's own, as listed in yfinance's screener value map):
 
 * tw: TAI (TWSE, ``.TW``), TWO (TPEx, ``.TWO``)
@@ -25,6 +31,7 @@ preferred shares and TDRs.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
@@ -43,6 +50,15 @@ MARKET_EXCHANGES: dict[str, tuple[str, ...]] = {
 US_OTC_EXCHANGES: tuple[str, ...] = ("PNK", "OEM", "OQB", "OQX")
 
 PAGE_SIZE = 250  # Yahoo's hard cap per screener page
+
+# Retries of one screener page / lookup request after a 5xx or 429 (on top of
+# the first attempt). The pause before retry n is the base delay times
+# _RETRY_BACKOFF[n]: 2 s, 5 s, 10 s. A Retry-After header, when present,
+# replaces it (capped at RETRY_AFTER_MAX_SECONDS).
+PAGE_RETRIES = 3
+PAGE_RETRY_BASE_DELAY_SECONDS = 2.0
+_RETRY_BACKOFF = (1.0, 2.5, 5.0)
+RETRY_AFTER_MAX_SECONDS = 60.0
 LOOKUP_QUERY = "USD"
 LOOKUP_COUNT = 1000
 
@@ -71,6 +87,66 @@ _SEED_CURRENCIES = (
 
 class SymbolSourceError(RuntimeError):
     """Raised when a market's list could not be fetched completely."""
+
+
+_STATUS_IN_MESSAGE = re.compile(r"\bHTTP Error (\d{3})\b|\b(\d{3}) (?:Server|Client) Error\b")
+# Error texts that carry no status code: yfinance reports a lookup's error
+# payload, its own rate limiting and Yahoo's outage page this way.
+_STATUS_BY_TEXT = (
+    ("Internal Server Error", 500),
+    ("Server caught an exception", 500),
+    ("Bad Gateway", 502),
+    ("Service Unavailable", 503),
+    ("Gateway Timeout", 504),
+    ("CURRENTLY DOWN", 503),
+    ("Too Many Requests", 429),
+)
+
+
+def http_status(exc: BaseException) -> int | None:
+    """Best-effort HTTP status of a yfinance / HTTP-client error, else None.
+
+    Reads ``exc.response.status_code`` (curl_cffi and requests HTTPError),
+    then ``exc.status_code``, then the status in the message ("HTTP Error
+    500"), then the few status-less texts yfinance raises for Yahoo errors.
+    """
+    response = getattr(exc, "response", None)
+    for candidate in (getattr(response, "status_code", None), getattr(exc, "status_code", None)):
+        if isinstance(candidate, int) and 100 <= candidate <= 599:
+            return candidate
+    if type(exc).__name__ == "YFRateLimitError":
+        return 429
+    text = str(exc)
+    match = _STATUS_IN_MESSAGE.search(text)
+    if match:
+        return int(match.group(1) or match.group(2))
+    for needle, status in _STATUS_BY_TEXT:
+        if needle in text:
+            return status
+    return None
+
+
+def is_retryable_status(status: int | None) -> bool:
+    """True for 429 and 5xx: worth retrying the same request."""
+    return status is not None and (status == 429 or 500 <= status <= 599)
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """The response's ``Retry-After`` in seconds (numeric form only), capped."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    try:
+        raw = headers.get("Retry-After")
+    except Exception:  # pragma: no cover - exotic header containers
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, RETRY_AFTER_MAX_SECONDS)
 
 
 def _first(quote: dict[str, Any], *keys: str) -> str:
@@ -195,7 +271,12 @@ class YahooSymbolSource:
         total: int | None = None
         for _ in range(self._max_pages):
             self._pace()
-            result = screen(query, offset=offset, size=PAGE_SIZE, sortField="ticker", sortAsc=True)
+            result = self._with_retries(
+                lambda offset=offset: screen(
+                    query, offset=offset, size=PAGE_SIZE, sortField="ticker", sortAsc=True
+                ),
+                f"screener {label} offset={offset}",
+            )
             quotes = (result or {}).get("quotes") or []
             reported = (result or {}).get("total")
             if isinstance(reported, int) and not isinstance(reported, bool):
@@ -240,11 +321,15 @@ class YahooSymbolSource:
     def _lookup_rows(self, kind: str) -> list[dict[str, Any]]:
         factory = self._lookup_factory or self._default_lookup()
         self._pace()
-        lookup = factory(LOOKUP_QUERY)
-        if kind == "crypto":
-            frame = lookup.get_cryptocurrency(count=LOOKUP_COUNT)
-        else:
-            frame = lookup.get_currency(count=LOOKUP_COUNT)
+
+        def request():
+            # A fresh Lookup per attempt: yfinance caches results per instance.
+            lookup = factory(LOOKUP_QUERY)
+            if kind == "crypto":
+                return lookup.get_cryptocurrency(count=LOOKUP_COUNT)
+            return lookup.get_currency(count=LOOKUP_COUNT)
+
+        frame = self._with_retries(request, f"lookup {kind} count={LOOKUP_COUNT}")
         if frame is None or getattr(frame, "empty", True):
             return []
         # Lookup returns a DataFrame indexed by symbol.
@@ -316,6 +401,31 @@ class YahooSymbolSource:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _with_retries(self, request: Callable[[], Any], label: str) -> Any:
+        """Run one request, retrying it on a 5xx or 429 (see ``PAGE_RETRIES``)."""
+        for attempt in range(PAGE_RETRIES + 1):
+            try:
+                return request()
+            except Exception as exc:
+                status = http_status(exc)
+                if attempt == PAGE_RETRIES or not is_retryable_status(status):
+                    raise
+                delay = retry_after_seconds(exc)
+                if delay is None:
+                    delay = PAGE_RETRY_BASE_DELAY_SECONDS * _RETRY_BACKOFF[attempt]
+                logger.warning(
+                    "Yahoo %s failed with HTTP %s (%s: %s); retry %d of %d in %.1fs",
+                    label,
+                    status,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                    attempt + 1,
+                    PAGE_RETRIES,
+                    delay,
+                )
+                self._sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _pace(self) -> None:
         if self._requests and self._page_delay:

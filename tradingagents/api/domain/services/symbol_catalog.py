@@ -23,7 +23,7 @@ Refresh policy:
   without waiting for the TTL.
 * ``request_manual_refresh()`` (``POST /symbols/refresh``) queues markets
   regardless of age, except those fetched within ``refresh_cooldown`` unless
-  forced.
+  forced. A forced refresh may also replace a list with a shrunken one.
 """
 
 from __future__ import annotations
@@ -178,6 +178,7 @@ class SymbolCatalog:
         self._indexes: dict[str, _MarketIndex] = {}
         self._lock = threading.Lock()
         self._pending: list[str] = []
+        self._forced: set[str] = set()  # queued markets whose refresh was forced
         self._refreshing: str | None = None
         self._thread: threading.Thread | None = None
         self._last_attempt: dict[str, datetime] = {}
@@ -473,9 +474,20 @@ class SymbolCatalog:
 
         A market whose list was fetched within ``refresh_cooldown`` is skipped
         unless ``force`` is set, so repeated calls cannot hammer Yahoo.
+
+        ``force`` also lets that refresh replace the list even if it shrank
+        (see ``refresh_market``), so a real shrink can be accepted
+        deliberately. A market being fetched right now without force is
+        queued again, so the forced fetch really happens.
         """
         requested = [m for m in dict.fromkeys(markets) if m in MARKETS]
         skipped = [] if force else [m for m in requested if self._fetched_recently(m)]
+        if force:
+            with self._lock:
+                for market in requested:
+                    self._forced.add(market)
+                    if market == self._refreshing and market not in self._pending:
+                        self._pending.append(market)
         queued = self.request_refresh([m for m in requested if m not in skipped])
         return queued, skipped
 
@@ -488,13 +500,16 @@ class SymbolCatalog:
             return not thread.is_alive()
         return True
 
-    def refresh_market(self, market: str) -> bool:
+    def refresh_market(self, market: str, force: bool = False) -> bool:
         """Fetch ``market`` now (blocking) and swap it in; True on success.
 
         On failure the previous list stays in memory and on disk. A fetch that
         looks truncated next to the previous list (fewer than 80% of its
         entries, or an exchange/type group that had rows is now empty) is
         refused the same way: logged, recorded as ``last_error``, not saved.
+        ``force`` (a forced manual refresh) accepts such a shrink with a
+        warning. A fetch the source itself fails (an error, a query short of
+        its total, the page cap) is refused whatever ``force`` says.
         """
         self._last_attempt[market] = self._clock()
         kept = self.get_list(market)
@@ -505,7 +520,13 @@ class SymbolCatalog:
             self._log_kept(market, self._last_error[market], kept)
             return False
         problem = self._shrink_problem(kept, entries)
-        if problem:
+        if problem and force:
+            logger.warning(
+                "Accepting the shrunken %s symbol list because the refresh was forced: %s",
+                market,
+                problem,
+            )
+        elif problem:
             self._last_error[market] = f"refused a suspicious refresh: {problem}"
             self._log_kept(market, self._last_error[market], kept)
             return False
@@ -560,14 +581,17 @@ class SymbolCatalog:
             with self._lock:
                 if self._stop.is_set():
                     self._pending.clear()
+                    self._forced.clear()
                 if not self._pending:
                     self._refreshing = None
                     self._thread = None
                     return
                 market = self._pending.pop(0)
                 self._refreshing = market
+                force = market in self._forced
+                self._forced.discard(market)
             try:
-                self.refresh_market(market)
+                self.refresh_market(market, force=force)
             except Exception:  # pragma: no cover - refresh_market already guards
                 logger.exception("Unexpected error refreshing the %s symbol list", market)
             finally:
