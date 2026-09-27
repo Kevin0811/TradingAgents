@@ -15,24 +15,28 @@ Two layers:
   rejects a bare 4-6 digit code and applies the API-only forex mapping
   (``USDTWD`` -> ``USDTWD=X``).
 * ``validate_ticker_supported`` (model validator, needs ``asset_type``):
-  checks the ticker against the supported-symbols list of the market it
-  belongs to. When that list is not loaded (cold start, fetch failure with no
-  cache) or no list covers the ticker's market (``0700.HK``, ``^GSPC``,
-  ``GC=F``), it lets the ticker through, so an empty cache never blocks an
-  analysis.
+  asks the supported-symbols catalog for its decision (``SymbolCatalog.decide``,
+  the same code path as ``GET /symbols/check``) and rejects the request only
+  when the ticker is missing from a loaded list of a market whose policy is
+  enforced (tw, jp; see ``REJECT_UNLISTED_TICKERS``), or is a suffix-less
+  TW/JP code whose suffixed symbol is listed. A miss in a soft market (us,
+  crypto, fx), a market whose list is not loaded (cold start, fetch failure
+  with no cache) and a market no list covers (``0700.HK``, ``^GSPC``,
+  ``GC=F``) all pass, so an empty cache never blocks an analysis.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from pydantic_core import PydanticCustomError
 
-from tradingagents.api.domain.symbols import api_forex_symbol
+from tradingagents.api.domain.symbols import api_forex_symbol, is_bare_numeric
 
-_BARE_NUMERIC = re.compile(r"^\d{4,6}$")
-_BARE_NUMERIC_SUFFIXES = ("TW", "TWO", "T")
+TICKER_NOT_SUPPORTED = "ticker_not_supported"
+TICKER_NOT_SUPPORTED_MESSAGE = (
+    "'{ticker}' is not on the supported {market} symbol list (see GET /symbols).{hint}"
+)
 
 
 def _active_catalog():
@@ -41,6 +45,11 @@ def _active_catalog():
     from tradingagents.api.domain.services.symbol_catalog import get_active_catalog
 
     return get_active_catalog()
+
+
+def normalize_asset_type(v: Any) -> Any:
+    """Field validator (mode="before"): ``asset_type`` is case-insensitive."""
+    return v.strip().lower() if isinstance(v, str) else v
 
 
 def validate_ticker_shape(v: str) -> str:
@@ -59,15 +68,11 @@ def validate_ticker_shape(v: str) -> str:
     v = v.strip()
     if not v:
         raise ValueError("ticker is required")
-    if _BARE_NUMERIC.fullmatch(v):
+    if is_bare_numeric(v):
         hint = ""
         catalog = _active_catalog()
         if catalog is not None:
-            listed = [
-                f"{v}.{suffix}"
-                for suffix in _BARE_NUMERIC_SUFFIXES
-                if catalog.get(f"{v}.{suffix}") is not None
-            ]
+            listed = catalog.listed_local_variants(v)
             if listed:
                 hint = f" On the supported list: {', '.join(listed)}."
         raise ValueError(
@@ -79,28 +84,44 @@ def validate_ticker_shape(v: str) -> str:
     return api_forex_symbol(v) or v
 
 
-def validate_ticker_supported(model: Any) -> Any:
-    """Model validator: reject a ticker that is not on its market's list.
+def ticker_not_supported_error(decision: Any) -> PydanticCustomError:
+    """The 422 error for a rejected ``TickerDecision``.
 
-    Raises a ``ticker_not_supported`` error (HTTP 422) whose ``ctx`` carries
-    ``ticker``, ``market`` and ``suggestions`` (up to 3 close symbols).
+    ``ctx`` carries ``ticker`` (normalised), ``market``, ``suggestions`` (up to
+    3 listed symbols) and ``hint`` (the text appended to the message).
+    """
+    from tradingagents.api.domain.services.symbol_catalog import REASON_MISSING_SUFFIX
+
+    suggestions = list(decision.suggestions)
+    if decision.reason == REASON_MISSING_SUFFIX and suggestions:
+        hint = f" It needs an exchange suffix; listed as: {', '.join(suggestions)}."
+    elif suggestions:
+        hint = f" Did you mean: {', '.join(suggestions)}?"
+    else:
+        hint = ""
+    return PydanticCustomError(
+        TICKER_NOT_SUPPORTED,
+        TICKER_NOT_SUPPORTED_MESSAGE,
+        {
+            "ticker": decision.normalized,
+            "market": decision.market,
+            "suggestions": suggestions,
+            "hint": hint,
+        },
+    )
+
+
+def validate_ticker_supported(model: Any) -> Any:
+    """Model validator: reject a ticker the catalog's decision rejects.
+
+    Raises a ``ticker_not_supported`` error (HTTP 422); see
+    ``ticker_not_supported_error`` for its ``ctx``.
     """
     catalog = _active_catalog()
     if catalog is None:
         return model
     asset_type = getattr(model.asset_type, "value", model.asset_type)
-    result = catalog.check(model.ticker, asset_type)
-    if result.supported is False:
-        suggestions = list(result.suggestions)
-        hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-        raise PydanticCustomError(
-            "ticker_not_supported",
-            "'{ticker}' is not on the supported {market} symbol list (see GET /symbols).{hint}",
-            {
-                "ticker": result.key,
-                "market": result.market,
-                "suggestions": suggestions,
-                "hint": hint,
-            },
-        )
+    decision = catalog.decide(model.ticker, asset_type)
+    if decision.rejected:
+        raise ticker_not_supported_error(decision)
     return model

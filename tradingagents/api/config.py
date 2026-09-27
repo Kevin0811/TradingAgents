@@ -25,7 +25,7 @@ _SYMBOLS_ENV_OVERRIDES = {
 def _symbols_defaults() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "symbols_cache_dir": None,  # None -> <data_cache_dir>/symbols
-        "symbols_cache_ttl_days": 7,
+        "symbols_cache_ttl_days": 7.0,  # float, so "0.5" from the env var works
         "symbols_auto_refresh": True,
         "symbols_include_otc": False,
         "symbols_page_delay_seconds": 1.0,
@@ -122,7 +122,7 @@ class ApiConfig:
     @property
     def symbols_cache_ttl_days(self) -> float:
         """Return the age (days) after which a cached symbol list is stale."""
-        return float(self._config.get("symbols_cache_ttl_days", 7))
+        return float(self._config.get("symbols_cache_ttl_days", 7.0))
 
     @property
     def symbols_auto_refresh(self) -> bool:

@@ -21,6 +21,7 @@ from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.domain.services.task_service import TaskService
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
+from tradingagents.api.schemas.symbols import TICKER_NOT_SUPPORTED_RESPONSES
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskResponse, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -48,8 +49,9 @@ router = APIRouter(
         "**Parameters:**\n"
         "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
         "- `trade_date`: Date in YYYY-MM-DD format\n"
-        "- `asset_type`: 'stock' or 'crypto' (default: 'stock')\n"
-        "- `selected_analysts`: List of 'market', 'sentiment', 'news', 'fundamentals'\n"
+        "- `asset_type`: 'stock' or 'crypto' (default: 'stock'), case-insensitive\n"
+        "- `selected_analysts`: List of 'market', 'social', 'news', 'fundamentals' "
+        "(default: all four; 'sentiment' is accepted as an alias of 'social')\n"
         "- `debug`: Enable debug mode (default: false)\n\n"
         "**Performance overrides (all optional; see `GET /config` for current server "
         "defaults):**\n"
@@ -61,7 +63,7 @@ router = APIRouter(
         "- `max_tokens`, `llm_max_retries`: cap output tokens / retry attempts for "
         "this run\n\n"
         "**Pipeline Steps:**\n"
-        "1. **Analysts** (market, sentiment, news, fundamentals) - gather data and produce reports\n"
+        "1. **Analysts** (market, social, news, fundamentals) - gather data and produce reports\n"
         "2. **Researchers** (bull/bear) - debate the investment thesis\n"
         "3. **Research Manager** - synthesize debate into an investment plan\n"
         "4. **Trader** - convert investment plan into a transaction proposal\n"
@@ -71,8 +73,11 @@ router = APIRouter(
         "on the LLM provider and analysis depth. It runs on the threadpool, so it "
         "does not block other requests, but it holds the connection open for the "
         "whole run and is not subject to `task_max_concurrent`. "
-        "For async operation, use `POST /analyze/tasks` instead."
+        "For async operation, use `POST /analyze/tasks` instead.\n\n"
+        "The ticker is checked against the supported-symbols list first; see the 422 "
+        "response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
+    responses=TICKER_NOT_SUPPORTED_RESPONSES,
 )
 def analyze(
     request: AnalyzeRequest,
@@ -112,8 +117,11 @@ def analyze(
         "429 Too Many Requests.\n\n"
         "Tasks are queued automatically when concurrency limit is reached. "
         "Use `GET /analyze/tasks/{task_id}` to check the status and retrieve "
-        "results when completed."
+        "results when completed.\n\n"
+        "The ticker is checked against the supported-symbols list before anything is "
+        "queued; see the 422 response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
+    responses=TICKER_NOT_SUPPORTED_RESPONSES,
 )
 async def create_analysis_task(
     request: TaskCreateRequest,

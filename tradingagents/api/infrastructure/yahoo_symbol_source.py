@@ -4,8 +4,9 @@ Equities and ETFs come from yfinance's built-in screener (``yf.screen`` with an
 ``EquityQuery`` / ``ETFQuery``), crypto and currencies from ``yf.Lookup``.
 Yahoo's screener is undocumented: it caps a page at 250 rows, may rate-limit,
 and may change shape. This module therefore paginates with a pause between
-requests and a hard page cap, and raises on any failure so the caller keeps
-the previous list instead of saving a partial one.
+requests and a hard page cap, and raises on any failure, including a query
+that stops short of its reported total or runs into the page cap, so the
+caller keeps the previous list instead of saving a partial one.
 
 Exchange codes (Yahoo's own, as listed in yfinance's screener value map):
 
@@ -131,7 +132,8 @@ class YahooSymbolSource:
         """Fetch ``market``'s full list, sorted by symbol.
 
         Raises:
-            SymbolSourceError: Nothing usable came back.
+            SymbolSourceError: Nothing usable came back, or a screener query
+                came back incomplete (short of its total, or at the page cap).
             Exception: Any yfinance / HTTP error, unchanged.
         """
         self._requests = 0
@@ -180,22 +182,40 @@ class YahooSymbolSource:
         return entries
 
     def _screen_pages(self, query: Any, label: str) -> Iterator[dict[str, Any]]:
+        """Yield every row of one screener query, or raise if that is not possible.
+
+        With a ``total`` in the response, pages are requested until ``offset``
+        reaches it; an empty page before that means Yahoo stopped short. With
+        no ``total``, only an empty page ends the query (a short page may just
+        be Yahoo trimming one). Hitting the page cap first raises too: a
+        partial list must never replace a complete one.
+        """
         screen = self._screen or self._default_screen()
         offset = 0
+        total: int | None = None
         for _ in range(self._max_pages):
             self._pace()
             result = screen(query, offset=offset, size=PAGE_SIZE, sortField="ticker", sortAsc=True)
             quotes = (result or {}).get("quotes") or []
+            reported = (result or {}).get("total")
+            if isinstance(reported, int) and not isinstance(reported, bool):
+                total = reported
             yield from quotes
             offset += len(quotes)
-            total = (result or {}).get("total")
-            if len(quotes) < PAGE_SIZE or (isinstance(total, int) and offset >= total):
+            if total is not None:
+                if offset >= total:
+                    return
+                if not quotes:
+                    raise SymbolSourceError(
+                        f"Symbol screener {label} returned an empty page after {offset} of "
+                        f"{total} rows"
+                    )
+            elif not quotes:
                 return
-        logger.warning(
-            "Symbol screener %s stopped at the %d-page cap (%d rows); the list may be incomplete",
-            label,
-            self._max_pages,
-            offset,
+        raise SymbolSourceError(
+            f"Symbol screener {label} hit the {self._max_pages}-page cap after {offset} rows"
+            + (f" of {total}" if total is not None else "")
+            + "; raise TRADINGAGENTS_SYMBOLS_MAX_PAGES"
         )
 
     @staticmethod

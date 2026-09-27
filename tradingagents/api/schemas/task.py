@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tradingagents.api.schemas.overrides import RunOverridesMixin
 from tradingagents.api.schemas.validators import (
+    normalize_asset_type,
     validate_ticker_shape,
     validate_ticker_supported,
 )
@@ -35,11 +36,15 @@ class TaskCreateRequest(RunOverridesMixin):
     )
     selected_analysts: list[str] = Field(
         default=["market", "social", "news", "fundamentals"],
-        description="List of analysts to include",
+        description=(
+            "List of analysts to include: 'market', 'social', 'news', 'fundamentals' "
+            "('sentiment' is accepted as an alias of 'social')"
+        ),
     )
     debug: bool = Field(default=False, description="Enable debug mode with verbose output")
 
     _validate_ticker = field_validator("ticker")(validate_ticker_shape)
+    _normalize_asset_type = field_validator("asset_type", mode="before")(normalize_asset_type)
     _check_ticker_supported = model_validator(mode="after")(validate_ticker_supported)
 
 

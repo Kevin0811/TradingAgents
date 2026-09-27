@@ -1,9 +1,11 @@
 """Request ticker validation against the supported-symbols list.
 
-With a loaded list, an off-list ticker fails the request with a 422 that names
-close symbols. When the ticker's market has no loaded list (cold start, failed
-fetch without a cache) or no list covers it (HK, indices, futures), the old
-shape-only check applies, so an empty cache never blocks an analysis.
+With a loaded tw or jp list, an off-list ticker fails the request with a 422
+that names close symbols. A miss in the us, crypto or fx list is allowed (the
+per-market policy), with the suggestions only reported by GET /symbols/check.
+When the ticker's market has no loaded list (cold start, failed fetch without
+a cache) or no list covers it (HK, indices, futures), the old shape-only check
+applies, so an empty cache never blocks an analysis.
 """
 
 from __future__ import annotations
@@ -33,12 +35,13 @@ from tradingagents.dataflows.symbol_utils import normalize_symbol
 
 DATE = "2026-09-25"
 LISTS = {
-    "tw": ["2330.TW", "2303.TW", "0050.TW", "6488.TWO"],
+    "tw": ["2330.TW", "2303.TW", "0050.TW", "6488.TWO", "9958A.TW"],
+    "jp": ["7203.T", "130A.T"],
     "us": ["AAPL", "SPY", "BRK-B"],
     "crypto": ["BTC-USD", "ETH-USD", "PEPE24478-USD"],
     "fx": ["TWD=X", "JPY=X", "EUR=X"],
 }
-TYPES = {"tw": "equity", "us": "equity", "crypto": "crypto", "fx": "currency"}
+TYPES = {"tw": "equity", "jp": "equity", "us": "equity", "crypto": "crypto", "fx": "currency"}
 
 
 class _NoSource:
@@ -93,6 +96,14 @@ class TestWithLoadedList:
             ("^GSPC", "stock"),
             ("GC=F", "stock"),
             ("XAUUSD", "stock"),  # alias -> GC=F
+            ("SAP.F", "stock"),  # a suffix outside tw/jp never routes: uncovered
+            # Soft markets: a miss is allowed.
+            ("APPL", "stock"),
+            ("ZZZZ", "stock"),
+            ("BTX-USD", "crypto"),
+            ("DOGE", "crypto"),
+            ("USDKRW", "stock"),
+            ("7203.T", "STOCK"),  # asset_type is case-insensitive
         ],
     )
     def test_on_list_or_uncovered_passes(self, catalog, request_cls, ticker, asset_type):
@@ -103,10 +114,12 @@ class TestWithLoadedList:
         ("ticker", "asset_type", "market", "suggestion"),
         [
             ("2331.TW", "stock", "tw", "2330.TW"),
-            ("APPL", "stock", "us", "AAPL"),
-            ("BTX-USD", "crypto", "crypto", "BTC-USD"),
-            ("DOGE", "crypto", "crypto", None),
-            ("USDKRW", "stock", "fx", None),
+            ("6489.TWO", "stock", "tw", "6488.TWO"),
+            ("7204.T", "stock", "jp", "7203.T"),
+            ("9999.T", "Stock", "jp", None),
+            # Suffix-less codes whose suffixed symbol is listed.
+            ("9958A", "stock", "tw", "9958A.TW"),
+            ("130A", "stock", "jp", "130A.T"),
         ],
     )
     def test_off_list_is_rejected_with_suggestions(
@@ -131,6 +144,21 @@ class TestWithLoadedList:
     def test_usdtwd_is_mapped_to_the_yahoo_form(self, catalog, request_cls):
         assert request_cls(ticker="usdtwd", trade_date=DATE).ticker == "USDTWD=X"
 
+    def test_suffixless_code_error_names_the_listed_symbol(self, catalog, request_cls):
+        with pytest.raises(ValidationError) as excinfo:
+            request_cls(ticker="9958A", trade_date=DATE)
+        (error,) = excinfo.value.errors()
+        assert error["ctx"] == {
+            "ticker": "9958A",
+            "market": "tw",
+            "suggestions": ["9958A.TW"],
+            "hint": " It needs an exchange suffix; listed as: 9958A.TW.",
+        }
+
+    def test_asset_type_is_case_insensitive(self, catalog, request_cls):
+        req = request_cls(ticker="BTC", trade_date=DATE, asset_type=" CRYPTO ")
+        assert getattr(req.asset_type, "value", req.asset_type) == "crypto"
+
 
 @pytest.mark.unit
 @pytest.mark.parametrize("request_cls", REQUESTS)
@@ -139,9 +167,18 @@ class TestFallbackWithoutList:
     def test_no_catalog_means_shape_check_only(self, no_catalog, request_cls, ticker):
         assert request_cls(ticker=ticker, trade_date=DATE).ticker == ticker
 
-    def test_market_not_loaded_falls_back(self, catalog, request_cls):
-        # jp has no list in the fixture: any .T ticker passes.
-        assert request_cls(ticker="0000.T", trade_date=DATE).ticker == "0000.T"
+    def test_market_not_loaded_falls_back(self, tmp_path, request_cls):
+        # Only tw has a list: any .T ticker passes, although jp is enforced.
+        repo = FileSymbolCacheRepository(tmp_path)
+        entries = (SymbolEntry("2330.TW", "TSMC", "TAI", "equity", "tw"),)
+        repo.save(SymbolList("tw", entries, datetime.now(timezone.utc)))
+        catalog = SymbolCatalog(repo, _NoSource(), auto_refresh=False)
+        catalog.start()
+        set_active_catalog(catalog)
+        try:
+            assert request_cls(ticker="0000.T", trade_date=DATE).ticker == "0000.T"
+        finally:
+            set_active_catalog(None)
 
     def test_bare_digits_rejected_without_a_list(self, no_catalog, request_cls):
         with pytest.raises(ValidationError, match="2330.TW"):
@@ -161,6 +198,7 @@ class TestOverHttp:
         analysis.run_analysis.side_effect = AssertionError("request was not rejected")
         app.dependency_overrides[get_analysis_service] = lambda: analysis
         app.state.task_worker.submit = MagicMock(side_effect=AssertionError("not rejected"))
+        app.state.symbol_catalog = catalog  # the check endpoint reads the same catalog
         return TestClient(app, raise_server_exceptions=False)
 
     @pytest.mark.parametrize("path", ["/api/v1/analyze/tasks", "/api/v1/analyze"])
@@ -176,6 +214,44 @@ class TestOverHttp:
             "suggestions": ["2330.TW", "2303.TW"],
             "hint": " Did you mean: 2330.TW, 2303.TW?",
         }
+
+    # One code path: an analyze request is rejected exactly when the check
+    # endpoint reports supported=false and enforced=true.
+    @pytest.mark.parametrize(
+        ("ticker", "asset_type"),
+        [
+            ("2330.TW", "stock"),
+            ("2331.TW", "stock"),
+            ("7204.T", "stock"),
+            ("0000.T", "stock"),
+            ("9958A", "stock"),
+            ("130A", "stock"),
+            ("9959A", "stock"),
+            ("APPL", "stock"),
+            ("USDKRW", "stock"),
+            ("DOGE", "crypto"),
+            ("BTC", "CRYPTO"),
+            ("0700.HK", "stock"),
+            ("SAP.F", "stock"),
+        ],
+    )
+    def test_check_endpoint_matches_the_validator(self, client, ticker, asset_type):
+        check = client.get(
+            "/api/v1/symbols/check", params={"ticker": ticker, "asset_type": asset_type}
+        ).json()
+        resp = client.post(
+            "/api/v1/analyze/tasks",
+            json={"ticker": ticker, "trade_date": DATE, "asset_type": asset_type},
+        )
+        rejected = check["supported"] is False and check["enforced"] is True
+        if rejected:
+            assert resp.status_code == 422
+            (error,) = resp.json()["detail"]
+            assert error["type"] == "ticker_not_supported"
+            assert error["ctx"]["suggestions"] == check["suggestions"]
+        else:
+            # Not rejected: validation passed and the (mocked) worker was reached.
+            assert resp.status_code == 500, resp.text
 
     def test_create_app_registers_an_empty_catalog(self, tmp_path, no_catalog):
         app = create_app(
@@ -224,6 +300,8 @@ class TestSymbolRules:
             ("BTC-USD", "crypto"),
             ("TWD=X", "fx"),
             ("EURJPY=X", "fx"),
+            ("SAP.F", None),
+            ("9999.S", None),
             ("BTC-EUR", None),
             ("0700.HK", None),
             ("^GSPC", None),

@@ -39,6 +39,7 @@ class FakeScreen:
     def __init__(self, data: dict[tuple[str, str], list[dict]], report_total: bool = True):
         self.data = data
         self.report_total = report_total
+        self.total_override: int | None = None
         self.calls: list[dict] = []
 
     def __call__(self, query, offset=0, size=25, sortField=None, sortAsc=None):
@@ -56,10 +57,24 @@ class FakeScreen:
             }
         )
         rows = self.data.get((exchange, kind), [])
-        result = {"quotes": rows[offset : offset + size], "count": size}
+        result = {"quotes": rows[offset : offset + self._page_rows(size)], "count": size}
         if self.report_total:
-            result["total"] = len(rows)
+            result["total"] = self.total_override if self.total_override is not None else len(rows)
         return result
+
+    def _page_rows(self, size: int) -> int:
+        return size
+
+
+class TrimmingScreen(FakeScreen):
+    """A screener that serves fewer rows per page than asked for."""
+
+    def __init__(self, data, page_rows: int, **kwargs):
+        super().__init__(data, **kwargs)
+        self.page_rows = page_rows
+
+    def _page_rows(self, size: int) -> int:
+        return min(size, self.page_rows)
 
 
 def _quotes(prefix: str, n: int, suffix: str = "", **extra) -> list[dict]:
@@ -85,18 +100,30 @@ def _source(screen=None, lookup_factory=None, **kwargs) -> tuple[YahooSymbolSour
 
 @pytest.mark.unit
 class TestScreenerPagination:
-    def test_paginates_until_a_short_page(self):
+    def test_paginates_until_an_empty_page_without_a_total(self):
         screen = FakeScreen({("TAI", "equity"): _quotes("", 600, ".TW")}, report_total=False)
         src, sleeps = _source(screen)
 
         entries = src.fetch("tw")
 
         tai_calls = [c for c in screen.calls if c["exchange"] == "TAI" and c["kind"] == "equity"]
-        assert [c["offset"] for c in tai_calls] == [0, 250, 500]
+        # Without a total a short page proves nothing: only an empty one ends it.
+        assert [c["offset"] for c in tai_calls] == [0, 250, 500, 600]
         assert all(c["size"] == PAGE_SIZE == 250 for c in tai_calls)
         assert len(entries) == 600
         # A pause before every request but the first.
         assert sleeps == [0.5] * (len(screen.calls) - 1)
+
+    def test_short_pages_do_not_end_the_query_before_the_total(self):
+        # Yahoo trims a page (200 rows for size=250): keep paging to the total.
+        screen = TrimmingScreen({("TAI", "equity"): _quotes("", 500, ".TW")}, page_rows=200)
+        src, _ = _source(screen)
+
+        entries = src.fetch("tw")
+
+        tai_calls = [c for c in screen.calls if c["exchange"] == "TAI" and c["kind"] == "equity"]
+        assert [c["offset"] for c in tai_calls] == [0, 200, 400]
+        assert len(entries) == 500
 
     def test_stops_at_total_without_an_extra_empty_request(self):
         screen = FakeScreen({("TAI", "equity"): _quotes("", 500, ".TW")})
@@ -107,16 +134,31 @@ class TestScreenerPagination:
         tai_calls = [c for c in screen.calls if c["exchange"] == "TAI" and c["kind"] == "equity"]
         assert [c["offset"] for c in tai_calls] == [0, 250]
 
-    def test_page_cap_bounds_each_query(self, caplog):
+    def test_an_empty_page_short_of_the_total_fails_the_fetch(self):
+        # Yahoo claims 900 rows but serves 500: a partial list must not be saved.
+        screen = FakeScreen({("TAI", "equity"): _quotes("", 500, ".TW")})
+        screen.total_override = 900
+        src, _ = _source(screen)
+
+        with pytest.raises(SymbolSourceError, match="empty page after 500 of 900 rows"):
+            src.fetch("tw")
+
+    def test_hitting_the_page_cap_fails_the_fetch(self):
         screen = FakeScreen({("TAI", "equity"): _quotes("", 2000, ".TW")})
         src, _ = _source(screen, max_pages=3)
 
-        entries = src.fetch("tw")
+        with pytest.raises(SymbolSourceError, match=r"3-page cap after 750 rows of 2000"):
+            src.fetch("tw")
 
         tai_calls = [c for c in screen.calls if c["exchange"] == "TAI" and c["kind"] == "equity"]
         assert len(tai_calls) == 3
-        assert len(entries) == 750
-        assert "page cap" in caplog.text
+
+    def test_hitting_the_page_cap_without_a_total_fails_too(self):
+        screen = FakeScreen({("TAI", "equity"): _quotes("", 2000, ".TW")}, report_total=False)
+        src, _ = _source(screen, max_pages=3)
+
+        with pytest.raises(SymbolSourceError, match="page cap"):
+            src.fetch("tw")
 
     def test_equities_require_positive_market_cap_etfs_use_etf_query(self):
         screen = FakeScreen({})

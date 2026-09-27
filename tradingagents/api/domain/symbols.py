@@ -14,18 +14,36 @@ modifies — the core is synced from upstream). It answers two questions:
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from functools import lru_cache
+from types import MappingProxyType
 
 from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair, normalize_symbol
 
 MARKETS: tuple[str, ...] = ("tw", "us", "jp", "crypto", "fx")
 SYMBOL_TYPES: tuple[str, ...] = ("equity", "etf", "crypto", "currency")
 
-# Yahoo suffixes that always route to a market's list. Suffixes seen in a
-# loaded tw/jp list are added on top at runtime (see ``classify_market``), so a
-# JP regional suffix Yahoo returns (e.g. Fukuoka/Sapporo) routes to "jp" as
-# soon as that list is loaded, without hard-coding it here.
-BASE_SUFFIX_MARKETS: dict[str, str] = {"TW": "tw", "TWO": "tw", "T": "jp"}
+# The only Yahoo suffixes that route a ticker to a market's list. They are
+# hard-coded and verified on purpose: a suffix is never learned from a loaded
+# list, because the JP screener also returns foreign listings (``SAP.F``,
+# ``BMW.F``) whose suffix would otherwise pull whole foreign exchanges into the
+# jp list's reject policy. Such entries stay searchable; they just do not route.
+SUFFIX_MARKETS: Mapping[str, str] = MappingProxyType({"TW": "tw", "TWO": "tw", "T": "jp"})
+
+# Per-market policy for a ticker that is missing from a *loaded* list.
+#
+# * True  ("enforced"): the analyze request is rejected (422
+#   ``ticker_not_supported`` with suggestions).
+# * False ("soft"): the ticker is allowed with the shape check only; the
+#   suggestions are still reported by ``GET /symbols/check`` as a hint.
+#
+# tw and jp lists come from exchange-wide screens and are near complete. The us
+# list leaves out OTC venues and the crypto / fx lists come from a ranked
+# lookup, so a miss there is not proof that Yahoo has no data. Markets missing
+# from this mapping are soft. Tighten a market by flipping its value.
+REJECT_UNLISTED_TICKERS: Mapping[str, bool] = MappingProxyType(
+    {"tw": True, "jp": True, "us": False, "crypto": False, "fx": False}
+)
 
 # Currencies the API maps as forex on top of the core's own table. The core's
 # ``normalize_symbol`` turns ``USDJPY`` into ``USDJPY=X`` but leaves ``USDTWD``
@@ -40,6 +58,16 @@ _NON_USD_CRYPTO_QUOTES = frozenset(
 )
 
 _US_SHAPE = re.compile(r"^[A-Z0-9][A-Z0-9\-]*$")
+
+# A bare exchange code: always rejected by the shape check (Yahoo needs the
+# suffix). ``2330`` -> ``2330.TW``.
+_BARE_NUMERIC = re.compile(r"^\d{4,6}$")
+# Suffix-less codes that look like a TW or JP listing. TW: 4-6 digits and an
+# optional share-class letter (``2330``, ``00679B``, ``2881A``). JP: four
+# characters, digits in the odd positions (``7203``, and the alphanumeric codes
+# issued since 2024 such as ``130A``).
+_TW_LOCAL_CODE = re.compile(r"^\d{4,6}[A-Z]?$")
+_JP_LOCAL_CODE = re.compile(r"^\d[0-9A-Z]\d[0-9A-Z]$")
 
 
 @lru_cache(maxsize=256)
@@ -132,12 +160,32 @@ def symbol_suffix(symbol: str) -> str:
     return symbol.rsplit(".", 1)[1] if "." in symbol else ""
 
 
-def classify_market(key: str, extra_suffixes: dict[str, str] | None = None) -> str | None:
+def is_bare_numeric(code: str) -> bool:
+    """True for a bare 4-6 digit code (``2330``), which the shape check rejects."""
+    return bool(_BARE_NUMERIC.fullmatch(code.strip()))
+
+
+def local_code_variants(key: str) -> list[str]:
+    """Suffixed TW/JP symbols a suffix-less ``key`` may have meant.
+
+    ``2330`` -> ``["2330.TW", "2330.TWO", "2330.T"]``; ``2881A`` ->
+    ``["2881A.TW", "2881A.TWO"]``; ``130A`` -> ``["130A.T"]``; ``AAPL`` -> ``[]``.
+    """
+    variants = []
+    if _TW_LOCAL_CODE.fullmatch(key):
+        variants += [f"{key}.TW", f"{key}.TWO"]
+    if _JP_LOCAL_CODE.fullmatch(key):
+        variants.append(f"{key}.T")
+    return variants
+
+
+def classify_market(key: str) -> str | None:
     """Return the market whose list must hold ``key``, or None if none covers it.
 
     ``key`` is a ``list_key`` result. None means the ticker belongs to a market
-    the list does not cover (``0700.HK``, ``^GSPC``, ``GC=F``, ``BTC-EUR``), so
-    the validator applies only the shape check to it.
+    the list does not cover (``0700.HK``, ``^GSPC``, ``GC=F``, ``BTC-EUR``,
+    ``SAP.F``), so the validator applies only the shape check to it. Only the
+    suffixes in ``SUFFIX_MARKETS`` route a dotted symbol.
     """
     if not key:
         return None
@@ -146,8 +194,7 @@ def classify_market(key: str, extra_suffixes: dict[str, str] | None = None) -> s
     if "=" in key or key.startswith("^"):
         return None
     if "." in key:
-        suffixes = {**BASE_SUFFIX_MARKETS, **(extra_suffixes or {})}
-        return suffixes.get(symbol_suffix(key))
+        return SUFFIX_MARKETS.get(symbol_suffix(key))
     if "-" in key:
         quote = key.rsplit("-", 1)[1]
         if quote == "USD":

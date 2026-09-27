@@ -17,29 +17,47 @@ Supported symbols:
     ``/api/{version}``:
 
     - ``GET /symbols?market=&q=&type=&limit=&offset=`` list/search one market
-    - ``GET /symbols/{symbol}`` exact lookup (404 with suggestions, 503 while
-      the symbol's market list is not loaded)
-    - ``POST /symbols/refresh[?market=]`` queue a background refresh (202)
+    - ``GET /symbols/check?ticker=&asset_type=`` the analyze validator's
+      decision for one ticker (always 200: ``supported``, ``enforced``,
+      ``status``, ``suggestions``, ``entry``, ``last_error``)
+    - ``GET /symbols/{symbol}`` plain exact lookup (404 with suggestions and
+      the list status)
+    - ``POST /symbols/refresh[?market=][&force=true]`` queue a background
+      refresh (202 with ``queued`` / ``skipped``; a market fetched within the
+      last 30 minutes is skipped unless forced)
 
     Lists are cached as ``<cache dir>/<market>.json`` (default
     ``<data_cache_dir>/symbols``, i.e. ``~/.tradingagents/cache/symbols``) and
     loaded at startup; missing or stale ones refresh in the background, one
-    market at a time, and a failed refresh keeps the previous list. Requests
-    never wait on the network. Settings (env var -> config key):
+    market at a time. A failed refresh keeps the previous list, and so does a
+    refresh that looks truncated (under 80% of the previous entries, or an
+    exchange/type group gone empty); either sets ``last_error``. A miss in a
+    list older than a day queues a (rate-limited) refresh of that market, so
+    new listings show up. Requests never wait on the network. Settings (env
+    var -> config key):
 
     - ``TRADINGAGENTS_SYMBOLS_CACHE_DIR`` -> ``symbols_cache_dir``
-    - ``TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS`` -> ``symbols_cache_ttl_days`` (7)
+    - ``TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS`` -> ``symbols_cache_ttl_days``
+      (7.0; fractions such as 0.5 work)
     - ``TRADINGAGENTS_SYMBOLS_AUTO_REFRESH`` -> ``symbols_auto_refresh`` (true)
     - ``TRADINGAGENTS_SYMBOLS_INCLUDE_OTC`` -> ``symbols_include_otc`` (false)
     - ``TRADINGAGENTS_SYMBOLS_PAGE_DELAY_SECONDS`` ->
       ``symbols_page_delay_seconds`` (1.0)
     - ``TRADINGAGENTS_SYMBOLS_MAX_PAGES`` -> ``symbols_max_pages`` (200 pages
-      of 250 rows per screener query)
+      of 250 rows per screener query; a query that needs more fails the
+      refresh instead of saving a partial list)
 
-    ``POST /analyze`` and ``POST /analyze/tasks`` reject a ticker that is not
-    on its market's list (422, ``type: ticker_not_supported``, ``ctx`` with
-    ``suggestions``). Tickers of a market whose list is not loaded, or that no
-    list covers (``0700.HK``, ``^GSPC``, ``GC=F``), get the shape check only.
+    ``POST /analyze`` and ``POST /analyze/tasks`` check the ticker per market
+    (``REJECT_UNLISTED_TICKERS`` in ``tradingagents.api.domain.symbols``): a
+    ticker missing from the loaded ``tw`` or ``jp`` list is rejected (422,
+    ``type: ticker_not_supported``, ``ctx`` with ``suggestions``), as is a
+    suffix-less TW/JP code whose ``.TW`` / ``.TWO`` / ``.T`` symbol is listed
+    (``2330``, ``130A``). A miss in the ``us``, ``crypto`` or ``fx`` list is
+    allowed; its suggestions are only a hint in ``GET /symbols/check``.
+    Tickers of a market whose list is not loaded, or that no list covers
+    (``0700.HK``, ``^GSPC``, ``GC=F``, ``SAP.F``), get the shape check only.
+    Only ``.TW`` / ``.TWO`` (tw) and ``.T`` (jp) route a dotted symbol to a
+    list.
 
 Architecture:
     The API follows Clean Architecture principles with the following layers:

@@ -5,16 +5,17 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, Query, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from tradingagents.api.dependencies import get_symbol_catalog
 from tradingagents.api.domain.services.symbol_catalog import SymbolCatalog
-from tradingagents.api.domain.symbols import MARKETS, list_key
-from tradingagents.api.schemas.enums import SymbolMarket, SymbolType
+from tradingagents.api.domain.symbols import MARKETS
+from tradingagents.api.schemas.enums import AssetType, SymbolMarket, SymbolType
 from tradingagents.api.schemas.symbols import (
+    SymbolCheckResponse,
     SymbolEntryResponse,
     SymbolListResponse,
-    SymbolListUnavailableResponse,
     SymbolNotFoundResponse,
     SymbolRefreshResponse,
 )
@@ -25,6 +26,12 @@ router = APIRouter(
     prefix="/symbols",
     tags=["Symbols"],
 )
+
+_ASSET_TYPES = tuple(a.value for a in AssetType)
+
+
+def _entry(entry) -> SymbolEntryResponse | None:
+    return SymbolEntryResponse(**entry.to_dict()) if entry is not None else None
 
 
 @router.get(
@@ -44,7 +51,8 @@ router = APIRouter(
         "Always 200. When the market has no list yet, `symbols` is empty and `status` "
         "is 'loading' (a background fetch is queued or running) or 'unavailable' (no "
         "fetch in progress, e.g. the last one failed); `stale` is true once the list is "
-        "older than the cache TTL (it is still served, and refreshed in the background)."
+        "older than the cache TTL (it is still served, and refreshed in the background). "
+        "`last_error` says why the last refresh failed or was refused."
     ),
 )
 def list_symbols(
@@ -70,10 +78,75 @@ def list_symbols(
         fetched_at=symbol_list.fetched_at if symbol_list else None,
         stale=catalog.is_stale(market.value),
         refreshing=catalog.is_refreshing(market.value),
+        last_error=catalog.last_error(market.value),
         total=total,
         limit=limit,
         offset=offset,
         symbols=[SymbolEntryResponse(**e.to_dict()) for e in page],
+    )
+
+
+@router.get(
+    "/check",
+    response_model=SymbolCheckResponse,
+    summary="Check a ticker the way analyze requests are checked",
+    description=(
+        "Return exactly the decision `POST /analyze` and `POST /analyze/tasks` make for "
+        "this ticker (the same code path), without submitting anything. Always 200; 422 "
+        "only for invalid query parameters.\n\n"
+        "- `ticker` (required), `asset_type`: 'stock' (default) or 'crypto', "
+        "case-insensitive\n\n"
+        "An analyze request is rejected (422 `ticker_not_supported`) exactly when "
+        "`supported` is false and `enforced` is true. `enforced` is true for tw and jp; "
+        "a miss in us, crypto or fx is allowed and `suggestions` is only a hint. "
+        "`supported` is null when no list covers the ticker (`status` 'uncovered', e.g. "
+        "'0700.HK', '^GSPC') or its market's list is not loaded ('loading' / "
+        "'unavailable'); such tickers get the shape check only. A suffix-less TW/JP code "
+        "('2330', '2881A', '130A') is reported unsupported and enforced, with the listed "
+        "'.TW' / '.TWO' / '.T' symbol in `suggestions` when there is one."
+    ),
+)
+def check_symbol(
+    ticker: str = Query(..., min_length=1, max_length=64, description="Ticker to check"),
+    asset_type: str | None = Query(default=None, description="'stock' (default) or 'crypto'"),
+    catalog: SymbolCatalog = Depends(get_symbol_catalog),
+) -> SymbolCheckResponse:
+    """Return the analyze validator's decision for one ticker."""
+    errors = []
+    if not ticker.strip():
+        errors.append(
+            {
+                "type": "value_error",
+                "loc": ("query", "ticker"),
+                "msg": "Value error, ticker is required",
+                "input": ticker,
+            }
+        )
+    normalized_type = asset_type.strip().lower() if asset_type is not None else None
+    if normalized_type is not None and normalized_type not in _ASSET_TYPES:
+        errors.append(
+            {
+                "type": "enum",
+                "loc": ("query", "asset_type"),
+                "msg": "Input should be " + " or ".join(f"'{a}'" for a in _ASSET_TYPES),
+                "input": asset_type,
+                "ctx": {"expected": " or ".join(f"'{a}'" for a in _ASSET_TYPES)},
+            }
+        )
+    if errors:
+        raise RequestValidationError(errors)
+
+    decision = catalog.decide(ticker, normalized_type)
+    return SymbolCheckResponse(
+        ticker=decision.ticker,
+        normalized=decision.normalized,
+        market=decision.market,
+        supported=decision.supported,
+        enforced=decision.enforced,
+        status=decision.status,
+        suggestions=list(decision.suggestions),
+        entry=_entry(decision.entry),
+        last_error=decision.last_error,
     )
 
 
@@ -83,21 +156,30 @@ def list_symbols(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Refresh supported-symbols lists",
     description=(
-        "Queue a background refresh from Yahoo Finance, regardless of the lists' age. "
-        "Returns 202 immediately; markets refresh one at a time. `market` limits it to "
-        "one market; omit it to refresh all. A failed refresh keeps the previous list. "
-        "Poll `GET /symbols?market=...&limit=0` and watch `fetched_at` / `refreshing`."
+        "Queue a background refresh from Yahoo Finance. Returns 202 immediately; "
+        "markets refresh one at a time. `market` limits it to one market; omit it to "
+        "refresh all. A market whose list was fetched within the last 30 minutes is "
+        "listed in `skipped` instead of `queued`, unless `force=true`. A failed "
+        "refresh, or one that looks truncated (under 80% of the previous entries, or an "
+        "exchange/type group gone empty), keeps the previous list and sets its "
+        "`last_error`. Poll `GET /symbols?market=...&limit=0` and watch `fetched_at` / "
+        "`refreshing` / `last_error`."
     ),
 )
 async def refresh_symbols(
     market: SymbolMarket | None = Query(default=None, description="Market; omit for all"),
+    force: bool = Query(default=False, description="Ignore the 30-minute cooldown"),
     catalog: SymbolCatalog = Depends(get_symbol_catalog),
 ) -> SymbolRefreshResponse:
     """Queue a background refresh of one or all markets."""
     markets = [market.value] if market else list(MARKETS)
-    queued = catalog.request_refresh(markets)
-    logger.info("Symbol list refresh requested for %s", ", ".join(queued))
-    return SymbolRefreshResponse(queued=queued)
+    queued, skipped = catalog.request_manual_refresh(markets, force=force)
+    logger.info(
+        "Symbol list refresh requested: queued %s; skipped (cooldown) %s",
+        ", ".join(queued) or "none",
+        ", ".join(skipped) or "none",
+    )
+    return SymbolRefreshResponse(queued=queued, skipped=skipped)
 
 
 @router.get(
@@ -105,51 +187,43 @@ async def refresh_symbols(
     response_model=SymbolEntryResponse,
     summary="Look up one supported symbol",
     description=(
-        "Exact lookup across every market's list. The symbol is normalised first "
+        "Plain exact lookup across every market's list. The symbol is normalised first "
         "(case, broker aliases such as 'BTCUSD' -> 'BTC-USD', 'USDJPY' -> 'JPY=X').\n\n"
         "- **200**: the entry.\n"
-        "- **404**: not on the list; `suggestions` holds up to 3 close symbols from "
-        "the list of the market the symbol belongs to. `market` is null when no list "
-        "covers it (e.g. '0700.HK', '^GSPC'); it may still work for analysis.\n"
-        "- **503**: the list of the symbol's market is not loaded yet, so it cannot be "
-        "checked (`status` is 'loading' or 'unavailable')."
+        "- **404**: not on any loaded list. `suggestions` holds up to 3 close symbols "
+        "from the list of the symbol's market (for a suffix-less TW/JP code, the listed "
+        "'.TW' / '.TWO' / '.T' symbol), and `status` that list's load state: when it is "
+        "'loading' or 'unavailable' the miss proves nothing yet; 'uncovered' means no "
+        "list covers the symbol (e.g. '0700.HK', '^GSPC'), which may still work for "
+        "analysis.\n\n"
+        "Whether an analyze request would accept a ticker is `GET /symbols/check`."
     ),
-    responses={
-        404: {"model": SymbolNotFoundResponse},
-        503: {"model": SymbolListUnavailableResponse},
-    },
+    responses={404: {"model": SymbolNotFoundResponse}},
 )
 def get_symbol(
     symbol: str,
     catalog: SymbolCatalog = Depends(get_symbol_catalog),
 ):
     """Look up one symbol, with suggestions when it is unknown."""
-    key = list_key(symbol)
-    entry = catalog.get(key)
-    if entry is not None:
-        return SymbolEntryResponse(**entry.to_dict())
-    market = catalog.market_for(key)
-    if market is not None and not catalog.is_loaded(market):
-        body = SymbolListUnavailableResponse(
-            error="Symbol list not loaded",
-            detail=f"The {market} symbol list is not loaded yet, so '{key}' cannot be checked.",
-            symbol=key,
-            market=market,
-            status=catalog.status(market),
-        )
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content=body.model_dump(mode="json"),
+    found = catalog.lookup(symbol)
+    if found.entry is not None:
+        return SymbolEntryResponse(**found.entry.to_dict())
+    if found.market is None:
+        detail = f"'{found.symbol}' belongs to a market the supported-symbols list does not cover."
+    elif found.status == "ready":
+        detail = f"'{found.symbol}' is not on the {found.market} supported-symbols list."
+    else:
+        detail = (
+            f"'{found.symbol}' was not found; the {found.market} symbol list is not loaded "
+            f"yet ({found.status})."
         )
     body = SymbolNotFoundResponse(
         error="Symbol not found",
-        detail=(
-            f"'{key}' is not on the {market} supported-symbols list."
-            if market
-            else f"'{key}' belongs to a market the supported-symbols list does not cover."
-        ),
-        symbol=key,
-        market=market,
-        suggestions=catalog.suggest(key, market) if market else [],
+        detail=detail,
+        symbol=found.symbol,
+        market=found.market,
+        status=found.status,
+        suggestions=list(found.suggestions),
+        last_error=found.last_error,
     )
     return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=body.model_dump(mode="json"))

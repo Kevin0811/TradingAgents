@@ -20,6 +20,7 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
 )
 from tradingagents.api.core.exceptions import AnalysisError
+from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalystReport
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -146,14 +147,8 @@ class AnalystService:
         asset_type: str,
     ) -> str:
         """Run analyst using TradingAgentsGraph for non-market analysts."""
-        # Map analyst type to graph analyst selection
-        analyst_map = {
-            "sentiment": ("social",),
-            "news": ("news",),
-            "fundamentals": ("fundamentals",),
-        }
-
-        selected = analyst_map.get(analyst_type, (analyst_type,))
+        # Map the API's analyst name to the core's graph key ('sentiment' -> 'social')
+        selected = to_core_analyst_keys((analyst_type,))
         graph = TradingAgentsGraph(
             selected_analysts=selected,
             debug=False,

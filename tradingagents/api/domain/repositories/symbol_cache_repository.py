@@ -21,3 +21,10 @@ class SymbolCacheRepository(ABC):
     @abstractmethod
     def save(self, symbol_list: SymbolList) -> None:
         """Persist ``symbol_list``, replacing the market's previous cache atomically."""
+
+    def sweep_temp_files(self) -> int:
+        """Remove leftovers of interrupted writes; returns how many were removed.
+
+        Called once at startup. The default has nothing to sweep.
+        """
+        return 0
