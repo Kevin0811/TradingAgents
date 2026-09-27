@@ -29,6 +29,7 @@ from tradingagents.api.core.exceptions import (
     ExternalServiceError,
     InvalidRequestError,
 )
+from tradingagents.api.domain.symbols import to_yahoo_symbol
 from tradingagents.api.domain.vendor_reports import (
     parse_indicator_report,
     parse_ohlcv_csv,
@@ -39,7 +40,7 @@ from tradingagents.dataflows.errors import (
     VendorRateLimitError,
 )
 from tradingagents.dataflows.interface import NO_DATA_SENTINEL, UNAVAILABLE_SENTINEL
-from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair, normalize_symbol
+from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +88,12 @@ class MarketDataService:
 
         Applies the bare-crypto convenience (``BTC`` -> ``BTC-USD``) that
         ``normalize_symbol`` deliberately withholds, then the shared broker /
-        forex / crypto mapping. Running ``normalize_symbol`` here as well as
-        downstream is harmless — it is idempotent and purely syntactic — and
-        lets the response report the symbol actually queried.
+        forex / crypto mapping, plus the API-only forex pairs the core does not
+        know (``USDTWD`` -> ``USDTWD=X``). Running ``normalize_symbol`` here as
+        well as downstream is harmless — it is idempotent and purely syntactic —
+        and lets the response report the symbol actually queried.
         """
-        return normalize_symbol(bare_crypto_to_pair(ticker) or ticker)
+        return to_yahoo_symbol(bare_crypto_to_pair(ticker) or ticker)
 
     @staticmethod
     def _parse_date(value: str, field: str = "trade_date") -> datetime:

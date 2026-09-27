@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -71,3 +72,34 @@ class DecisionState:
     portfolio_decision: str = ""
     sentiment_report: str = ""
     raw_state: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SymbolEntry:
+    """One instrument on the supported-symbols list, in Yahoo Finance form."""
+
+    symbol: str  # e.g. "2330.TW", "6488.TWO", "AAPL", "7203.T", "BTC-USD", "TWD=X"
+    name: str
+    exchange: str
+    type: str  # "equity" | "etf" | "crypto" | "currency"
+    market: str  # "tw" | "us" | "jp" | "crypto" | "fx"
+
+    def to_dict(self) -> dict[str, str]:
+        """Convert to dictionary."""
+        return {
+            "symbol": self.symbol,
+            "name": self.name,
+            "exchange": self.exchange,
+            "type": self.type,
+            "market": self.market,
+        }
+
+
+@dataclass(frozen=True)
+class SymbolList:
+    """The supported-symbols list of one market, as fetched at ``fetched_at``."""
+
+    market: str
+    entries: tuple[SymbolEntry, ...]
+    fetched_at: datetime
+    source: str = ""

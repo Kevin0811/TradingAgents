@@ -13,10 +13,17 @@ class AssetType(str, Enum):
 
 
 class AnalystType(str, Enum):
-    """Available analyst agents."""
+    """Available analyst agents.
+
+    ``social`` is the core's key for the social-media sentiment analyst.
+    ``sentiment`` is the API's older name for it, still accepted and mapped to
+    ``social`` before a request reaches the core (see
+    ``tradingagents.api.domain.analysts``).
+    """
 
     MARKET = "market"
-    SENTIMENT = "sentiment"
+    SOCIAL = "social"
+    SENTIMENT = "sentiment"  # alias of SOCIAL
     NEWS = "news"
     FUNDAMENTALS = "fundamentals"
 
@@ -61,3 +68,31 @@ class IndicatorName(str, Enum):
     ATR = "atr"
     VWMA = "vwma"
     MFI = "mfi"  # yfinance only
+
+
+class SymbolMarket(str, Enum):
+    """Markets covered by the supported-symbols list."""
+
+    TW = "tw"
+    US = "us"
+    JP = "jp"
+    CRYPTO = "crypto"
+    FX = "fx"
+
+
+class SymbolType(str, Enum):
+    """Instrument types on the supported-symbols list."""
+
+    EQUITY = "equity"
+    ETF = "etf"
+    CRYPTO = "crypto"
+    CURRENCY = "currency"
+
+
+class SymbolListStatus(str, Enum):
+    """Load state of one market's supported-symbols list."""
+
+    READY = "ready"  # list loaded (it may still be stale; see ``stale``)
+    LOADING = "loading"  # no list yet; a background fetch is queued or running
+    UNAVAILABLE = "unavailable"  # no list and no fetch in progress (e.g. it failed)
+    UNCOVERED = "uncovered"  # GET /symbols/check only: no list covers the ticker

@@ -80,9 +80,14 @@ class TestAnalystTypeEnum:
     def test_fundamentals_value(self):
         assert AnalystType.FUNDAMENTALS.value == "fundamentals"
 
+    def test_social_value(self):
+        # The core's key for the social-media analyst; "sentiment" is its alias.
+        assert AnalystType.SOCIAL.value == "social"
+
     def test_all_members(self):
         expected = {
             AnalystType.MARKET,
+            AnalystType.SOCIAL,
             AnalystType.SENTIMENT,
             AnalystType.NEWS,
             AnalystType.FUNDAMENTALS,
@@ -159,10 +164,11 @@ class TestAnalyzeRequest:
         assert req.asset_type == AssetType.STOCK
 
     def test_default_analysts(self):
+        # "social", not "sentiment": the core rejects "sentiment" as an unknown key.
         req = AnalyzeRequest(ticker="AAPL", trade_date="2026-06-01")
         expected = [
             AnalystType.MARKET,
-            AnalystType.SENTIMENT,
+            AnalystType.SOCIAL,
             AnalystType.NEWS,
             AnalystType.FUNDAMENTALS,
         ]

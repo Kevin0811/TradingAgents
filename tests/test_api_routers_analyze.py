@@ -176,6 +176,71 @@ class TestAnalyzeEndpoint:
         assert captured["overrides"]["max_risk_discuss_rounds"] == 5
 
 
+
+@pytest.mark.unit
+class TestAnalystKeysReachCore:
+    """Analyst names must reach the core's graph as keys it knows.
+
+    The graph is mocked, so nothing runs: the test only captures the
+    ``selected_analysts`` the API hands to ``TradingAgentsGraph`` and feeds
+    them to the core's own plan builder, which raises "unknown analyst key"
+    for anything else (the old sync default "sentiment" did).
+    """
+
+    @staticmethod
+    def _post(json_body):
+        captured = {}
+
+        def fake_graph(*, selected_analysts, **kwargs):
+            captured["selected_analysts"] = selected_analysts
+            graph = MagicMock()
+            graph.propagate.return_value = ({}, "Hold")
+            return graph
+
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.TradingAgentsGraph",
+            side_effect=fake_graph,
+        ):
+            client = TestClient(create_app())
+            resp = client.post("/api/v1/analyze", json=json_body)
+        assert resp.status_code == 200, resp.text
+        return captured["selected_analysts"]
+
+    def test_sync_default_analysts_are_core_keys(self):
+        from tradingagents.graph.analyst_execution import (
+            ANALYST_NODE_SPECS,
+            build_analyst_execution_plan,
+        )
+
+        selected = self._post({"ticker": "AAPL", "trade_date": "2026-06-01"})
+
+        assert tuple(selected) == ("market", "social", "news", "fundamentals")
+        assert set(selected) <= set(ANALYST_NODE_SPECS)
+        build_analyst_execution_plan(selected)  # raises on an unknown key
+
+    def test_sentiment_is_mapped_to_social(self):
+        selected = self._post(
+            {
+                "ticker": "AAPL",
+                "trade_date": "2026-06-01",
+                "selected_analysts": ["market", "sentiment", "social"],
+            }
+        )
+        assert tuple(selected) == ("market", "social")
+
+    def test_task_requests_are_mapped_too(self):
+        from tradingagents.api.domain.services.analysis_service import AnalysisService
+
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.TradingAgentsGraph"
+        ) as graph_cls:
+            graph_cls.return_value.propagate.return_value = ({}, "Hold")
+            AnalysisService().run_analysis(
+                "AAPL", "2026-06-01", selected_analysts=("sentiment", "news")
+            )
+        assert graph_cls.call_args.kwargs["selected_analysts"] == ("social", "news")
+
+
 # ---------------------------------------------------------------------------
 # POST /analyze/tasks (async task creation)
 # ---------------------------------------------------------------------------
