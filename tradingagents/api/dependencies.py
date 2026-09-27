@@ -133,3 +133,13 @@ async def get_task_service(
 async def get_symbol_catalog(request: Request) -> SymbolCatalog:
     """Get the app's supported-symbols catalog."""
     return request.app.state.symbol_catalog
+
+
+async def get_symbol_settings(request: Request):
+    """Get the app's supported-symbols refresher settings."""
+    return request.app.state.symbol_settings
+
+
+async def get_activity_monitor(request: Request):
+    """Get the app's Yahoo activity monitor."""
+    return request.app.state.activity_monitor

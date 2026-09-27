@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from tradingagents.api.domain.refresh_window import RefreshWindow
 from tradingagents.default_api_config import DEFAULT_API_CONFIG, _coerce
 from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -19,7 +20,12 @@ _SYMBOLS_ENV_OVERRIDES = {
     "TRADINGAGENTS_SYMBOLS_INCLUDE_OTC": "symbols_include_otc",
     "TRADINGAGENTS_SYMBOLS_PAGE_DELAY_SECONDS": "symbols_page_delay_seconds",
     "TRADINGAGENTS_SYMBOLS_MAX_PAGES": "symbols_max_pages",
+    "TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW": "symbols_refresh_window",
+    "TRADINGAGENTS_SYMBOLS_REFRESH_TIMEZONE": "symbols_refresh_timezone",
+    "TRADINGAGENTS_SYMBOLS_IDLE_GRACE_MINUTES": "symbols_idle_grace_minutes",
 }
+# Config keys whose value came from an env var (reported as source "env").
+SYMBOLS_ENV_KEYS: set[str] = set()
 
 
 def _symbols_defaults() -> dict[str, Any]:
@@ -28,13 +34,24 @@ def _symbols_defaults() -> dict[str, Any]:
         "symbols_cache_ttl_days": 7.0,  # float, so "0.5" from the env var works
         "symbols_auto_refresh": True,
         "symbols_include_otc": False,
-        "symbols_page_delay_seconds": 1.0,
+        "symbols_page_delay_seconds": 2.0,  # pause between Yahoo requests
         "symbols_max_pages": 200,  # per screener query (250 rows a page)
+        # Automatic refreshes of stale lists wait until TradingAgents has been
+        # idle (no analysis task, no Yahoo-backed request) for this long.
+        "symbols_idle_grace_minutes": 10.0,
+        # Optional extra condition: a daily window ("HH:MM-HH:MM", may wrap
+        # midnight, local to the zone below). "" (the default) = any time.
+        "symbols_refresh_window": "",
+        "symbols_refresh_timezone": "Asia/Taipei",
     }
     for env_var, key in _SYMBOLS_ENV_OVERRIDES.items():
         raw = os.environ.get(env_var)
-        if raw:
-            defaults[key] = _coerce(raw, defaults[key])
+        if raw is None:
+            continue
+        if raw == "" and not isinstance(defaults[key], str):
+            continue  # an empty value only means something for text settings
+        defaults[key] = _coerce(raw, defaults[key])
+        SYMBOLS_ENV_KEYS.add(key)
     return defaults
 
 
@@ -60,6 +77,7 @@ class ApiConfig:
             **DEFAULT_API_CONFIG,
             **SYMBOLS_DEFAULT_CONFIG,
         }
+        self._override_keys = set(overrides or ())
         if overrides:
             self._config.update(overrides)
 
@@ -128,6 +146,27 @@ class ApiConfig:
     def symbols_auto_refresh(self) -> bool:
         """Return whether missing/stale symbol lists refresh in the background."""
         return bool(self._config.get("symbols_auto_refresh", True))
+
+    def source_of(self, key: str) -> str:
+        """Where ``key``'s value came from: ``config`` (overrides), ``env`` or ``default``."""
+        if key in self._override_keys:
+            return "config"
+        if key in SYMBOLS_ENV_KEYS:
+            return "env"
+        return "default"
+
+    @property
+    def symbols_refresh_window(self) -> RefreshWindow | None:
+        """Return the quiet window for automatic refreshes (None: any time).
+
+        Raises:
+            ValueError: ``symbols_refresh_window`` or ``symbols_refresh_timezone``
+                is malformed (checked when the app is created).
+        """
+        return RefreshWindow.parse(
+            self._config.get("symbols_refresh_window"),
+            self._config.get("symbols_refresh_timezone"),
+        )
 
     def ensure_directories(self) -> None:
         """Create required directories if they don't exist."""

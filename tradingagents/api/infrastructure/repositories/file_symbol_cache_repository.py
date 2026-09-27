@@ -52,7 +52,8 @@ CACHE_FORMAT_VERSION = 1
 # (another worker process sharing the directory) and are left alone.
 TEMP_FILE_MIN_AGE_SECONDS = 600.0
 
-_TEMP_FILE = re.compile(r"^\.(" + "|".join(map(re.escape, MARKETS)) + r")\..+\.tmp$")
+# Temp files of the list writes and of the refresher settings (settings.json).
+_TEMP_FILE = re.compile(r"^\.(" + "|".join(map(re.escape, (*MARKETS, "settings"))) + r")\..+\.tmp$")
 
 
 class _BadCache(ValueError):
@@ -160,7 +161,7 @@ class FileSymbolCacheRepository(SymbolCacheRepository):
             raise
 
     def sweep_temp_files(self) -> int:
-        """Delete ``.<market>.*.tmp`` files older than ``TEMP_FILE_MIN_AGE_SECONDS``."""
+        """Delete ``.<market>.*.tmp`` / ``.settings.*.tmp`` files older than the minimum age."""
         if not self._cache_dir.is_dir():
             return 0
         cutoff = time.time() - TEMP_FILE_MIN_AGE_SECONDS

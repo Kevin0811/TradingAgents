@@ -5,8 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from tradingagents.api.domain.services.symbol_settings import SETTING_SPECS, validate_setting
 from tradingagents.api.schemas.enums import SymbolListStatus, SymbolMarket, SymbolType
 
 
@@ -40,6 +41,30 @@ class SymbolListResponse(BaseModel):
         description=(
             "Why the last refresh failed or was refused (a truncated-looking fetch); null "
             "once a refresh succeeds. The previous list, if any, is still served."
+        ),
+    )
+    next_refresh_after: datetime | None = Field(
+        None,
+        description=(
+            "Set while a stale list (or one a miss asked to refresh) is served and waits "
+            "for the refresh window: when that window next opens (UTC). Null when nothing "
+            "is waiting, when the window is open now, or when there is no window"
+        ),
+    )
+    refresh_window: str | None = Field(
+        None,
+        description=(
+            "The optional window automatic refreshes of stale lists also wait for, e.g. "
+            "'02:00-06:00 Asia/Taipei'; null when none is set. Missing lists and POST "
+            "/symbols/refresh ignore it"
+        ),
+    )
+    waiting_for: str | None = Field(
+        None,
+        description=(
+            "Why a stale list is not being refreshed yet: 'activity' (TradingAgents is "
+            "busy), 'window', 'auto_refresh_off', 'retry_limit' or 'tick' (due at the next "
+            "tick); null when nothing is waiting"
         ),
     )
     total: int = Field(..., description="Number of matching entries before paging")
@@ -179,3 +204,114 @@ TICKER_NOT_SUPPORTED_RESPONSES: dict[int | str, dict[str, Any]] = {
         },
     }
 }
+
+
+# ---------------------------------------------------------------------------
+# GET / PUT /symbols/settings
+# ---------------------------------------------------------------------------
+
+_SOURCE_DESCRIPTION = "'default', 'env' (a TRADINGAGENTS_* variable), 'config' or 'api'"
+
+
+class SymbolSettingsValues(BaseModel):
+    """Effective refresher settings."""
+
+    ttl_days: float = Field(..., description="Age (days) after which a list is stale")
+    auto_refresh: bool = Field(..., description="Refresh missing/stale lists automatically")
+    idle_grace_minutes: float = Field(
+        ..., description="Minutes without Yahoo-backed activity before TradingAgents counts as idle"
+    )
+    refresh_window: str = Field(
+        ..., description="Optional daily window 'HH:MM-HH:MM' for automatic refreshes; '' = off"
+    )
+    refresh_timezone: str = Field(..., description="IANA time zone of the refresh window")
+    page_delay_seconds: float = Field(..., description="Pause between Yahoo requests")
+
+
+class SymbolSettingsSources(BaseModel):
+    """Where each effective value comes from."""
+
+    ttl_days: str = Field(..., description=_SOURCE_DESCRIPTION)
+    auto_refresh: str
+    idle_grace_minutes: str
+    refresh_window: str
+    refresh_timezone: str
+    page_delay_seconds: str
+
+
+class SymbolMarketRefreshState(BaseModel):
+    """Refresh state of one market's list."""
+
+    status: SymbolListStatus
+    stale: bool
+    refreshing: bool = Field(..., description="Queued or being fetched")
+    paused: bool = Field(..., description="Being fetched, but paused while TradingAgents is busy")
+    waiting_for: str | None = Field(
+        None,
+        description=(
+            "Why a stale list is not refreshed yet: 'activity', 'window', "
+            "'auto_refresh_off', 'retry_limit' or 'tick'; null when nothing is waiting"
+        ),
+    )
+    next_refresh_after: datetime | None = Field(
+        None, description="When the refresh window next opens, while the list waits for it"
+    )
+    last_error: str | None = None
+
+
+class SymbolRefreshState(BaseModel):
+    """Read-only refresher state."""
+
+    idle: bool = Field(..., description="Whether TradingAgents counts as idle now")
+    active_tasks: int = Field(..., description="Analysis tasks pending, queued or processing")
+    data_requests_in_flight: int = Field(
+        ..., description="Yahoo-backed requests (/data, /analysts, sync /analyze) running now"
+    )
+    last_data_request_at: datetime | None = Field(
+        None, description="When the last Yahoo-backed request started or ended (UTC)"
+    )
+    window_open: bool = Field(..., description="True when no window is set or now is inside it")
+    markets: dict[SymbolMarket, SymbolMarketRefreshState]
+
+
+class SymbolSettingsResponse(BaseModel):
+    """200 body for ``GET`` / ``PUT /symbols/settings``."""
+
+    values: SymbolSettingsValues
+    sources: SymbolSettingsSources
+    state: SymbolRefreshState
+
+
+def _limits(name: str) -> dict[str, float]:
+    spec = SETTING_SPECS[name]
+    return {"ge": spec.minimum, "le": spec.maximum}
+
+
+class SymbolSettingsUpdate(BaseModel):
+    """Body of ``PUT /symbols/settings``: a partial update.
+
+    Omitted fields are left alone; a field set to null goes back to its
+    default / env / config value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_days: float | None = Field(None, **_limits("ttl_days"), description="0.5-90")
+    auto_refresh: bool | None = None
+    idle_grace_minutes: float | None = Field(
+        None, **_limits("idle_grace_minutes"), description="0-240"
+    )
+    refresh_window: str | None = Field(
+        None, max_length=20, description="'HH:MM-HH:MM' (may wrap midnight) or '' for none"
+    )
+    refresh_timezone: str | None = Field(
+        None, max_length=64, description="IANA time zone, e.g. 'Asia/Taipei'"
+    )
+    page_delay_seconds: float | None = Field(
+        None, **_limits("page_delay_seconds"), description="0.5-10"
+    )
+
+    @field_validator("refresh_window", "refresh_timezone")
+    @classmethod
+    def _check_text(cls, value: str | None, info) -> str | None:
+        return None if value is None else validate_setting(info.field_name, value)

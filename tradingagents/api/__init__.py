@@ -23,33 +23,65 @@ Supported symbols:
     - ``GET /symbols/{symbol}`` plain exact lookup (404 with suggestions and
       the list status)
     - ``POST /symbols/refresh[?market=][&force=true]`` queue a background
-      refresh (202 with ``queued`` / ``skipped``; a market fetched within the
-      last 30 minutes is skipped unless forced; ``force`` also accepts a
-      shrunken list, never an incomplete fetch)
+      refresh right away (202 with ``queued`` / ``skipped``; a market fetched
+      within the last 30 minutes is skipped unless forced; ``force`` also
+      accepts a shrunken list, never an incomplete fetch)
+    - ``GET /symbols/settings`` / ``PUT /symbols/settings`` read and change the
+      refresher settings at runtime (see below). Like every endpoint of this
+      API they have no authentication: keep the API on a trusted network.
 
     Lists are cached as ``<cache dir>/<market>.json`` (default
     ``<data_cache_dir>/symbols``, i.e. ``~/.tradingagents/cache/symbols``) and
-    loaded at startup; missing or stale ones refresh in the background, one
-    market at a time. A failed refresh keeps the previous list, and so does a
-    refresh that looks truncated (under 80% of the previous entries, or an
-    exchange/type group gone empty) unless the refresh was forced; either
-    sets ``last_error``. A screener page or lookup that fails with a 5xx or
-    429 is retried up to 3 times (2 s, 5 s, 10 s, or ``Retry-After``) before
-    the market's refresh fails. A miss in a
-    list older than a day queues a (rate-limited) refresh of that market, so
-    new listings show up. Requests never wait on the network. Settings (env
-    var -> config key):
+    loaded at startup; the refresher fetches one market at a time on a
+    background thread, and requests never wait on the network.
+
+    - A missing list is fetched right away.
+    - A stale list (older than the TTL) keeps being served and is refreshed
+      only when TradingAgents is idle: no analysis task pending, queued or
+      processing, and no Yahoo-backed request (``/data``, ``/analysts``, the
+      synchronous ``POST /analyze``) within ``symbols_idle_grace_minutes``.
+      An optional daily window (``symbols_refresh_window``, off by default)
+      must also hold when set. A tick every 15 minutes picks up lists that
+      became due; ``GET /symbols`` shows ``waiting_for`` and, for the window,
+      ``next_refresh_after``.
+    - While a refresh runs it pauses between pages whenever TradingAgents
+      turns busy, and resumes the same market once idle again (a manual
+      refresh does not pause).
+    - A miss in a tw or jp list (the enforced markets) older than a day asks
+      for a refresh of that market under the same conditions, so new listings
+      show up. us, crypto and fx misses never do: those lists are incomplete
+      by design and refresh on the TTL only.
+    - A failed refresh keeps the previous list, and so does one that looks
+      truncated (under 80% of the previous entries, or an exchange/type group
+      gone empty) unless it was forced; either sets ``last_error``. A screener
+      page or lookup failing with a 5xx or 429 is retried up to 3 times (2 s,
+      5 s, 10 s, or ``Retry-After``) before the market's refresh fails.
+
+    Settings (env var -> config key; the ones marked * can also be changed
+    with ``PUT /symbols/settings``, which saves them to
+    ``<cache dir>/settings.json`` so they survive a restart and win over env
+    values; null in the PUT restores the env / default value):
 
     - ``TRADINGAGENTS_SYMBOLS_CACHE_DIR`` -> ``symbols_cache_dir``
     - ``TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS`` -> ``symbols_cache_ttl_days``
-      (7.0; fractions such as 0.5 work)
-    - ``TRADINGAGENTS_SYMBOLS_AUTO_REFRESH`` -> ``symbols_auto_refresh`` (true)
-    - ``TRADINGAGENTS_SYMBOLS_INCLUDE_OTC`` -> ``symbols_include_otc`` (false)
+      * (7.0; 0.5-90)
+    - ``TRADINGAGENTS_SYMBOLS_AUTO_REFRESH`` -> ``symbols_auto_refresh`` *
+      (true)
+    - ``TRADINGAGENTS_SYMBOLS_IDLE_GRACE_MINUTES`` ->
+      ``symbols_idle_grace_minutes`` * (10; 0-240)
+    - ``TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW`` -> ``symbols_refresh_window`` *
+      (``""`` = off; ``HH:MM-HH:MM``, may wrap midnight)
+    - ``TRADINGAGENTS_SYMBOLS_REFRESH_TIMEZONE`` ->
+      ``symbols_refresh_timezone`` * (``"Asia/Taipei"``, an IANA zone)
     - ``TRADINGAGENTS_SYMBOLS_PAGE_DELAY_SECONDS`` ->
-      ``symbols_page_delay_seconds`` (1.0)
+      ``symbols_page_delay_seconds`` * (2.0; 0.5-10)
+    - ``TRADINGAGENTS_SYMBOLS_INCLUDE_OTC`` -> ``symbols_include_otc`` (false)
     - ``TRADINGAGENTS_SYMBOLS_MAX_PAGES`` -> ``symbols_max_pages`` (200 pages
       of 250 rows per screener query; a query that needs more fails the
       refresh instead of saving a partial list)
+
+    The * values are validated at startup too: an out-of-range or malformed
+    env value stops the app from starting.
 
     ``POST /analyze`` and ``POST /analyze/tasks`` check the ticker per market
     (``REJECT_UNLISTED_TICKERS`` in ``tradingagents.api.domain.symbols``): a

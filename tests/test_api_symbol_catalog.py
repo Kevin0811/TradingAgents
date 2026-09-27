@@ -230,8 +230,9 @@ class TestRefresh:
 
         source.gate.set()
         assert catalog.wait_idle(5)
-        # One market at a time, in a fixed order; the fresh one is skipped.
-        assert source.calls == ["tw", "us", "crypto", "fx"]
+        # One market at a time: missing lists first (they cannot be checked at
+        # all), then stale ones, each in market order; the fresh one is skipped.
+        assert source.calls == ["us", "crypto", "fx", "tw"]
         assert catalog.status("us") == "ready"
         assert "2317.TW" in {e.symbol for e in catalog.get_list("tw").entries}
 

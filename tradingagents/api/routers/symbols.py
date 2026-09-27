@@ -8,16 +8,28 @@ from fastapi import APIRouter, Depends, Query, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from tradingagents.api.dependencies import get_symbol_catalog
+from tradingagents.api.dependencies import (
+    get_activity_monitor,
+    get_symbol_catalog,
+    get_symbol_settings,
+)
+from tradingagents.api.domain.services.refresh_activity import ActivityMonitor
 from tradingagents.api.domain.services.symbol_catalog import SymbolCatalog
+from tradingagents.api.domain.services.symbol_settings import SymbolSettings
 from tradingagents.api.domain.symbols import MARKETS
 from tradingagents.api.schemas.enums import AssetType, SymbolMarket, SymbolType
 from tradingagents.api.schemas.symbols import (
     SymbolCheckResponse,
     SymbolEntryResponse,
     SymbolListResponse,
+    SymbolMarketRefreshState,
     SymbolNotFoundResponse,
     SymbolRefreshResponse,
+    SymbolRefreshState,
+    SymbolSettingsResponse,
+    SymbolSettingsSources,
+    SymbolSettingsUpdate,
+    SymbolSettingsValues,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,7 +63,9 @@ def _entry(entry) -> SymbolEntryResponse | None:
         "Always 200. When the market has no list yet, `symbols` is empty and `status` "
         "is 'loading' (a background fetch is queued or running) or 'unavailable' (no "
         "fetch in progress, e.g. the last one failed); `stale` is true once the list is "
-        "older than the cache TTL (it is still served, and refreshed in the background). "
+        "older than the cache TTL (it is still served, and refreshed in the background once "
+        "TradingAgents is idle and, if one is set, inside `refresh_window`; `waiting_for` "
+        "says what it waits for, `next_refresh_after` when the window opens). "
         "`last_error` says why the last refresh failed or was refused."
     ),
 )
@@ -79,6 +93,9 @@ def list_symbols(
         stale=catalog.is_stale(market.value),
         refreshing=catalog.is_refreshing(market.value),
         last_error=catalog.last_error(market.value),
+        next_refresh_after=catalog.next_refresh_after(market.value),
+        refresh_window=catalog.refresh_window.describe() if catalog.refresh_window else None,
+        waiting_for=catalog.waiting_for(market.value),
         total=total,
         limit=limit,
         offset=offset,
@@ -156,7 +173,9 @@ def check_symbol(
     status_code=status.HTTP_202_ACCEPTED,
     summary="Refresh supported-symbols lists",
     description=(
-        "Queue a background refresh from Yahoo Finance. Returns 202 immediately; "
+        "Queue a background refresh from Yahoo Finance, right away: it neither waits for "
+        "TradingAgents to be idle nor for the refresh window, and does not pause while "
+        "busy. Returns 202 immediately; "
         "markets refresh one at a time. `market` limits it to one market; omit it to "
         "refresh all. A market whose list was fetched within the last 30 minutes is "
         "listed in `skipped` instead of `queued`, unless `force=true`. A failed "
@@ -184,6 +203,102 @@ async def refresh_symbols(
         ", ".join(skipped) or "none",
     )
     return SymbolRefreshResponse(queued=queued, skipped=skipped)
+
+
+def _settings_response(
+    catalog: SymbolCatalog, settings: SymbolSettings, monitor: ActivityMonitor
+) -> SymbolSettingsResponse:
+    activity = monitor.state()
+    markets = {}
+    for market in MARKETS:
+        markets[market] = SymbolMarketRefreshState(
+            status=catalog.status(market),
+            stale=catalog.is_stale(market),
+            refreshing=catalog.is_refreshing(market),
+            paused=catalog.is_paused(market),
+            waiting_for=catalog.waiting_for(market),
+            next_refresh_after=catalog.next_refresh_after(market),
+            last_error=catalog.last_error(market),
+        )
+    return SymbolSettingsResponse(
+        values=SymbolSettingsValues(**settings.values()),
+        sources=SymbolSettingsSources(**settings.sources()),
+        state=SymbolRefreshState(
+            idle=activity["idle"],
+            active_tasks=activity["active_tasks"],
+            data_requests_in_flight=activity["data_requests_in_flight"],
+            last_data_request_at=activity["last_data_request_at"],
+            window_open=catalog.window_open(),
+            markets=markets,
+        ),
+    )
+
+
+_SETTINGS_NOTE = (
+    "Like every endpoint of this API, this one has no authentication: keep the API on "
+    "a trusted network."
+)
+
+
+@router.get(
+    "/settings",
+    response_model=SymbolSettingsResponse,
+    summary="Get the symbol refresher settings",
+    description=(
+        "The effective refresher settings, where each comes from ('default', 'env', "
+        "'config' or 'api'), and the read-only refresher state: whether TradingAgents "
+        "counts as idle (no analysis task pending/queued/processing and no Yahoo-backed "
+        "request - /data, /analysts, sync /analyze - within `idle_grace_minutes`), and "
+        "per market what a stale list waits for.\n\n" + _SETTINGS_NOTE
+    ),
+)
+def get_settings(
+    catalog: SymbolCatalog = Depends(get_symbol_catalog),
+    settings: SymbolSettings = Depends(get_symbol_settings),
+    monitor: ActivityMonitor = Depends(get_activity_monitor),
+) -> SymbolSettingsResponse:
+    """Return the effective refresher settings and state."""
+    return _settings_response(catalog, settings, monitor)
+
+
+@router.put(
+    "/settings",
+    response_model=SymbolSettingsResponse,
+    summary="Change the symbol refresher settings",
+    description=(
+        "Partial update: omitted fields stay as they are; a field set to null goes back "
+        "to its default / env / config value. Ranges: `ttl_days` 0.5-90, "
+        "`idle_grace_minutes` 0-240, `page_delay_seconds` 0.5-10; `refresh_window` is "
+        "'HH:MM-HH:MM' (may wrap midnight) or '' for none; `refresh_timezone` an IANA "
+        "zone. Invalid input is a 422 and changes nothing. Changes apply at once (the "
+        "refresher reads them on every tick and page) and are saved to `settings.json` "
+        "in the symbols cache dir, so they survive a restart and win over env values.\n\n"
+        + _SETTINGS_NOTE
+    ),
+)
+def put_settings(
+    body: SymbolSettingsUpdate,
+    catalog: SymbolCatalog = Depends(get_symbol_catalog),
+    settings: SymbolSettings = Depends(get_symbol_settings),
+    monitor: ActivityMonitor = Depends(get_activity_monitor),
+) -> SymbolSettingsResponse:
+    """Apply a partial settings update."""
+    changes = {name: getattr(body, name) for name in body.model_fields_set}
+    try:
+        settings.update(changes)
+    except ValueError as exc:
+        field, message = exc.args if len(exc.args) == 2 else ("body", str(exc))
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("body", field),
+                    "msg": f"Value error, {message}",
+                    "input": changes.get(field),
+                }
+            ]
+        ) from exc
+    return _settings_response(catalog, settings, monitor)
 
 
 @router.get(

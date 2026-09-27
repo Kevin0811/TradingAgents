@@ -37,6 +37,7 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from tradingagents.api.domain.entities import SymbolEntry
+from tradingagents.api.domain.services.refresh_activity import RefreshGate
 from tradingagents.api.domain.symbols import fx_legs, is_currency
 from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair
 
@@ -163,24 +164,30 @@ class YahooSymbolSource:
     def __init__(
         self,
         *,
-        page_delay_seconds: float = 1.0,
+        page_delay_seconds: float | Callable[[], float] = 2.0,
         max_pages: int = 200,
         include_otc: bool = False,
         screen: Callable[..., dict[str, Any]] | None = None,
         lookup_factory: Callable[[str], Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        gate: RefreshGate | None = None,
     ):
         """Initialize the source.
 
         Args:
-            page_delay_seconds: Pause before every request after the first.
+            page_delay_seconds: Pause before every request after the first; a
+                callable is read before each pause (live settings).
             max_pages: Safety bound on pages per screener query.
             include_otc: Also screen the US OTC venues.
             screen: Replacement for ``yfinance.screen`` (tests).
             lookup_factory: Replacement for ``yfinance.Lookup`` (tests).
             sleep: Replacement for ``time.sleep`` (tests).
+            gate: Consulted before every request after the first: pauses
+                the fetch while TradingAgents is busy (see RefreshGate).
         """
-        self._page_delay = max(0.0, float(page_delay_seconds))
+        self._page_delay = page_delay_seconds
+        self._gate = gate
+        self._market = ""
         self._max_pages = max(1, int(max_pages))
         self._include_otc = include_otc
         self._screen = screen
@@ -213,6 +220,7 @@ class YahooSymbolSource:
             Exception: Any yfinance / HTTP error, unchanged.
         """
         self._requests = 0
+        self._market = market
         if market in MARKET_EXCHANGES:
             entries = self._fetch_screened(market)
         elif market == "crypto":
@@ -428,8 +436,14 @@ class YahooSymbolSource:
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _pace(self) -> None:
-        if self._requests and self._page_delay:
-            self._sleep(self._page_delay)
+        if self._requests:
+            if self._gate is not None:
+                # Between pages only: the first request of a fetch starts at once.
+                self._gate.wait_until_idle(f"{self._market}, after {self._requests} request(s)")
+            delay = self._page_delay() if callable(self._page_delay) else self._page_delay
+            delay = max(0.0, float(delay))
+            if delay:
+                self._sleep(delay)
         self._requests += 1
 
     @staticmethod

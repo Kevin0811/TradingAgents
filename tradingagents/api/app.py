@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from typing import Any
 
 from fastapi import FastAPI
 
 from tradingagents.api.config import ApiConfig, set_config
+from tradingagents.api.core.activity_middleware import (
+    YahooActivityMiddleware,
+    yahoo_backed_paths,
+)
 from tradingagents.api.core.error_handlers import register_exception_handlers
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
+from tradingagents.api.domain.services.refresh_activity import ActivityMonitor, RefreshGate
 from tradingagents.api.domain.services.symbol_catalog import SymbolCatalog, set_active_catalog
+from tradingagents.api.domain.services.symbol_settings import SETTING_SPECS, SymbolSettings
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
@@ -44,18 +49,40 @@ async def lifespan(app: FastAPI):
         app.state.task_worker.shutdown(wait=False)
 
 
-def create_symbol_catalog(config: ApiConfig) -> SymbolCatalog:
+def create_symbol_settings(config: ApiConfig) -> SymbolSettings:
+    """Build the refresher settings: config/env values plus persisted API overrides.
+
+    Raises:
+        ValueError: A configured value is invalid (e.g. a malformed window).
+    """
+    base, sources = {}, {}
+    for name, spec in SETTING_SPECS.items():
+        base[name] = config.config.get(spec.config_key)
+        sources[name] = config.source_of(spec.config_key)
+    return SymbolSettings(base, sources, store_dir=config.symbols_cache_dir)
+
+
+def create_symbol_catalog(
+    config: ApiConfig,
+    settings: SymbolSettings | None = None,
+    monitor: ActivityMonitor | None = None,
+) -> SymbolCatalog:
     """Build the supported-symbols catalog from the API config."""
-    settings = config.config
+    config_values = config.config
+    settings = settings or create_symbol_settings(config)
+    idle_check = monitor.is_idle if monitor is not None else None
+    gate = RefreshGate(idle_check) if idle_check is not None else None
     return SymbolCatalog(
         repository=FileSymbolCacheRepository(config.symbols_cache_dir),
         source=YahooSymbolSource(
-            page_delay_seconds=float(settings.get("symbols_page_delay_seconds", 1.0)),
-            max_pages=int(settings.get("symbols_max_pages", 200)),
-            include_otc=bool(settings.get("symbols_include_otc", False)),
+            page_delay_seconds=lambda: settings.page_delay_seconds,
+            max_pages=int(config_values.get("symbols_max_pages", 200)),
+            include_otc=bool(config_values.get("symbols_include_otc", False)),
+            gate=gate,
         ),
-        ttl=timedelta(days=config.symbols_cache_ttl_days),
-        auto_refresh=config.symbols_auto_refresh,
+        settings=settings,
+        idle_check=idle_check,
+        gate=gate,
     )
 
 
@@ -105,9 +132,24 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
 
     # The supported-symbols list. Nothing is loaded until the lifespan runs;
     # until then (and for any market whose list never loads) request
-    # validation falls back to the ticker shape check.
-    app.state.symbol_catalog = create_symbol_catalog(config)
+    # validation falls back to the ticker shape check. Its automatic refreshes
+    # wait until TradingAgents is idle: no active analysis task and no recent
+    # Yahoo-backed request (tracked by the middleware below).
+    app.state.symbol_settings = create_symbol_settings(config)
+    task_manager = app.state.task_manager
+    app.state.activity_monitor = ActivityMonitor(
+        busy_tasks=lambda: task_manager.active_task_count,
+        grace=lambda: app.state.symbol_settings.idle_grace,
+    )
+    app.state.symbol_catalog = create_symbol_catalog(
+        config, app.state.symbol_settings, app.state.activity_monitor
+    )
     set_active_catalog(app.state.symbol_catalog)
+    app.add_middleware(
+        YahooActivityMiddleware,
+        monitor=app.state.activity_monitor,
+        is_tracked=yahoo_backed_paths(f"/api/{api_version}"),
+    )
 
     # Register global exception handlers
     register_exception_handlers(app)

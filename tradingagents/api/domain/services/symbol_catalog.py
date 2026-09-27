@@ -12,18 +12,30 @@ request validator and ``GET /symbols/check``. A miss in a loaded list is
 rejected only in the markets ``REJECT_UNLISTED_TICKERS`` enforces (tw, jp);
 elsewhere it is allowed and the suggestions are only a hint.
 
-Refresh policy:
+Refresh policy (automatic parts only with auto-refresh on, and at most once
+per ``retry_after`` per market so a failing Yahoo is not hammered). The
+settings are read live from ``SymbolSettings`` (``PUT /symbols/settings``).
 
-* ``start()`` (app lifespan) loads the cache files and, when auto-refresh is
-  on, queues every market whose list is missing or older than the TTL.
-* A read of a missing/stale market re-queues it (auto-refresh only), at most
-  once per ``retry_after`` so a failing Yahoo is not hammered.
-* A miss in a list older than ``miss_refresh_age`` (24h) queues that market
-  too, under the same per-market rate limit, so a newly listed symbol shows up
-  without waiting for the TTL.
-* ``request_manual_refresh()`` (``POST /symbols/refresh``) queues markets
-  regardless of age, except those fetched within ``refresh_cooldown`` unless
-  forced. A forced refresh may also replace a list with a shrunken one.
+* A **missing** list (first start, no cache file) is fetched right away, at
+  ``start()`` or on the next read, whatever the time.
+* A **stale** list (older than the TTL) keeps being served and is refreshed
+  only when TradingAgents is idle (``idle_check``, see ``ActivityMonitor``)
+  and, if one is set, inside the optional ``refresh_window``.
+* A miss in an *enforced* market's list (tw, jp; ``REJECT_UNLISTED_TICKERS``)
+  older than ``miss_refresh_age`` (24h) asks for a refresh of that market so a
+  new listing shows up; it waits for the same conditions. A miss in a soft
+  market (us, crypto, fx) never does: those lists are incomplete by design.
+* A light periodic tick (``REFRESH_TICK_SECONDS``) queues the stale and
+  miss-flagged markets once the conditions hold, so nothing depends on a
+  request arriving at the right moment.
+* ``request_manual_refresh()`` (``POST /symbols/refresh``) is immediate and
+  ignores both conditions, but skips markets fetched within
+  ``refresh_cooldown`` unless forced. A forced refresh may also replace a list
+  with a shrunken one.
+
+Every fetch runs on the one refresher thread, one market at a time. While it
+runs, the source asks the ``RefreshGate`` between pages and pauses while
+TradingAgents is busy (a manual refresh does not pause).
 """
 
 from __future__ import annotations
@@ -38,7 +50,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from tradingagents.api.domain.entities import SymbolEntry, SymbolList
+from tradingagents.api.domain.refresh_window import RefreshWindow
 from tradingagents.api.domain.repositories import SymbolCacheRepository
+from tradingagents.api.domain.services.refresh_activity import RefreshGate
+from tradingagents.api.domain.services.symbol_settings import SymbolSettings, static_settings
 from tradingagents.api.domain.symbols import (
     MARKETS,
     REJECT_UNLISTED_TICKERS,
@@ -55,6 +70,10 @@ STATUS_READY = "ready"
 STATUS_LOADING = "loading"
 STATUS_UNAVAILABLE = "unavailable"
 STATUS_UNCOVERED = "uncovered"  # decisions only: no list covers the ticker
+
+# How often the background tick looks for stale / miss-flagged markets to
+# refresh inside the window. It only queues work; fetches stay on the refresher.
+REFRESH_TICK_SECONDS = 15 * 60
 
 # A refresh must keep at least this share of the previous list's entries, or
 # it is treated as a truncated fetch and the previous list is kept.
@@ -147,6 +166,11 @@ class SymbolCatalog:
         miss_refresh_age: timedelta = timedelta(hours=24),
         refresh_cooldown: timedelta = timedelta(minutes=30),
         reject_unlisted: Mapping[str, bool] = REJECT_UNLISTED_TICKERS,
+        refresh_window: RefreshWindow | None = None,
+        settings: SymbolSettings | None = None,
+        idle_check: Callable[[], bool] | None = None,
+        gate: RefreshGate | None = None,
+        tick_seconds: float = REFRESH_TICK_SECONDS,
         clock: Callable[[], datetime] = _utcnow,
     ):
         """Initialize the catalog.
@@ -154,8 +178,9 @@ class SymbolCatalog:
         Args:
             repository: Persistent cache of the per-market lists.
             source: Fetches a market's list (see ``SymbolSource``).
-            ttl: Age after which a list counts as stale.
-            auto_refresh: Refresh missing/stale lists in the background.
+            ttl: Age after which a list counts as stale (ignored with ``settings``).
+            auto_refresh: Refresh missing/stale lists in the background
+                (ignored with ``settings``).
             retry_after: Minimum gap between automatic attempts per market.
             miss_refresh_age: A miss in a list older than this queues a
                 refresh of that market (rate-limited by ``retry_after``).
@@ -163,26 +188,43 @@ class SymbolCatalog:
                 list is younger than this, unless forced.
             reject_unlisted: Per-market reject policy for a miss in a loaded
                 list (see ``REJECT_UNLISTED_TICKERS``).
+            refresh_window: Optional window for automatic refreshes of stale
+                lists; None refreshes at any time (ignored with ``settings``).
+            settings: Live settings (TTL, auto-refresh, window); built from
+                ``ttl`` / ``auto_refresh`` / ``refresh_window`` when omitted.
+            idle_check: Whether TradingAgents is idle now; automatic refreshes
+                of existing lists wait for it. None means always idle.
+            gate: Pauses a running refresh between pages while busy; the
+                source must consult it (see YahooSymbolSource). The catalog
+                marks manual fetches so they do not pause, and stops the gate
+                on shutdown.
+            tick_seconds: Interval of the background tick that queues due
+                markets inside the window.
             clock: Returns the current UTC time (tests).
         """
         self._repository = repository
         self._source = source
-        self._ttl = ttl
-        self._auto_refresh = auto_refresh
+        self._settings = settings or static_settings(ttl, auto_refresh, refresh_window)
+        self._idle_check = idle_check or (lambda: True)
+        self._gate = gate
         self._retry_after = retry_after
         self._miss_refresh_age = miss_refresh_age
         self._refresh_cooldown = refresh_cooldown
         self._reject_unlisted = dict(reject_unlisted)
+        self._tick_seconds = max(1.0, float(tick_seconds))
         self._clock = clock
 
         self._indexes: dict[str, _MarketIndex] = {}
         self._lock = threading.Lock()
         self._pending: list[str] = []
         self._forced: set[str] = set()  # queued markets whose refresh was forced
+        self._manual: set[str] = set()  # queued markets a user asked for (no pausing)
         self._refreshing: str | None = None
         self._thread: threading.Thread | None = None
         self._last_attempt: dict[str, datetime] = {}
         self._last_error: dict[str, str] = {}
+        self._miss_flagged: set[str] = set()  # a day-old list missed; waits for the window
+        self._tick_thread: threading.Thread | None = None
         self._started = False
         self._stop = threading.Event()
 
@@ -200,14 +242,77 @@ class SymbolCatalog:
             logger.warning("Could not sweep symbol-cache temp files: %s", exc)
         self.load()
         self._started = True
-        if self._auto_refresh:
-            due = [m for m in MARKETS if not self.is_loaded(m) or self.is_stale(m)]
-            if due:
-                self.request_refresh(due)
+        self._settings.add_listener(self.settings_changed)
+        if self._settings.auto_refresh:
+            missing = [m for m in MARKETS if not self.is_loaded(m)]
+            ready = self.conditions_met()
+            stale = [m for m in MARKETS if self.is_stale(m)] if ready else []
+            waiting = [m for m in MARKETS if self.is_stale(m) and m not in stale]
+            if waiting:
+                logger.info(
+                    "Stale symbol lists (%s) are served until they may refresh (waiting for: %s)",
+                    ", ".join(waiting),
+                    self.waiting_for(waiting[0]),
+                )
+            for market in missing + stale:
+                self._last_attempt[market] = self._clock()
+            if missing or stale:
+                self.request_refresh(missing + stale)
+            self._start_tick()
 
     def shutdown(self) -> None:
-        """Stop the refresher after the market it is fetching, if any."""
+        """Stop the tick and the refresher (after the market it is fetching, if any).
+
+        A refresh paused for activity is abandoned at once (its old list stays).
+        """
         self._stop.set()
+        if self._gate is not None:
+            self._gate.stop()
+
+    def settings_changed(self) -> None:
+        """Apply changed settings now: start the tick if needed and run it once."""
+        if not self._started or self._stop.is_set():
+            return
+        if self._settings.auto_refresh:
+            self._start_tick()
+        self.tick()
+
+    def tick(self) -> list[str]:
+        """Queue what is due now (the periodic tick's body); returns queued markets.
+
+        Missing lists are due at any time; stale and miss-flagged ones only
+        inside the refresh window. The per-market rate limit applies.
+        """
+        if not (self._started and self._settings.auto_refresh) or self._stop.is_set():
+            return []
+        queued = [m for m in MARKETS if not self.is_loaded(m) and self._touch(m)]
+        if self.conditions_met():
+            queued += [m for m in MARKETS if self.is_loaded(m) and self._touch(m)]
+            for market in sorted(self._miss_flagged):
+                age = self._age(market)
+                if age is None or age <= self._miss_refresh_age:
+                    self._miss_flagged.discard(market)  # refreshed meanwhile
+                elif self._touch(market, max_age=self._miss_refresh_age):
+                    self._miss_flagged.discard(market)
+                    queued.append(market)
+        return list(dict.fromkeys(queued))
+
+    def _start_tick(self) -> None:
+        if self._tick_thread is not None or self._stop.is_set():
+            return
+        self._tick_thread = threading.Thread(
+            target=self._tick_loop, name="symbol-catalog-tick", daemon=True
+        )
+        self._tick_thread.start()
+
+    def _tick_loop(self) -> None:
+        # Event.wait sleeps the whole interval (no busy loop) and returns True
+        # as soon as shutdown() sets the event.
+        while not self._stop.wait(self._tick_seconds):
+            try:
+                self.tick()
+            except Exception:  # pragma: no cover - tick only queues work
+                logger.exception("Symbol catalog tick failed")
 
     def load(self) -> None:
         """(Re)load every market's list from the cache; never raises."""
@@ -250,7 +355,71 @@ class SymbolCatalog:
     def is_stale(self, market: str) -> bool:
         """True when the market has a list older than the TTL."""
         age = self._age(market)
-        return age is not None and age > self._ttl
+        return age is not None and age > self._settings.ttl
+
+    @property
+    def settings(self) -> SymbolSettings:
+        return self._settings
+
+    @property
+    def refresh_window(self) -> RefreshWindow | None:
+        return self._settings.refresh_window
+
+    def window_open(self) -> bool:
+        """True when no refresh window is set, or the current time is inside it."""
+        window = self._settings.refresh_window
+        return window is None or window.contains(self._clock())
+
+    def is_idle(self) -> bool:
+        try:
+            return bool(self._idle_check())
+        except Exception:  # pragma: no cover - a failing probe means "busy"
+            logger.exception("Idle check failed; treating TradingAgents as busy")
+            return False
+
+    def conditions_met(self) -> bool:
+        """True when automatic refreshes of existing lists may start now."""
+        return self.window_open() and self.is_idle()
+
+    def is_paused(self, market: str) -> bool:
+        """True while ``market``'s refresh is paused for activity."""
+        return bool(self._gate and self._gate.paused and self.is_refreshing(market))
+
+    def waiting_for(self, market: str) -> str | None:
+        """Why a due list (stale or miss-flagged) is not being refreshed yet.
+
+        ``auto_refresh_off``, ``window`` (outside the refresh window),
+        ``activity`` (TradingAgents is busy), ``retry_limit`` (a recent attempt
+        failed) or ``tick`` (conditions hold; queued at the next tick or read).
+        None when nothing is due: the list is fresh, missing (fetched right
+        away) or being refreshed.
+        """
+        if not self.is_loaded(market) or self.is_refreshing(market):
+            return None
+        if not (self.is_stale(market) or market in self._miss_flagged):
+            return None
+        if not self._settings.auto_refresh:
+            return "auto_refresh_off"
+        if not self.window_open():
+            return "window"
+        if not self.is_idle():
+            return "activity"
+        last = self._last_attempt.get(market)
+        if last is not None and self._clock() - last < self._retry_after:
+            return "retry_limit"
+        return "tick"
+
+    def next_refresh_after(self, market: str) -> datetime | None:
+        """When a list waiting for the refresh window may refresh (UTC).
+
+        Only known for the window: None when the market is not waiting for
+        it (fresh, missing, refreshing, or waiting for idleness, which has no
+        predictable end).
+        """
+        window = self._settings.refresh_window
+        if window is None or self.waiting_for(market) != "window":
+            return None
+        return window.next_open(self._clock())
 
     def is_refreshing(self, market: str) -> bool:
         with self._lock:
@@ -482,13 +651,15 @@ class SymbolCatalog:
         """
         requested = [m for m in dict.fromkeys(markets) if m in MARKETS]
         skipped = [] if force else [m for m in requested if self._fetched_recently(m)]
-        if force:
-            with self._lock:
-                for market in requested:
+        wanted = [m for m in requested if m not in skipped]
+        with self._lock:
+            for market in wanted:
+                self._manual.add(market)
+                if force:
                     self._forced.add(market)
                     if market == self._refreshing and market not in self._pending:
                         self._pending.append(market)
-        queued = self.request_refresh([m for m in requested if m not in skipped])
+        queued = self.request_refresh(wanted)
         return queued, skipped
 
     def wait_idle(self, timeout: float | None = None) -> bool:
@@ -500,7 +671,7 @@ class SymbolCatalog:
             return not thread.is_alive()
         return True
 
-    def refresh_market(self, market: str, force: bool = False) -> bool:
+    def refresh_market(self, market: str, force: bool = False, manual: bool = False) -> bool:
         """Fetch ``market`` now (blocking) and swap it in; True on success.
 
         On failure the previous list stays in memory and on disk. A fetch that
@@ -510,9 +681,12 @@ class SymbolCatalog:
         ``force`` (a forced manual refresh) accepts such a shrink with a
         warning. A fetch the source itself fails (an error, a query short of
         its total, the page cap) is refused whatever ``force`` says.
+        ``manual`` (a user-requested refresh) does not pause for activity.
         """
         self._last_attempt[market] = self._clock()
         kept = self.get_list(market)
+        if self._gate is not None:
+            self._gate.active = not manual
         try:
             entries = list(self._source.fetch(market))
         except Exception as exc:
@@ -582,6 +756,7 @@ class SymbolCatalog:
                 if self._stop.is_set():
                     self._pending.clear()
                     self._forced.clear()
+                    self._manual.clear()
                 if not self._pending:
                     self._refreshing = None
                     self._thread = None
@@ -589,9 +764,11 @@ class SymbolCatalog:
                 market = self._pending.pop(0)
                 self._refreshing = market
                 force = market in self._forced
+                manual = market in self._manual
                 self._forced.discard(market)
+                self._manual.discard(market)
             try:
-                self.refresh_market(market, force=force)
+                self.refresh_market(market, force=force, manual=manual)
             except Exception:  # pragma: no cover - refresh_market already guards
                 logger.exception("Unexpected error refreshing the %s symbol list", market)
             finally:
@@ -603,27 +780,46 @@ class SymbolCatalog:
         return age is not None and age < self._refresh_cooldown
 
     def _refresh_after_miss(self, market: str) -> None:
-        """A miss may be a new listing: refresh a list older than a day."""
+        """A miss may be a new listing: refresh an enforced list older than a day.
+
+        Only enforced markets (tw, jp): a soft market's list is incomplete by
+        design, so a miss there is routine. When the conditions do not hold
+        (busy, outside the window) the market is flagged instead, and the
+        tick refreshes it once they do.
+        """
+        if not (self._started and self._settings.auto_refresh) or not self.is_enforced(market):
+            return
+        age = self._age(market)
+        if age is None or age <= self._miss_refresh_age:
+            return
+        if not self.conditions_met():
+            self._miss_flagged.add(market)
+            return
         self._touch(market, max_age=self._miss_refresh_age)
 
-    def _touch(self, market: str, max_age: timedelta | None = None) -> None:
+    def _touch(self, market: str, max_age: timedelta | None = None) -> bool:
         """Queue a missing list, or one older than ``max_age`` (default: the TTL).
 
         Only after startup with auto-refresh on, and at most once per
-        ``retry_after`` per market.
+        ``retry_after`` per market. A missing list is queued whatever the
+        time; an existing one only when ``conditions_met()``. True if queued.
         """
-        if not (self._started and self._auto_refresh) or self._stop.is_set():
-            return
+        if not (self._started and self._settings.auto_refresh) or self._stop.is_set():
+            return False
         age = self._age(market)
-        if age is not None and age <= (max_age if max_age is not None else self._ttl):
-            return
+        if age is not None:
+            if age <= (max_age if max_age is not None else self._settings.ttl):
+                return False
+            if not self.conditions_met():
+                return False
         if self.is_refreshing(market):
-            return
+            return False
         last = self._last_attempt.get(market)
         if last is not None and self._clock() - last < self._retry_after:
-            return
+            return False
         self._last_attempt[market] = self._clock()
         self.request_refresh([market])
+        return True
 
 
 # ---------------------------------------------------------------------------
