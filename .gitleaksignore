@@ -1,0 +1,4 @@
+# Fake keys in upstream's tests, used to check that errors never echo a key.
+# Fingerprint format: <commit>:<file>:<rule>:<line>.
+b20c8e60a462b82f3f5bdd21d4f2896acf9a9d69:tests/test_alpha_vantage_hardening.py:generic-api-key:144
+b20c8e60a462b82f3f5bdd21d4f2896acf9a9d69:tests/test_fred.py:generic-api-key:239
