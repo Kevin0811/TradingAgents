@@ -1,12 +1,24 @@
 """Runtime-adjustable settings of the supported-symbols refresher.
 
-Each setting has a *base* value (the built-in default, a ``TRADINGAGENTS_*``
-env var, or a ``create_app`` override) and may be overridden at runtime
-through ``PUT /symbols/settings``. API overrides are persisted to a JSON file
-next to the list cache (``<cache dir>/settings.json``, written atomically) so
-they survive a restart, and win over the base value on load. Setting a field
-to null in the PUT removes its override. A corrupt settings file is ignored
-with a warning (base values apply); a single invalid field in it is dropped.
+Each setting has a *base* value and may be overridden at runtime through
+``PUT /symbols/settings``. Precedence, highest first:
+
+1. ``api``: a ``PUT /symbols/settings`` value, persisted to
+   ``<cache dir>/settings.json`` (written atomically) so it survives a restart;
+2. ``config``: a ``create_app(overrides=...)`` value;
+3. ``env``: a ``TRADINGAGENTS_SYMBOLS_*`` env var (an empty value counts as
+   unset);
+4. ``default``: the built-in default.
+
+Setting a field to null in the PUT removes its API override, so the next
+level applies again. A corrupt settings file is ignored with a warning (base
+values apply); a single invalid field in it is dropped. An invalid base value
+stops the app from starting (``create_symbol_settings`` names the env var or
+config key).
+
+The time zone is only resolved when a refresh window is set, so a system
+without tz data runs fine with the window off; with a window set, an unknown
+zone is an error.
 
 Readers (the catalog, the Yahoo source, the activity monitor) read the
 current values on every use, so a change applies live: the next tick, the
@@ -18,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -26,7 +39,6 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tradingagents.api.domain.refresh_window import RefreshWindow
 
@@ -78,6 +90,8 @@ def validate_setting(name: str, value: Any) -> Any:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"{name} must be a number")
         number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be a finite number")
         if spec.minimum is not None and number < spec.minimum:
             raise ValueError(f"{name} must be at least {spec.minimum:g}")
         if spec.maximum is not None and number > spec.maximum:
@@ -86,15 +100,11 @@ def validate_setting(name: str, value: Any) -> Any:
     if not isinstance(value, str):
         raise ValueError(f"{name} must be a string")
     text = value.strip()
-    if name == "refresh_timezone":
-        if not text:
-            raise ValueError("refresh_timezone must be an IANA time zone, e.g. 'Asia/Taipei'")
-        try:
-            ZoneInfo(text)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError(f"unknown time zone {text!r}") from exc
+    if name == "refresh_timezone" and not text:
+        # The zone itself is resolved with the window (``RefreshWindow.parse``).
+        raise ValueError("refresh_timezone must be an IANA time zone, e.g. 'Asia/Taipei'")
     if name == "refresh_window":
-        RefreshWindow.parse(text, "UTC")  # format only; the zone is checked on its own
+        RefreshWindow.parse_times(text)  # format only; the zone is checked with it
     return text
 
 
@@ -116,7 +126,8 @@ class SymbolSettings:
                 API overrides in memory only.
 
         Raises:
-            ValueError: A base value is invalid (e.g. a malformed env var).
+            ValueError: A base value is invalid (e.g. a malformed env var);
+                ``create_symbol_settings`` validates first to name its origin.
         """
         self._lock = threading.Lock()
         self._base = {name: validate_setting(name, base[name]) for name in SETTING_SPECS}
@@ -126,7 +137,6 @@ class SymbolSettings:
         RefreshWindow.parse(self._base["refresh_window"], self._base["refresh_timezone"])
         self._path = Path(store_dir) / SETTINGS_FILE_NAME if store_dir is not None else None
         self._overrides: dict[str, Any] = self._load()
-        self._window_cache: tuple[tuple[str, str], RefreshWindow | None] | None = None
         self._listeners: list[Callable[[], None]] = []
 
     # ------------------------------------------------------------------
@@ -166,12 +176,10 @@ class SymbolSettings:
 
     @property
     def refresh_window(self) -> RefreshWindow | None:
-        key = (self.get("refresh_window"), self.get("refresh_timezone"))
-        cached = self._window_cache
-        if cached is None or cached[0] != key:
-            cached = (key, RefreshWindow.parse(*key))
-            self._window_cache = cached
-        return cached[1]
+        with self._lock:
+            spec = self._overrides.get("refresh_window", self._base["refresh_window"])
+            zone = self._overrides.get("refresh_timezone", self._base["refresh_timezone"])
+        return RefreshWindow.parse(spec, zone)  # the zone is resolved only with a window
 
     # ------------------------------------------------------------------
     # Updating

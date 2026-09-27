@@ -63,7 +63,7 @@ class _OfflineSymbolSource:
     def __init__(self, *args, **kwargs):
         pass
 
-    def fetch(self, market):
+    def fetch(self, market, yield_when_busy=True):
         from tradingagents.api.infrastructure.yahoo_symbol_source import SymbolSourceError
 
         raise SymbolSourceError(f"network access is disabled in tests ({market})")

@@ -46,6 +46,26 @@ class RefreshWindow:
             ValueError: The spec is not ``HH:MM-HH:MM``, a time is out of range,
                 start equals end, or the time zone is unknown or empty.
         """
+        times = cls.parse_times(spec)
+        if times is None:
+            return None
+        start, end = times
+        spec = str(spec).strip()
+        name = (tz_name or "").strip()
+        if not name:
+            raise ValueError("a refresh window needs a time zone (e.g. 'Asia/Taipei')")
+        try:
+            tz = ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown refresh-window time zone {name!r}") from exc
+        return cls(start=start, end=end, tz=tz, spec=spec)
+
+    @staticmethod
+    def parse_times(spec: str | None) -> tuple[time, time] | None:
+        """The ``(start, end)`` of ``spec`` without resolving any time zone.
+
+        None for an empty spec. Raises ValueError like ``parse``.
+        """
         if spec is None or not str(spec).strip():
             return None
         spec = str(spec).strip()
@@ -60,14 +80,7 @@ class RefreshWindow:
         end = _clock_time(h2, m2, spec, is_end=True)
         if start == end:
             raise ValueError(f"refresh window {spec!r} is empty (start equals end)")
-        name = (tz_name or "").strip()
-        if not name:
-            raise ValueError("a refresh window needs a time zone (e.g. 'Asia/Taipei')")
-        try:
-            tz = ZoneInfo(name)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValueError(f"unknown refresh-window time zone {name!r}") from exc
-        return cls(start=start, end=end, tz=tz, spec=spec)
+        return start, end
 
     def describe(self) -> str:
         """``"02:00-06:00 Asia/Taipei"``."""

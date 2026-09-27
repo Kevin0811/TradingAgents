@@ -59,11 +59,13 @@ class FakeSource:
 
     def __init__(self):
         self.calls: list[str] = []
+        self.yields: dict[str, bool] = {}  # market -> yield_when_busy of its last fetch
 
     fail: set[str] = set()
 
-    def fetch(self, market):
+    def fetch(self, market, yield_when_busy=True):
         self.calls.append(market)
+        self.yields[market] = yield_when_busy
         if market in self.fail:
             raise RuntimeError(f"{market} is down")
         base = {"tw": TW, "us": US}.get(market, [])
@@ -670,7 +672,7 @@ class TestSettingsApi:
             {"refresh_window": "2-6"},
             {"refresh_window": "25:00-06:00"},
             {"refresh_window": "02:00-02:00"},
-            {"refresh_timezone": "Mars/Olympus_Mons"},
+            {"refresh_window": "02:00-06:00", "refresh_timezone": "Mars/Olympus_Mons"},
             {"refresh_timezone": ""},
             {"auto_refresh": "maybe"},
             {"ttl_days": "soon"},
@@ -771,14 +773,37 @@ class TestDataActivityMiddleware:
         assert client.get(f"{BASE}/settings").json()["state"]["active_tasks"] == 1
 
 
+class BlockingSource(FakeSource):
+    """A FakeSource whose fetches wait until ``release`` is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def fetch(self, market, yield_when_busy=True):
+        self.entered.set()
+        assert self.release.wait(5), "test never released the source"
+        return super().fetch(market, yield_when_busy)
+
+
 @pytest.mark.unit
-def test_refresher_threads_are_daemon_and_named(make_catalog):
-    catalog, _, _ = make_catalog(lists=_stale_tw())
-    catalog.start()
+def test_refresher_threads_are_daemon_and_named(tmp_path):
+    repo = FileSymbolCacheRepository(tmp_path)
+    for market, (entries, age) in _stale_tw().items():
+        repo.save(SymbolList(market, tuple(entries), NOW - age, "seeded"))
+    source = BlockingSource()
+    catalog = SymbolCatalog(repo, source, tick_seconds=3600, clock=Clock())
+    try:
+        catalog.start()
+        assert source.entered.wait(5)
+        threads = {t.name: t for t in threading.enumerate() if t.name.startswith("symbol-")}
+        assert threads["symbol-catalog-tick"].daemon
+        assert threads["symbol-catalog-refresh"].daemon
+    finally:
+        source.release.set()
+        catalog.shutdown()
     assert catalog.wait_idle(5)
-    names = {t.name for t in threading.enumerate() if t.name.startswith("symbol-catalog")}
-    assert "symbol-catalog-tick" in names
-    assert catalog._tick_thread.daemon
 
 
 @pytest.mark.unit
@@ -793,20 +818,509 @@ class TestConfigAndEnv:
         from tradingagents.api import config as config_module
 
         monkeypatch.setattr(config_module, "SYMBOLS_ENV_KEYS", set())
-        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW", "")  # empty = off
+        # Empty values (compose's ``${VAR:-}``) count as unset, for every setting.
+        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW", "")
+        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_REFRESH_TIMEZONE", "")
+        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS", " ")
+        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_MAX_PAGES", "")
         monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_IDLE_GRACE_MINUTES", "2.5")
-        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS", "")  # ignored: not text
         defaults = config_module._symbols_defaults()
         assert defaults["symbols_refresh_window"] == ""
-        assert defaults["symbols_idle_grace_minutes"] == 2.5
+        assert defaults["symbols_refresh_timezone"] == "Asia/Taipei"
         assert defaults["symbols_cache_ttl_days"] == 7.0
-        env_keys = set(config_module.SYMBOLS_ENV_KEYS)
-        assert env_keys == {
-            "symbols_refresh_window",
-            "symbols_idle_grace_minutes",
-        }
+        assert defaults["symbols_max_pages"] == 200
+        assert defaults["symbols_idle_grace_minutes"] == 2.5
+        assert set(config_module.SYMBOLS_ENV_KEYS) == {"symbols_idle_grace_minutes"}
 
         client, _ = make_app(symbols_idle_grace_minutes=2.5)
         sources = client.get(f"{BASE}/settings").json()["sources"]
-        assert sources["refresh_window"] == "env"
+        assert sources["refresh_window"] == "default"
+        assert sources["refresh_timezone"] == "default"
         assert sources["idle_grace_minutes"] == "config"  # an override wins the label
+
+
+# ---------------------------------------------------------------------------
+# Which fetches yield, and manual work preempting a yielding one
+# ---------------------------------------------------------------------------
+
+
+def _until(predicate, timeout: float = 5.0) -> bool:
+    """Poll ``predicate`` (a background thread must make it true) up to ``timeout``."""
+    pause = threading.Event()
+    for _ in range(int(timeout / 0.005)):
+        if predicate():
+            return True
+        pause.wait(0.005)
+    return predicate()
+
+
+class ExchangeScreen:
+    """A screener with ``pages[exchange]`` full equity pages; records every call."""
+
+    def __init__(self, pages: dict[str, int], on_page=None):
+        self.rows = {
+            exchange: [{"symbol": f"{exchange}{i:04d}"} for i in range(250 * n)]
+            for exchange, n in pages.items()
+        }
+        self.calls: list[tuple[str, int]] = []
+        self.on_page = on_page
+
+    def __call__(self, query, offset=0, size=25, sortField=None, sortAsc=None):
+        text = json.dumps(query.to_dict())
+        exchange = next((e for e in self.rows if f'"{e}"' in text), None)
+        if exchange is None or "intradaymarketcap" not in text:
+            return {"quotes": [], "total": 0}
+        self.calls.append((exchange, offset))
+        if self.on_page:
+            self.on_page(exchange, offset)
+        rows = self.rows[exchange]
+        return {"quotes": rows[offset : offset + size], "total": len(rows)}
+
+
+# Seeded lists on the exchanges the fake screeners serve, so a refresh passes
+# the shrink guard (no exchange/type group goes empty).
+LISTED = {
+    **ALL_FRESH_BUT_TW,
+    "jp": ([SymbolEntry("7203.T", "Toyota", "JPX", "equity", "jp")], timedelta(hours=1)),
+    "tw": ([SymbolEntry("2330.TW", "TSMC", "TAI", "equity", "tw")], timedelta(days=8)),
+}
+
+
+def _seed(tmp_path, lists) -> FileSymbolCacheRepository:
+    repo = FileSymbolCacheRepository(tmp_path)
+    for market, (entries, age) in lists.items():
+        repo.save(SymbolList(market, tuple(entries), NOW - age, "seeded"))
+    return repo
+
+
+@pytest.mark.unit
+class TestWhichFetchesYield:
+    def test_the_per_fetch_flag(self, make_catalog):
+        catalog, source, _ = make_catalog(lists=dict(ALL_FRESH_BUT_TW, us=(US, timedelta(days=8))))
+        catalog.start()  # tw missing, us stale
+        assert catalog.wait_idle(5)
+        assert source.yields == {"tw": False, "us": True}
+
+        assert catalog.request_manual_refresh(["jp"]) == (["jp"], [])
+        assert catalog.wait_idle(5)
+        assert source.yields["jp"] is False
+
+    def test_a_missing_list_does_not_pause_while_busy(self, tmp_path):
+        waits = []
+
+        def fake_wait(seconds):
+            waits.append(seconds)
+            return len(waits) > 20  # never hang the test if it did pause
+
+        idle = Idle(False)
+        gate = RefreshGate(idle, wait=fake_wait)
+        screen = PagedScreen(3)
+        source = YahooSymbolSource(screen=screen, sleep=lambda s: None, gate=gate)
+        repo = _seed(tmp_path, ALL_FRESH_BUT_TW)  # no tw list
+        catalog = SymbolCatalog(repo, source, gate=gate, idle_check=idle, clock=Clock())
+        try:
+            catalog.start()
+            assert catalog.wait_idle(5)
+        finally:
+            catalog.shutdown()
+
+        assert waits == []
+        assert screen.offsets == [0, 250, 500]
+        assert len(catalog.get_list("tw").entries) == 750
+
+
+@pytest.mark.unit
+class TestManualPreemptsAutomatic:
+    def _catalog(self, tmp_path, screen, idle, poll_seconds):
+        gate = RefreshGate(idle, poll_seconds=poll_seconds)  # the real, wakeable wait
+        source = YahooSymbolSource(screen=screen, sleep=lambda s: None, gate=gate)
+        repo = _seed(tmp_path, LISTED)
+        catalog = SymbolCatalog(
+            repo, source, gate=gate, idle_check=idle, tick_seconds=3600, clock=Clock()
+        )
+        return catalog, gate
+
+    def test_a_manual_refresh_of_the_paused_market_carries_it_on_without_pausing(self, tmp_path):
+        idle = Idle(True)
+        screen = PagedScreen(3, on_page=lambda offset: setattr(idle, "idle", False))
+        # A 60 s poll: only the release can end the pause within the test.
+        catalog, gate = self._catalog(tmp_path, screen, idle, poll_seconds=60.0)
+        try:
+            catalog.start()  # idle: the stale tw list starts refreshing, then it turns busy
+            assert _until(lambda: catalog.is_paused("tw"))
+
+            assert catalog.request_manual_refresh(["tw"]) == (["tw"], [])
+            assert catalog.wait_idle(5)
+
+            assert idle.idle is False  # still busy: it did not wait for idleness
+            assert screen.offsets == [0, 250, 500]  # the same fetch went on
+            assert len(catalog.get_list("tw").entries) == 750
+            assert catalog._manual == set()  # tw was never queued, so never marked
+
+            # The flag did not leak: the next automatic fetch of tw pauses again.
+            screen.offsets.clear()
+            catalog.request_refresh(["tw"])
+            assert _until(lambda: catalog.is_paused("tw"))
+            assert screen.offsets == [0]
+        finally:
+            catalog.shutdown()
+        assert catalog.wait_idle(5)
+
+    def test_manual_work_for_another_market_preempts_a_paused_refresh(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO)
+        idle = Idle(True)
+        busy_during_jp = []
+
+        def on_page(exchange, offset):
+            if exchange == "TAI" and offset == 0:
+                idle.idle = False  # an analysis task starts after tw's first page
+            if exchange == "JPX":
+                busy_during_jp.append(not idle.idle)
+
+        screen = ExchangeScreen({"TAI": 3, "JPX": 2}, on_page)
+        catalog, gate = self._catalog(tmp_path, screen, idle, poll_seconds=0.02)
+        try:
+            catalog.start()
+            assert _until(lambda: catalog.is_paused("tw"))
+
+            assert catalog.request_manual_refresh(["jp"]) == (["jp"], [])
+            # jp runs now, busy or not, and tw is queued again after it.
+            assert _until(lambda: catalog.get_list("jp").source != "seeded")
+            assert busy_during_jp == [True, True]
+            assert _until(lambda: catalog.is_paused("tw"))  # tw restarted, paused again
+            assert screen.calls[:4] == [("TAI", 0), ("JPX", 0), ("JPX", 250), ("TAI", 0)]
+            assert catalog.get_list("tw").source == "seeded"
+            assert "made way for a manual refresh; queued again after it" in caplog.text
+
+            idle.idle = True
+            assert catalog.wait_idle(5)
+        finally:
+            catalog.shutdown()
+        assert len(catalog.get_list("tw").entries) == 750
+        assert len(catalog.get_list("jp").entries) == 500
+        assert catalog.last_error("tw") is None
+
+    def test_a_forced_refresh_of_the_paused_market_replaces_the_paused_fetch(self, tmp_path):
+        idle = Idle(True)
+        screen = PagedScreen(3, on_page=lambda offset: setattr(idle, "idle", False))
+        catalog, gate = self._catalog(tmp_path, screen, idle, poll_seconds=60.0)
+        try:
+            catalog.start()
+            assert _until(lambda: catalog.is_paused("tw"))
+
+            assert catalog.request_manual_refresh(["tw"], force=True) == (["tw"], [])
+            assert catalog.wait_idle(5)
+
+            # The paused fetch was abandoned (not queued twice); the forced one ran.
+            assert screen.offsets == [0, 0, 250, 500]
+            assert len(catalog.get_list("tw").entries) == 750
+        finally:
+            catalog.shutdown()
+
+
+@pytest.mark.unit
+class TestAutoRefreshOffDropsQueuedAutomaticWork:
+    def test_queued_automatic_markets_are_dropped_manual_ones_kept(self, tmp_path):
+        repo = _seed(tmp_path, _stale_tw(us=(US, timedelta(days=8))))
+        source = BlockingSource()
+        settings = SymbolSettings(
+            {
+                "ttl_days": 7.0,
+                "auto_refresh": True,
+                "idle_grace_minutes": 10.0,
+                "refresh_window": "",
+                "refresh_timezone": "Asia/Taipei",
+                "page_delay_seconds": 2.0,
+            }
+        )
+        catalog = SymbolCatalog(repo, source, settings=settings, tick_seconds=3600, clock=Clock())
+        try:
+            catalog.start()  # tw and us are stale: tw is fetched, us queued
+            assert source.entered.wait(5)
+            assert catalog.request_manual_refresh(["jp"]) == (["jp"], [])
+            assert catalog._pending == ["jp", "us"]  # manual work goes first
+
+            settings.update({"auto_refresh": False})
+            assert catalog._pending == ["jp"]
+
+            source.release.set()
+            assert catalog.wait_idle(5)
+        finally:
+            catalog.shutdown()
+        assert source.calls == ["tw", "jp"]  # the running tw fetch finished
+
+
+@pytest.mark.unit
+def test_concurrent_settings_updates_start_one_tick_thread(make_catalog, monkeypatch):
+    from tradingagents.api.domain.services import symbol_catalog as catalog_module
+
+    catalog, _, _ = make_catalog(lists=ALL_FRESH_BUT_TW | {"tw": (TW, timedelta(hours=1))})
+    catalog.start()
+    catalog._stop.set()  # stop the running tick thread ...
+    catalog._tick_thread.join(2)
+    catalog._stop.clear()  # ... and forget it, so the next calls race to start one
+    catalog._tick_thread = None
+
+    real_thread = threading.Thread
+    started = []
+
+    class SlowThread(real_thread):
+        def __init__(self, *args, **kwargs):
+            pause.wait(0.05)  # widen the check-then-create window
+            super().__init__(*args, **kwargs)
+            started.append(self)
+
+    pause = threading.Event()
+    callers = [real_thread(target=catalog._start_tick) for _ in range(4)]
+    monkeypatch.setattr(catalog_module.threading, "Thread", SlowThread)
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(5)
+    monkeypatch.setattr(catalog_module.threading, "Thread", real_thread)
+
+    assert [t.name for t in started] == ["symbol-catalog-tick"]
+
+
+@pytest.mark.unit
+class TestForcedRefreshGap:
+    def test_a_market_is_forced_at_most_once_per_gap(self, make_catalog):
+        from tradingagents.api.domain.services.symbol_catalog import FORCED_REFRESH_MIN_GAP
+
+        clock = Clock()
+        catalog, source, _ = make_catalog(lists=_stale_tw(), clock=clock, auto=False)
+        catalog.start()
+        assert timedelta(minutes=5) == FORCED_REFRESH_MIN_GAP
+
+        assert catalog.request_manual_refresh(["tw"], force=True) == (["tw"], [])
+        assert catalog.wait_idle(5)
+        clock.now += timedelta(minutes=4)
+        assert catalog.request_manual_refresh(["tw", "us"], force=True) == (["us"], ["tw"])
+        assert catalog.wait_idle(5)
+        clock.now += timedelta(minutes=1)
+        assert catalog.request_manual_refresh(["tw"], force=True) == (["tw"], [])
+        assert catalog.wait_idle(5)
+        assert source.calls == ["tw", "us", "tw"]
+
+    def test_the_202_body_says_why(self, make_app):
+        client, _ = make_app()
+        first = client.post(f"{BASE}/refresh", params={"market": "tw", "force": "true"})
+        assert first.status_code == 202
+        assert first.json() == {"queued": ["tw"], "skipped": [], "skip_reasons": {}}
+        again = client.post(f"{BASE}/refresh", params={"market": "tw", "force": "true"})
+        assert again.json() == {
+            "queued": [],
+            "skipped": ["tw"],
+            "skip_reasons": {"tw": "forced_recently"},
+        }
+
+
+# ---------------------------------------------------------------------------
+# The source: stop checks, long pauses
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestSourceStopsAndRestarts:
+    def test_a_retry_pause_ends_at_once_on_stop_and_is_not_retried(self):
+        from tradingagents.api.infrastructure import yahoo_symbol_source as source_module
+
+        gate = RefreshGate()
+        calls = []
+
+        def screen(query, offset=0, size=25, sortField=None, sortAsc=None):
+            calls.append(offset)
+            gate.stop()  # shutdown while this request fails
+            raise RuntimeError("HTTP Error 500: ")
+
+        # No sleep injected: the source sleeps on the gate's stop event.
+        source = YahooSymbolSource(screen=screen, gate=gate)
+        assert source_module.PAGE_RETRY_BASE_DELAY_SECONDS == 2.0
+        started = datetime.now()
+        with pytest.raises(RefreshInterrupted):
+            source.fetch("tw")
+        assert (datetime.now() - started).total_seconds() < 1.5
+        assert calls == [0]
+
+    def test_a_non_yielding_fetch_still_stops_between_pages(self):
+        gate = RefreshGate(Idle(False), wait=lambda s: pytest.fail("must not pause"))
+        screen = PagedScreen(3, on_page=lambda offset: gate.stop() if offset == 250 else None)
+        source = YahooSymbolSource(screen=screen, sleep=lambda s: None, gate=gate)
+
+        with pytest.raises(RefreshInterrupted):
+            source.fetch("tw", yield_when_busy=False)
+        assert screen.offsets == [0, 250]
+
+    @pytest.mark.parametrize(("polls", "offsets"), [(4, [0, 250, 0, 250, 500]), (3, [0, 250, 500])])
+    def test_a_long_pause_restarts_the_query(self, polls, offsets, caplog):
+        from tradingagents.api.infrastructure.yahoo_symbol_source import (
+            RESTART_QUERY_AFTER_PAUSE_SECONDS,
+        )
+
+        caplog.set_level(logging.INFO)
+        assert RESTART_QUERY_AFTER_PAUSE_SECONDS == 15 * 60
+        idle, now, waited = Idle(True), [0.0], []
+
+        def fake_wait(seconds):
+            waited.append(seconds)
+            now[0] += 300.0  # each poll: five minutes
+            if len(waited) == polls:
+                idle.idle = True
+            return False
+
+        def on_page(offset):
+            if offset == 250 and not waited:
+                idle.idle = False  # busy after the second page, once
+
+        gate = RefreshGate(idle, wait=fake_wait, clock=lambda: now[0])
+        screen = PagedScreen(3, on_page)
+        source = YahooSymbolSource(screen=screen, sleep=lambda s: None, gate=gate)
+
+        entries = source.fetch("tw")
+
+        assert screen.offsets == offsets
+        assert len(entries) == 750  # nothing duplicated or lost by the restart
+        assert ("Restarting screener tw/TAI/equity from offset 0" in caplog.text) is (polls == 4)
+
+
+# ---------------------------------------------------------------------------
+# Startup validation: non-finite values, empty env values, named origins
+# ---------------------------------------------------------------------------
+
+
+def _reload_symbol_env(monkeypatch, **env):
+    """Recompute the env-derived symbol defaults as if the process started with ``env``."""
+    from tradingagents.api import config as config_module
+
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(config_module, "SYMBOLS_ENV_KEYS", set())
+    monkeypatch.setattr(config_module, "SYMBOLS_DEFAULT_CONFIG", config_module._symbols_defaults())
+
+
+@pytest.mark.unit
+class TestStartupValidation:
+    @pytest.mark.parametrize("name", ["ttl_days", "idle_grace_minutes", "page_delay_seconds"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_numbers_are_rejected(self, name, value):
+        from tradingagents.api.domain.services.symbol_settings import validate_setting
+
+        with pytest.raises(ValueError, match="finite"):
+            validate_setting(name, value)
+
+    def test_a_nan_env_value_stops_startup_naming_the_env_var(self, monkeypatch, tmp_path):
+        _reload_symbol_env(monkeypatch, TRADINGAGENTS_SYMBOLS_IDLE_GRACE_MINUTES="nan")
+        with pytest.raises(ValueError, match="env var TRADINGAGENTS_SYMBOLS_IDLE_GRACE_MINUTES"):
+            create_app(overrides={"symbols_cache_dir": str(tmp_path)})
+        set_active_catalog(None)
+
+    def test_a_bad_config_value_names_the_config_key(self, tmp_path):
+        with pytest.raises(ValueError, match="config key 'symbols_page_delay_seconds'.*finite"):
+            create_app(
+                overrides={
+                    "symbols_cache_dir": str(tmp_path),
+                    "symbols_page_delay_seconds": float("inf"),
+                }
+            )
+        set_active_catalog(None)
+
+    def test_a_malformed_env_number_names_the_env_var(self, monkeypatch):
+        from tradingagents.api import config as config_module
+
+        monkeypatch.setenv("TRADINGAGENTS_SYMBOLS_MAX_PAGES", "lots")
+        with pytest.raises(ValueError, match="TRADINGAGENTS_SYMBOLS_MAX_PAGES='lots'"):
+            config_module._symbols_defaults()
+
+    def test_a_bad_window_zone_names_both_origins(self, monkeypatch, tmp_path):
+        _reload_symbol_env(
+            monkeypatch,
+            TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW="02:00-06:00",
+            TRADINGAGENTS_SYMBOLS_REFRESH_TIMEZONE="Mars/Olympus_Mons",
+        )
+        with pytest.raises(
+            ValueError,
+            match="TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW / env var "
+            "TRADINGAGENTS_SYMBOLS_REFRESH_TIMEZONE: unknown refresh-window time zone",
+        ):
+            create_app(overrides={"symbols_cache_dir": str(tmp_path)})
+        set_active_catalog(None)
+
+    def test_empty_env_values_never_crash_startup(self, monkeypatch, make_app):
+        from tradingagents.api import config as config_module
+
+        _reload_symbol_env(monkeypatch, **dict.fromkeys(config_module._SYMBOLS_ENV_OVERRIDES, ""))
+        client, _ = make_app()
+        assert client.get(f"{BASE}/settings").json()["values"] == EXPECTED_DEFAULTS
+
+    def test_the_zone_is_only_resolved_with_a_window(self, monkeypatch, make_app):
+        """No tz data (e.g. a slim image): fine while no window is set."""
+        from zoneinfo import ZoneInfoNotFoundError
+
+        from tradingagents.api.domain import refresh_window as window_module
+        from tradingagents.api.domain.services import symbol_settings as settings_module
+
+        def no_tzdata(key):
+            raise ZoneInfoNotFoundError(f"No time zone found with key {key}")
+
+        monkeypatch.setattr(window_module, "ZoneInfo", no_tzdata)
+        monkeypatch.setattr(settings_module, "ZoneInfo", no_tzdata, raising=False)
+
+        client, _ = make_app()
+        assert client.get(f"{BASE}/settings").json()["values"]["refresh_timezone"] == "Asia/Taipei"
+        resp = client.put(f"{BASE}/settings", json={"refresh_window": "02:00-06:00"})
+        assert resp.status_code == 422
+        assert "unknown refresh-window time zone" in resp.text
+
+    def test_a_nan_in_the_settings_file_is_dropped(self, make_app, tmp_path, caplog):
+        (tmp_path / "settings.json").write_text(
+            '{"version": 1, "values": {"ttl_days": NaN, "page_delay_seconds": 3}}',
+            encoding="utf-8",
+        )
+        client, _ = make_app()
+        values = client.get(f"{BASE}/settings").json()["values"]
+        assert (values["ttl_days"], values["page_delay_seconds"]) == (7.0, 3.0)
+        assert "Ignoring 'ttl_days'" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# The app's wiring: ActivityMonitor -> RefreshGate -> YahooSymbolSource
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_app_pauses_a_refresh_while_a_task_is_active(make_app, monkeypatch, tmp_path):
+    from tradingagents.api.domain.services import refresh_activity
+    from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
+
+    _seed(tmp_path, LISTED)
+    monkeypatch.setattr(refresh_activity, "GATE_POLL_SECONDS", 0.02)
+    holder = {}
+
+    def on_page(offset):
+        if offset == 0:  # an analysis task is submitted after the first page
+            task, _ = holder["app"].state.task_manager.create_task(
+                TaskCreateRequest(ticker="AAPL", trade_date="2026-09-25")
+            )
+            holder["task"] = task.task_id
+
+    screen = PagedScreen(3, on_page)
+    monkeypatch.setattr(
+        app_module,
+        "YahooSymbolSource",
+        lambda **kwargs: YahooSymbolSource(screen=screen, sleep=lambda s: None, **kwargs),
+    )
+    client, app = make_app(symbols_auto_refresh=True)
+    holder["app"] = app
+    catalog = app.state.symbol_catalog
+
+    catalog.start()  # idle: the stale tw list starts refreshing
+    assert _until(lambda: catalog.is_paused("tw"))
+    state = client.get(f"{BASE}/settings").json()["state"]
+    assert (state["idle"], state["active_tasks"]) == (False, 1)
+    assert state["markets"]["tw"]["paused"] is True
+    assert screen.offsets == [0]
+
+    app.state.task_manager.update_task(holder["task"], status=TaskStatus.COMPLETED)
+    assert catalog.wait_idle(5)
+    assert screen.offsets == [0, 250, 500]
+    assert len(catalog.get_list("tw").entries) == 750

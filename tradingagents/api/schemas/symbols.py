@@ -138,7 +138,14 @@ class SymbolRefreshResponse(BaseModel):
     queued: list[SymbolMarket] = Field(..., description="Markets queued or already refreshing")
     skipped: list[SymbolMarket] = Field(
         default_factory=list,
-        description="Markets fetched within the refresh cooldown (pass force=true to refresh)",
+        description=(
+            "Markets not queued: fetched within the 30-minute cooldown (pass force=true), "
+            "or, with force=true, already forced within the last 5 minutes"
+        ),
+    )
+    skip_reasons: dict[SymbolMarket, str] = Field(
+        default_factory=dict,
+        description="Why each skipped market was skipped: 'cooldown' or 'forced_recently'",
     )
 
 

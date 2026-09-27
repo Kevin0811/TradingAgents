@@ -30,12 +30,23 @@ settings are read live from ``SymbolSettings`` (``PUT /symbols/settings``).
   request arriving at the right moment.
 * ``request_manual_refresh()`` (``POST /symbols/refresh``) is immediate and
   ignores both conditions, but skips markets fetched within
-  ``refresh_cooldown`` unless forced. A forced refresh may also replace a list
-  with a shrunken one.
+  ``refresh_cooldown`` unless forced, and a forced market forced again within
+  ``FORCED_REFRESH_MIN_GAP``. A forced refresh may also replace a list with a
+  shrunken one.
 
-Every fetch runs on the one refresher thread, one market at a time. While it
-runs, the source asks the ``RefreshGate`` between pages and pauses while
-TradingAgents is busy (a manual refresh does not pause).
+Every fetch runs on the one refresher thread, one market at a time; queued
+manual markets run before queued automatic ones. Whether a fetch *yields*
+(pauses between pages while TradingAgents is busy, via the ``RefreshGate``)
+is decided per fetch: an automatic refresh of an existing list yields; a
+manual refresh and a missing list never do. Manual work preempts a yielding
+fetch: a manual refresh of the market being fetched lets it run on without
+pausing; manual work for another market abandons a paused (or about to
+pause) automatic fetch, which is queued again after the manual work.
+
+A running automatic refresh that paused and resumes does not re-check the
+refresh window: once started, it finishes whenever TradingAgents is idle.
+Turning ``auto_refresh`` off drops the queued automatic markets; the one
+being fetched (even if paused) may still finish.
 """
 
 from __future__ import annotations
@@ -52,7 +63,7 @@ from typing import Protocol
 from tradingagents.api.domain.entities import SymbolEntry, SymbolList
 from tradingagents.api.domain.refresh_window import RefreshWindow
 from tradingagents.api.domain.repositories import SymbolCacheRepository
-from tradingagents.api.domain.services.refresh_activity import RefreshGate
+from tradingagents.api.domain.services.refresh_activity import RefreshGate, RefreshPreempted
 from tradingagents.api.domain.services.symbol_settings import SymbolSettings, static_settings
 from tradingagents.api.domain.symbols import (
     MARKETS,
@@ -75,6 +86,14 @@ STATUS_UNCOVERED = "uncovered"  # decisions only: no list covers the ticker
 # refresh inside the window. It only queues work; fetches stay on the refresher.
 REFRESH_TICK_SECONDS = 15 * 60
 
+# A market forced again within this gap is skipped (a forced fetch ignores the
+# cooldown, so this is what keeps repeated forced calls from hammering Yahoo).
+FORCED_REFRESH_MIN_GAP = timedelta(minutes=5)
+
+# Why request_manual_refresh skipped a market (POST /symbols/refresh body).
+SKIP_COOLDOWN = "cooldown"  # fetched within refresh_cooldown, not forced
+SKIP_FORCED_RECENTLY = "forced_recently"  # forced within FORCED_REFRESH_MIN_GAP
+
 # A refresh must keep at least this share of the previous list's entries, or
 # it is treated as a truncated fetch and the previous list is kept.
 MIN_REFRESH_KEEP_RATIO = 0.8
@@ -94,8 +113,12 @@ def _aware(value: datetime) -> datetime:
 class SymbolSource(Protocol):
     """Where the catalog fetches a market's list from (see YahooSymbolSource)."""
 
-    def fetch(self, market: str) -> list[SymbolEntry]:
-        """Return ``market``'s complete list; raise on any failure."""
+    def fetch(self, market: str, yield_when_busy: bool = True) -> list[SymbolEntry]:
+        """Return ``market``'s complete list; raise on any failure.
+
+        ``yield_when_busy``: pause between pages while TradingAgents is busy
+        (through the gate the source was built with, if any).
+        """
         ...
 
     def source_label(self, market: str) -> str:
@@ -194,10 +217,10 @@ class SymbolCatalog:
                 ``ttl`` / ``auto_refresh`` / ``refresh_window`` when omitted.
             idle_check: Whether TradingAgents is idle now; automatic refreshes
                 of existing lists wait for it. None means always idle.
-            gate: Pauses a running refresh between pages while busy; the
+            gate: Pauses a yielding refresh between pages while busy; the
                 source must consult it (see YahooSymbolSource). The catalog
-                marks manual fetches so they do not pause, and stops the gate
-                on shutdown.
+                uses it to let manual work preempt a yielding fetch, and
+                stops it on shutdown.
             tick_seconds: Interval of the background tick that queues due
                 markets inside the window.
             clock: Returns the current UTC time (tests).
@@ -220,6 +243,8 @@ class SymbolCatalog:
         self._forced: set[str] = set()  # queued markets whose refresh was forced
         self._manual: set[str] = set()  # queued markets a user asked for (no pausing)
         self._refreshing: str | None = None
+        self._refreshing_yields = False  # the market being fetched pauses while busy
+        self._last_forced: dict[str, datetime] = {}
         self._thread: threading.Thread | None = None
         self._last_attempt: dict[str, datetime] = {}
         self._last_error: dict[str, str] = {}
@@ -270,11 +295,24 @@ class SymbolCatalog:
             self._gate.stop()
 
     def settings_changed(self) -> None:
-        """Apply changed settings now: start the tick if needed and run it once."""
+        """Apply changed settings now: start the tick if needed and run it once.
+
+        With auto-refresh off, queued automatic markets are dropped (manual
+        ones stay; the market being fetched may finish).
+        """
         if not self._started or self._stop.is_set():
             return
         if self._settings.auto_refresh:
             self._start_tick()
+        else:
+            with self._lock:
+                dropped = [m for m in self._pending if m not in self._manual]
+                self._pending = [m for m in self._pending if m in self._manual]
+            if dropped:
+                logger.info(
+                    "Auto-refresh turned off: dropped the queued automatic refresh of %s",
+                    ", ".join(dropped),
+                )
         self.tick()
 
     def tick(self) -> list[str]:
@@ -298,12 +336,13 @@ class SymbolCatalog:
         return list(dict.fromkeys(queued))
 
     def _start_tick(self) -> None:
-        if self._tick_thread is not None or self._stop.is_set():
-            return
-        self._tick_thread = threading.Thread(
-            target=self._tick_loop, name="symbol-catalog-tick", daemon=True
-        )
-        self._tick_thread.start()
+        with self._lock:  # concurrent settings updates must not start two
+            if self._tick_thread is not None or self._stop.is_set():
+                return
+            self._tick_thread = threading.Thread(
+                target=self._tick_loop, name="symbol-catalog-tick", daemon=True
+            )
+            self._tick_thread.start()
 
     def _tick_loop(self) -> None:
         # Event.wait sleeps the whole interval (no busy loop) and returns True
@@ -383,7 +422,10 @@ class SymbolCatalog:
 
     def is_paused(self, market: str) -> bool:
         """True while ``market``'s refresh is paused for activity."""
-        return bool(self._gate and self._gate.paused and self.is_refreshing(market))
+        if self._gate is None or not self._gate.paused:
+            return False
+        with self._lock:
+            return market == self._refreshing
 
     def waiting_for(self, market: str) -> str | None:
         """Why a due list (stale or miss-flagged) is not being refreshed yet.
@@ -629,11 +671,8 @@ class SymbolCatalog:
             for market in requested:
                 if market != self._refreshing and market not in self._pending:
                     self._pending.append(market)
-            if requested and self._thread is None and not self._stop.is_set():
-                self._thread = threading.Thread(
-                    target=self._drain, name="symbol-catalog-refresh", daemon=True
-                )
-                self._thread.start()
+            if requested:
+                self._ensure_thread()
         return requested
 
     def request_manual_refresh(
@@ -641,26 +680,69 @@ class SymbolCatalog:
     ) -> tuple[list[str], list[str]]:
         """Queue a user-requested refresh; returns ``(queued, skipped)``.
 
-        A market whose list was fetched within ``refresh_cooldown`` is skipped
-        unless ``force`` is set, so repeated calls cannot hammer Yahoo.
+        Without ``force``, a market whose list was fetched within
+        ``refresh_cooldown`` is skipped (``SKIP_COOLDOWN``); with it, one
+        forced within ``FORCED_REFRESH_MIN_GAP`` is (``SKIP_FORCED_RECENTLY``),
+        so repeated calls cannot hammer Yahoo.
+
+        Manual markets go ahead of queued automatic ones and never pause.
+        The market being fetched right now is not queued again: that fetch
+        just stops yielding. With ``force`` it is queued again, so the forced
+        fetch really happens. If an automatic fetch is paused (or pauses
+        later) while manual work waits, it is abandoned and queued again
+        after that work (see ``RefreshGate.make_way``).
 
         ``force`` also lets that refresh replace the list even if it shrank
         (see ``refresh_market``), so a real shrink can be accepted
-        deliberately. A market being fetched right now without force is
-        queued again, so the forced fetch really happens.
+        deliberately.
         """
         requested = [m for m in dict.fromkeys(markets) if m in MARKETS]
-        skipped = [] if force else [m for m in requested if self._fetched_recently(m)]
-        wanted = [m for m in requested if m not in skipped]
+        now = self._clock()
         with self._lock:
+            if force:
+                skipped = [m for m in requested if self._forced_recently(m, now)]
+            else:
+                skipped = [m for m in requested if self._fetched_recently(m)]
+            wanted = [m for m in requested if m not in skipped]
+            manual_waits = False
             for market in wanted:
-                self._manual.add(market)
                 if force:
-                    self._forced.add(market)
-                    if market == self._refreshing and market not in self._pending:
-                        self._pending.append(market)
-        queued = self.request_refresh(wanted)
-        return queued, skipped
+                    self._last_forced[market] = now
+                if market == self._refreshing and not force:
+                    if self._refreshing_yields:
+                        self._refreshing_yields = False
+                        if self._gate is not None:
+                            self._gate.release()
+                    continue
+                self._queue_ahead(market, manual=True, force=force)
+                manual_waits = True
+            if manual_waits and self._refreshing_yields and self._gate is not None:
+                self._gate.make_way()
+            if wanted:
+                self._ensure_thread()
+        return wanted, skipped
+
+    def _queue_ahead(self, market: str, *, manual: bool, force: bool = False) -> None:
+        """Queue ``market`` after the queued manual markets (caller holds the lock).
+
+        Manual markets are always at the front of ``_pending``.
+        """
+        if market in self._pending:
+            self._pending.remove(market)
+        position = sum(1 for m in self._pending if m in self._manual)
+        self._pending.insert(position, market)
+        if manual:
+            self._manual.add(market)
+        if force:
+            self._forced.add(market)
+
+    def _ensure_thread(self) -> None:
+        """Start the refresher thread if it is not running (caller holds the lock)."""
+        if self._thread is None and not self._stop.is_set():
+            self._thread = threading.Thread(
+                target=self._drain, name="symbol-catalog-refresh", daemon=True
+            )
+            self._thread.start()
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Block until the refresher is idle (tests and scripts). True if idle."""
@@ -681,14 +763,21 @@ class SymbolCatalog:
         ``force`` (a forced manual refresh) accepts such a shrink with a
         warning. A fetch the source itself fails (an error, a query short of
         its total, the page cap) is refused whatever ``force`` says.
-        ``manual`` (a user-requested refresh) does not pause for activity.
+        ``manual`` (a user-requested refresh) does not pause for activity, and
+        neither does the fetch of a missing list.
         """
+        if self._gate is not None:
+            self._gate.begin_fetch()
+        return self._refresh(market, force, yield_when_busy=not manual and self.is_loaded(market))
+
+    def _refresh(self, market: str, force: bool, yield_when_busy: bool) -> bool:
+        """``refresh_market``'s body; RefreshPreempted propagates to the queue."""
         self._last_attempt[market] = self._clock()
         kept = self.get_list(market)
-        if self._gate is not None:
-            self._gate.active = not manual
         try:
-            entries = list(self._source.fetch(market))
+            entries = list(self._source.fetch(market, yield_when_busy=yield_when_busy))
+        except RefreshPreempted:
+            raise
         except Exception as exc:
             self._last_error[market] = f"{type(exc).__name__}: {exc}"
             self._log_kept(market, self._last_error[market], kept)
@@ -759,25 +848,51 @@ class SymbolCatalog:
                     self._manual.clear()
                 if not self._pending:
                     self._refreshing = None
+                    self._refreshing_yields = False
                     self._thread = None
                     return
                 market = self._pending.pop(0)
-                self._refreshing = market
                 force = market in self._forced
                 manual = market in self._manual
                 self._forced.discard(market)
                 self._manual.discard(market)
+                # Manual markets are queued first, so none waits behind a
+                # yielding fetch when it starts.
+                yields = not manual and self.is_loaded(market)
+                self._refreshing = market
+                self._refreshing_yields = yields
+                if self._gate is not None:
+                    self._gate.begin_fetch()
             try:
-                self.refresh_market(market, force=force, manual=manual)
-            except Exception:  # pragma: no cover - refresh_market already guards
+                self._refresh(market, force, yield_when_busy=yields)
+            except RefreshPreempted:
+                with self._lock:
+                    requeue = (
+                        self._settings.auto_refresh
+                        and not self._stop.is_set()
+                        and market not in self._pending
+                    )
+                    if requeue:
+                        self._queue_ahead(market, manual=False)
+                logger.info(
+                    "The automatic refresh of the %s symbol list made way for a manual refresh%s",
+                    market,
+                    "; queued again after it" if requeue else "",
+                )
+            except Exception:  # pragma: no cover - _refresh already guards
                 logger.exception("Unexpected error refreshing the %s symbol list", market)
             finally:
                 with self._lock:
                     self._refreshing = None
+                    self._refreshing_yields = False
 
     def _fetched_recently(self, market: str) -> bool:
         age = self._age(market)
         return age is not None and age < self._refresh_cooldown
+
+    def _forced_recently(self, market: str, now: datetime) -> bool:
+        last = self._last_forced.get(market)
+        return last is not None and now - last < FORCED_REFRESH_MIN_GAP
 
     def _refresh_after_miss(self, market: str) -> None:
         """A miss may be a new listing: refresh an enforced list older than a day.

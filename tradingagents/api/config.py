@@ -6,13 +6,13 @@ import os
 from pathlib import Path
 from typing import Any
 
-from tradingagents.api.domain.refresh_window import RefreshWindow
 from tradingagents.default_api_config import DEFAULT_API_CONFIG, _coerce
 from tradingagents.default_config import DEFAULT_CONFIG
 
 # Supported-symbols list settings. Kept in the API package (rather than in
 # default_api_config.py) so the feature stays self-contained; the env vars
-# follow the same TRADINGAGENTS_* convention and are coerced the same way.
+# follow the same TRADINGAGENTS_* convention and are coerced the same way. An
+# empty value (e.g. compose's ``${VAR:-}``) counts as unset, as in the core.
 _SYMBOLS_ENV_OVERRIDES = {
     "TRADINGAGENTS_SYMBOLS_CACHE_DIR": "symbols_cache_dir",
     "TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS": "symbols_cache_ttl_days",
@@ -46,13 +46,19 @@ def _symbols_defaults() -> dict[str, Any]:
     }
     for env_var, key in _SYMBOLS_ENV_OVERRIDES.items():
         raw = os.environ.get(env_var)
-        if raw is None:
-            continue
-        if raw == "" and not isinstance(defaults[key], str):
-            continue  # an empty value only means something for text settings
-        defaults[key] = _coerce(raw, defaults[key])
+        if raw is None or not raw.strip():
+            continue  # unset or empty: the default applies
+        try:
+            defaults[key] = _coerce(raw, defaults[key])
+        except ValueError as exc:
+            raise ValueError(f"invalid {env_var}={raw!r}: {exc}") from exc
         SYMBOLS_ENV_KEYS.add(key)
     return defaults
+
+
+def symbols_env_var(key: str) -> str | None:
+    """The ``TRADINGAGENTS_SYMBOLS_*`` env var that sets config ``key``, if any."""
+    return next((var for var, k in _SYMBOLS_ENV_OVERRIDES.items() if k == key), None)
 
 
 SYMBOLS_DEFAULT_CONFIG = _symbols_defaults()
@@ -137,36 +143,26 @@ class ApiConfig:
         configured = self._config.get("symbols_cache_dir")
         return Path(configured) if configured else self.data_cache_dir / "symbols"
 
-    @property
-    def symbols_cache_ttl_days(self) -> float:
-        """Return the age (days) after which a cached symbol list is stale."""
-        return float(self._config.get("symbols_cache_ttl_days", 7.0))
-
-    @property
-    def symbols_auto_refresh(self) -> bool:
-        """Return whether missing/stale symbol lists refresh in the background."""
-        return bool(self._config.get("symbols_auto_refresh", True))
-
     def source_of(self, key: str) -> str:
-        """Where ``key``'s value came from: ``config`` (overrides), ``env`` or ``default``."""
+        """Where ``key``'s value came from: ``config`` (overrides), ``env`` or ``default``.
+
+        Precedence: ``config`` > ``env`` > ``default`` (``PUT
+        /symbols/settings`` overrides all three; see ``SymbolSettings``).
+        """
         if key in self._override_keys:
             return "config"
         if key in SYMBOLS_ENV_KEYS:
             return "env"
         return "default"
 
-    @property
-    def symbols_refresh_window(self) -> RefreshWindow | None:
-        """Return the quiet window for automatic refreshes (None: any time).
-
-        Raises:
-            ValueError: ``symbols_refresh_window`` or ``symbols_refresh_timezone``
-                is malformed (checked when the app is created).
-        """
-        return RefreshWindow.parse(
-            self._config.get("symbols_refresh_window"),
-            self._config.get("symbols_refresh_timezone"),
-        )
+    def origin_of(self, key: str) -> str:
+        """``key``'s origin for an error message: the env var or the config key."""
+        source = self.source_of(key)
+        if source == "env":
+            return f"env var {symbols_env_var(key)}"
+        if source == "config":
+            return f"config key {key!r}"
+        return f"default of {key!r}"
 
     def ensure_directories(self) -> None:
         """Create required directories if they don't exist."""

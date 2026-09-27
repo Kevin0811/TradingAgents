@@ -516,6 +516,60 @@ class TestRetries:
         src.fetch("tw")
         assert sleeps == [slept]
 
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            lambda: __import__("curl_cffi.requests.exceptions", fromlist=["x"]).Timeout(
+                "Operation timed out after 30000 milliseconds"
+            ),
+            lambda: __import__("curl_cffi.requests.exceptions", fromlist=["x"]).ConnectionError(
+                "Failed to connect to query2.finance.yahoo.com"
+            ),
+            lambda: TimeoutError("timed out"),
+        ],
+        ids=["curl_cffi-timeout", "curl_cffi-connection", "builtin-timeout"],
+    )
+    def test_a_network_error_is_retried_once(self, make_error, caplog):
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 10, ".TW")},
+            fail_at=("TAI", "equity", 0),
+            errors=[make_error()],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        assert len(src.fetch("tw")) == 10
+        assert _page_calls(screen) == [0, 0]
+        assert sleeps == [PAGE_RETRY_BASE_DELAY_SECONDS]
+        assert "failed with a network error" in caplog.text and "retry 1 of 1" in caplog.text
+
+    def test_a_second_network_error_on_the_same_page_fails_the_market(self):
+        from curl_cffi.requests.exceptions import Timeout
+
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 600, ".TW")},
+            fail_at=("TAI", "equity", 250),
+            errors=[Timeout("timed out"), Timeout("timed out again")],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        with pytest.raises(Timeout, match="again"):
+            src.fetch("tw")
+        assert _page_calls(screen) == [0, 250, 250]
+        assert sleeps == [PAGE_RETRY_BASE_DELAY_SECONDS]
+
+    def test_network_and_status_retries_are_counted_separately(self):
+        from curl_cffi.requests.exceptions import Timeout
+
+        screen = FlakyScreen(
+            {("TAI", "equity"): _quotes("", 10, ".TW")},
+            fail_at=("TAI", "equity", 0),
+            errors=[_http_error(500), Timeout("timed out"), _http_error(503)],
+        )
+        src, sleeps = _source(screen, page_delay_seconds=0)
+
+        assert len(src.fetch("tw")) == 10
+        assert sleeps == [2.0, 2.0, 5.0]
+
     def test_lookup_errors_are_retried_too(self, caplog):
         from yfinance.exceptions import YFDataException
 

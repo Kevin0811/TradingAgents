@@ -16,9 +16,14 @@ from tradingagents.api.core.activity_middleware import (
 from tradingagents.api.core.error_handlers import register_exception_handlers
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
+from tradingagents.api.domain.refresh_window import RefreshWindow
 from tradingagents.api.domain.services.refresh_activity import ActivityMonitor, RefreshGate
 from tradingagents.api.domain.services.symbol_catalog import SymbolCatalog, set_active_catalog
-from tradingagents.api.domain.services.symbol_settings import SETTING_SPECS, SymbolSettings
+from tradingagents.api.domain.services.symbol_settings import (
+    SETTING_SPECS,
+    SymbolSettings,
+    validate_setting,
+)
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
@@ -53,12 +58,24 @@ def create_symbol_settings(config: ApiConfig) -> SymbolSettings:
     """Build the refresher settings: config/env values plus persisted API overrides.
 
     Raises:
-        ValueError: A configured value is invalid (e.g. a malformed window).
+        ValueError: A configured value is invalid (e.g. a malformed window);
+            the message names the env var or config key it came from.
     """
     base, sources = {}, {}
     for name, spec in SETTING_SPECS.items():
-        base[name] = config.config.get(spec.config_key)
+        try:
+            base[name] = validate_setting(name, config.config.get(spec.config_key))
+        except ValueError as exc:
+            raise ValueError(f"invalid {config.origin_of(spec.config_key)}: {exc}") from exc
         sources[name] = config.source_of(spec.config_key)
+    try:
+        RefreshWindow.parse(base["refresh_window"], base["refresh_timezone"])
+    except ValueError as exc:
+        window_key = SETTING_SPECS["refresh_window"].config_key
+        zone_key = SETTING_SPECS["refresh_timezone"].config_key
+        raise ValueError(
+            f"invalid {config.origin_of(window_key)} / {config.origin_of(zone_key)}: {exc}"
+        ) from exc
     return SymbolSettings(base, sources, store_dir=config.symbols_cache_dir)
 
 

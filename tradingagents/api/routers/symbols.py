@@ -14,7 +14,11 @@ from tradingagents.api.dependencies import (
     get_symbol_settings,
 )
 from tradingagents.api.domain.services.refresh_activity import ActivityMonitor
-from tradingagents.api.domain.services.symbol_catalog import SymbolCatalog
+from tradingagents.api.domain.services.symbol_catalog import (
+    SKIP_COOLDOWN,
+    SKIP_FORCED_RECENTLY,
+    SymbolCatalog,
+)
 from tradingagents.api.domain.services.symbol_settings import SymbolSettings
 from tradingagents.api.domain.symbols import MARKETS
 from tradingagents.api.schemas.enums import AssetType, SymbolMarket, SymbolType
@@ -176,9 +180,13 @@ def check_symbol(
         "Queue a background refresh from Yahoo Finance, right away: it neither waits for "
         "TradingAgents to be idle nor for the refresh window, and does not pause while "
         "busy. Returns 202 immediately; "
-        "markets refresh one at a time. `market` limits it to one market; omit it to "
+        "markets refresh one at a time, manual ones ahead of automatic ones (an automatic "
+        "refresh paused for activity makes way and resumes later; one of the same market "
+        "just carries on without pausing). `market` limits it to one market; omit it to "
         "refresh all. A market whose list was fetched within the last 30 minutes is "
-        "listed in `skipped` instead of `queued`, unless `force=true`. A failed "
+        "listed in `skipped` instead of `queued` (`skip_reasons` 'cooldown'), unless "
+        "`force=true`; a market already forced within the last 5 minutes is skipped even "
+        "with `force=true` ('forced_recently'). A failed "
         "refresh keeps the previous list and sets its `last_error`, and so does one that "
         "looks truncated (under 80% of the previous entries, or an exchange/type group "
         "gone empty) unless `force=true`, which accepts such a shrink deliberately. A "
@@ -190,19 +198,28 @@ async def refresh_symbols(
     market: SymbolMarket | None = Query(default=None, description="Market; omit for all"),
     force: bool = Query(
         default=False,
-        description="Ignore the 30-minute cooldown and accept a shrunken list",
+        description=(
+            "Ignore the 30-minute cooldown and accept a shrunken list "
+            "(at most once per 5 minutes per market)"
+        ),
     ),
     catalog: SymbolCatalog = Depends(get_symbol_catalog),
 ) -> SymbolRefreshResponse:
     """Queue a background refresh of one or all markets."""
     markets = [market.value] if market else list(MARKETS)
     queued, skipped = catalog.request_manual_refresh(markets, force=force)
+    # Without force the only reason to skip is the cooldown; with it, the forced gap.
+    reason = SKIP_FORCED_RECENTLY if force else SKIP_COOLDOWN
     logger.info(
-        "Symbol list refresh requested: queued %s; skipped (cooldown) %s",
+        "Symbol list refresh requested%s: queued %s; skipped (%s) %s",
+        " (forced)" if force else "",
         ", ".join(queued) or "none",
+        reason,
         ", ".join(skipped) or "none",
     )
-    return SymbolRefreshResponse(queued=queued, skipped=skipped)
+    return SymbolRefreshResponse(
+        queued=queued, skipped=skipped, skip_reasons=dict.fromkeys(skipped, reason)
+    )
 
 
 def _settings_response(

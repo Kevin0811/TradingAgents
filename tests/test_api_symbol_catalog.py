@@ -46,7 +46,7 @@ class FakeSource:
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
 
-    def fetch(self, market: str):
+    def fetch(self, market: str, yield_when_busy: bool = True):
         self.calls.append(market)
         self.entered.set()
         if self.gate is not None:

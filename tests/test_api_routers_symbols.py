@@ -51,7 +51,7 @@ class FakeSource:
         self.error: Exception | None = None
         self.shrink_to: int | None = None
 
-    def fetch(self, market):
+    def fetch(self, market, yield_when_busy=True):
         self.calls.append(market)
         self.gate.wait(5)
         if self.error is not None:
@@ -256,7 +256,7 @@ class TestRefresh:
         resp = client.post(f"{BASE}/refresh", params={"market": "us"})
 
         assert resp.status_code == 202
-        assert resp.json() == {"queued": ["us"], "skipped": []}
+        assert resp.json() == {"queued": ["us"], "skipped": [], "skip_reasons": {}}
         assert app.state.symbol_catalog.wait_idle(5)
         assert app.state.symbol_catalog._source.calls == ["us"]
         body = client.get(BASE, params={"market": "us"}).json()
@@ -267,7 +267,11 @@ class TestRefresh:
         resp = client.post(f"{BASE}/refresh")
 
         assert resp.status_code == 202
-        assert resp.json() == {"queued": ["tw", "us", "jp", "crypto", "fx"], "skipped": []}
+        assert resp.json() == {
+            "queued": ["tw", "us", "jp", "crypto", "fx"],
+            "skipped": [],
+            "skip_reasons": {},
+        }
         assert app.state.symbol_catalog.wait_idle(5)
         assert app.state.symbol_catalog._source.calls == ["tw", "us", "jp", "crypto", "fx"]
 
@@ -278,11 +282,15 @@ class TestRefresh:
 
         resp = client.post(f"{BASE}/refresh")
         assert resp.status_code == 202
-        assert resp.json() == {"queued": ["tw", "jp", "crypto", "fx"], "skipped": ["us"]}
+        assert resp.json() == {
+            "queued": ["tw", "jp", "crypto", "fx"],
+            "skipped": ["us"],
+            "skip_reasons": {"us": "cooldown"},
+        }
         assert app.state.symbol_catalog.wait_idle(5)
 
         resp = client.post(f"{BASE}/refresh", params={"market": "us", "force": "true"})
-        assert resp.json() == {"queued": ["us"], "skipped": []}
+        assert resp.json() == {"queued": ["us"], "skipped": [], "skip_reasons": {}}
         assert app.state.symbol_catalog.wait_idle(5)
         assert app.state.symbol_catalog._source.calls.count("us") == 2
 
@@ -297,7 +305,7 @@ class TestRefresh:
         assert "refused a suspicious refresh" in catalog.last_error("tw")
 
         resp = client.post(f"{BASE}/refresh", params={"market": "tw", "force": "true"})
-        assert resp.json() == {"queued": ["tw"], "skipped": []}
+        assert resp.json() == {"queued": ["tw"], "skipped": [], "skip_reasons": {}}
         assert catalog.wait_idle(5)
         body = client.get(BASE, params={"market": "tw", "limit": 0}).json()
         assert (body["total"], body["last_error"]) == (1, None)

@@ -9,9 +9,17 @@ kept out of the way of that work:
   queued or processing in the TaskManager, no Yahoo-backed request in flight
   (``/data``, ``/analysts``, the synchronous ``POST /analyze``), and none
   finished within the idle grace period (``symbols_idle_grace_minutes``).
-* ``RefreshGate`` is consulted by the symbol source between pages: while the
-  API is busy it pauses the refresh in small steps and resumes the same
-  market once idle again. Only ``shutdown()`` abandons it.
+* ``RefreshGate`` is consulted by the symbol source between pages of a fetch
+  that yields (an automatic refresh of an existing list): while the API is
+  busy it pauses the refresh in small steps and resumes the same market once
+  idle again. Whether a fetch yields is decided per fetch by the catalog and
+  passed to the source (``fetch(market, yield_when_busy=...)``); a manual
+  refresh and a missing list never yield.
+* Manual work preempts a yielding fetch: ``release()`` lets it run on without
+  pausing (a manual refresh of the same market), ``make_way()`` abandons it
+  with ``RefreshPreempted`` instead of pausing (manual work for another
+  market is waiting; the catalog queues it again after that work).
+  ``stop()`` (shutdown) abandons it with ``RefreshInterrupted``.
 
 Deciding *whether to start* an automatic refresh (idle, plus the optional
 refresh window) is the catalog's job; the gate only makes a running one yield.
@@ -21,7 +29,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -35,7 +45,19 @@ def _utcnow() -> datetime:
 
 
 class RefreshInterrupted(RuntimeError):
-    """A paused refresh was abandoned because the catalog is shutting down."""
+    """A refresh was abandoned because the catalog is shutting down."""
+
+
+class RefreshPreempted(RuntimeError):
+    """An automatic refresh gave way to manual work instead of pausing."""
+
+
+@dataclass(frozen=True)
+class PauseResult:
+    """What ``RefreshGate.wait_until_idle`` did before returning."""
+
+    paused_seconds: float = 0.0  # how long it paused (0 when it did not)
+    released: bool = False  # manual work released the fetch: stop yielding
 
 
 class ActivityMonitor:
@@ -102,52 +124,125 @@ class ActivityMonitor:
 
 
 class RefreshGate:
-    """Makes a running refresh wait between pages while the API is busy."""
+    """Makes a yielding refresh wait between pages while the API is busy.
+
+    The per-fetch flags (``release`` / ``make_way``) are reset by
+    ``begin_fetch()``; the catalog calls all three under its own lock, so a
+    flag never outlives the fetch it was meant for.
+    """
 
     def __init__(
         self,
         is_idle: Callable[[], bool] = lambda: True,
         *,
-        poll_seconds: float = GATE_POLL_SECONDS,
+        poll_seconds: float | None = None,
         wait: Callable[[float], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """Initialize the gate.
 
         Args:
             is_idle: Whether the API is idle now.
-            poll_seconds: Pause between idleness checks while waiting.
+            poll_seconds: Pause between idleness checks while waiting
+                (default ``GATE_POLL_SECONDS``).
             wait: ``wait(seconds) -> stopped``; defaults to waiting on the
-                gate's stop event, so ``stop()`` ends a pause at once (tests
-                pass a fake that advances a clock instead of sleeping).
+                gate's wake-up event, so ``stop()``, ``release()`` and
+                ``make_way()`` end a pause at once (tests pass a fake that
+                advances a clock instead of sleeping).
+            clock: Monotonic seconds, to measure how long a pause lasted.
         """
         self._is_idle = is_idle
-        self._poll = poll_seconds
+        self._poll = GATE_POLL_SECONDS if poll_seconds is None else poll_seconds
         self._stopped = threading.Event()
-        self._wait = wait or self._stopped.wait
-        # Set by the catalog for each fetch: a manual refresh does not yield.
-        self.active = True
+        self._wake = threading.Event()
+        self._wait = wait or self._wait_for_wake
+        self._clock = clock
+        self._released = False
+        self._make_way = False
         self.paused = False
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
 
     def stop(self) -> None:
         self._stopped.set()
+        self._wake.set()
 
     @property
     def stopped(self) -> bool:
         return self._stopped.is_set()
 
-    def wait_until_idle(self, label: str = "") -> None:
-        """Return once idle (at once if inactive); raise RefreshInterrupted on stop."""
+    def check_stopped(self) -> None:
+        """Raise RefreshInterrupted once the gate is stopped."""
         if self._stopped.is_set():
             raise RefreshInterrupted("the symbol catalog is shutting down")
-        if not self.active or self._is_idle():
-            return
+
+    def sleep(self, seconds: float) -> None:
+        """Sleep up to ``seconds``; returns early when the gate is stopped."""
+        self._stopped.wait(seconds)
+
+    # ------------------------------------------------------------------
+    # Per-fetch preemption
+    # ------------------------------------------------------------------
+
+    def begin_fetch(self) -> None:
+        """Forget the previous fetch's release / make-way request."""
+        self._released = False
+        self._make_way = False
+        self._wake.clear()
+
+    def release(self) -> None:
+        """Let the current fetch run to its end without pausing again."""
+        self._released = True
+        self._wake.set()
+
+    def make_way(self) -> None:
+        """Manual work waits: abandon the current fetch rather than pause it."""
+        self._make_way = True
+        self._wake.set()
+
+    # ------------------------------------------------------------------
+    # Waiting
+    # ------------------------------------------------------------------
+
+    def wait_until_idle(self, label: str = "") -> PauseResult:
+        """Return once idle, or once released; see PauseResult.
+
+        Raises:
+            RefreshInterrupted: The gate was stopped (shutdown).
+            RefreshPreempted: The API is busy and manual work is waiting.
+        """
+        self.check_stopped()
+        if self._released:
+            return PauseResult(released=True)
+        if self._is_idle():
+            return PauseResult()
         where = f" ({label})" if label else ""
+        if self._make_way:
+            raise RefreshPreempted(f"the refresh{where} made way for a manual refresh")
         logger.info("Pausing the symbol refresh%s: TradingAgents is busy", where)
+        started = self._clock()
         self.paused = True
         try:
             while not self._is_idle():
+                if self._released:
+                    logger.info(
+                        "Resuming the symbol refresh%s without pausing: a manual refresh "
+                        "asked for it",
+                        where,
+                    )
+                    return PauseResult(self._clock() - started, released=True)
+                if self._make_way:
+                    raise RefreshPreempted(f"the refresh{where} made way for a manual refresh")
                 if self._wait(self._poll) or self._stopped.is_set():
                     raise RefreshInterrupted("the symbol catalog is shutting down")
         finally:
             self.paused = False
         logger.info("Resuming the symbol refresh%s", where)
+        return PauseResult(self._clock() - started)
+
+    def _wait_for_wake(self, seconds: float) -> bool:
+        self._wake.wait(seconds)
+        self._wake.clear()
+        return self._stopped.is_set()

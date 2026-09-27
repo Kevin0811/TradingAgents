@@ -23,9 +23,11 @@ Supported symbols:
     - ``GET /symbols/{symbol}`` plain exact lookup (404 with suggestions and
       the list status)
     - ``POST /symbols/refresh[?market=][&force=true]`` queue a background
-      refresh right away (202 with ``queued`` / ``skipped``; a market fetched
-      within the last 30 minutes is skipped unless forced; ``force`` also
-      accepts a shrunken list, never an incomplete fetch)
+      refresh right away (202 with ``queued`` / ``skipped`` /
+      ``skip_reasons``; a market fetched within the last 30 minutes is skipped
+      unless forced, and a forced market forced again within 5 minutes is
+      skipped too; ``force`` also accepts a shrunken list, never an
+      incomplete fetch)
     - ``GET /symbols/settings`` / ``PUT /symbols/settings`` read and change the
       refresher settings at runtime (see below). Like every endpoint of this
       API they have no authentication: keep the API on a trusted network.
@@ -44,9 +46,14 @@ Supported symbols:
       must also hold when set. A tick every 15 minutes picks up lists that
       became due; ``GET /symbols`` shows ``waiting_for`` and, for the window,
       ``next_refresh_after``.
-    - While a refresh runs it pauses between pages whenever TradingAgents
-      turns busy, and resumes the same market once idle again (a manual
-      refresh does not pause).
+    - While an automatic refresh of an existing list runs it pauses between
+      pages whenever TradingAgents turns busy, and resumes the same market
+      once idle again (without re-checking the window); after a pause of
+      over 15 minutes the current screener query starts over. A manual
+      refresh and the fetch of a missing list never pause. Manual work goes
+      first: a paused automatic refresh makes way for it (and is queued
+      again), or carries on without pausing if it is the market asked for.
+      Turning ``auto_refresh`` off drops queued automatic refreshes.
     - A miss in a tw or jp list (the enforced markets) older than a day asks
       for a refresh of that market under the same conditions, so new listings
       show up. us, crypto and fx misses never do: those lists are incomplete
@@ -55,12 +62,17 @@ Supported symbols:
       truncated (under 80% of the previous entries, or an exchange/type group
       gone empty) unless it was forced; either sets ``last_error``. A screener
       page or lookup failing with a 5xx or 429 is retried up to 3 times (2 s,
-      5 s, 10 s, or ``Retry-After``) before the market's refresh fails.
+      5 s, 10 s, or ``Retry-After``), and once after a timeout or connection
+      error, before the market's refresh fails.
 
     Settings (env var -> config key; the ones marked * can also be changed
     with ``PUT /symbols/settings``, which saves them to
-    ``<cache dir>/settings.json`` so they survive a restart and win over env
-    values; null in the PUT restores the env / default value):
+    ``<cache dir>/settings.json`` so they survive a restart). Precedence,
+    highest first: ``PUT /symbols/settings`` (source ``api``) >
+    ``create_app(overrides=...)`` (``config``) > env var (``env``) > built-in
+    default (``default``); null in the PUT drops the API value, so the
+    config / env / default value applies again. An empty env value counts as
+    unset:
 
     - ``TRADINGAGENTS_SYMBOLS_CACHE_DIR`` -> ``symbols_cache_dir``
     - ``TRADINGAGENTS_SYMBOLS_CACHE_TTL_DAYS`` -> ``symbols_cache_ttl_days``
@@ -72,7 +84,8 @@ Supported symbols:
     - ``TRADINGAGENTS_SYMBOLS_REFRESH_WINDOW`` -> ``symbols_refresh_window`` *
       (``""`` = off; ``HH:MM-HH:MM``, may wrap midnight)
     - ``TRADINGAGENTS_SYMBOLS_REFRESH_TIMEZONE`` ->
-      ``symbols_refresh_timezone`` * (``"Asia/Taipei"``, an IANA zone)
+      ``symbols_refresh_timezone`` * (``"Asia/Taipei"``, an IANA zone; only
+      resolved when a window is set)
     - ``TRADINGAGENTS_SYMBOLS_PAGE_DELAY_SECONDS`` ->
       ``symbols_page_delay_seconds`` * (2.0; 0.5-10)
     - ``TRADINGAGENTS_SYMBOLS_INCLUDE_OTC`` -> ``symbols_include_otc`` (false)
@@ -80,8 +93,9 @@ Supported symbols:
       of 250 rows per screener query; a query that needs more fails the
       refresh instead of saving a partial list)
 
-    The * values are validated at startup too: an out-of-range or malformed
-    env value stops the app from starting.
+    The * values are validated at startup too: an out-of-range, non-finite
+    or malformed env / config value stops the app from starting, with an
+    error naming the env var or config key.
 
     ``POST /analyze`` and ``POST /analyze/tasks`` check the ticker per market
     (``REJECT_UNLISTED_TICKERS`` in ``tradingagents.api.domain.symbols``): a

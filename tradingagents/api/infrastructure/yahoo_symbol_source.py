@@ -11,8 +11,17 @@ caller keeps the previous list instead of saving a partial one.
 Yahoo also fails single pages transiently (HTTP 500 "Server caught an
 exception" deep into a query, or 429). Each screener page and lookup request
 is therefore retried on a 5xx or 429, up to ``PAGE_RETRIES`` times with a
-growing pause (2 s, 5 s, 10 s, or the server's ``Retry-After``); other errors,
+growing pause (2 s, 5 s, 10 s, or the server's ``Retry-After``), and once
+(``NETWORK_RETRIES``) on a timeout or connection error; other errors,
 including every other 4xx, fail the market at once.
+
+With a ``RefreshGate``, a fetch that yields (``fetch(market,
+yield_when_busy=True)``, an automatic refresh) pauses between pages while
+TradingAgents is busy. A pause longer than ``RESTART_QUERY_AFTER_PAUSE_SECONDS``
+restarts the current screener query from offset 0, since offset paging over
+a listing that changed meanwhile could skip or repeat rows. Every sleep
+(page delay, retry pause) ends early when the gate is stopped, and the gate's
+stop is checked before every request, yielding or not.
 
 Exchange codes (Yahoo's own, as listed in yfinance's screener value map):
 
@@ -33,7 +42,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from tradingagents.api.domain.entities import SymbolEntry
@@ -60,6 +69,11 @@ PAGE_RETRIES = 3
 PAGE_RETRY_BASE_DELAY_SECONDS = 2.0
 _RETRY_BACKOFF = (1.0, 2.5, 5.0)
 RETRY_AFTER_MAX_SECONDS = 60.0
+# Retries of one request after a timeout / connection error (curl_cffi,
+# requests or the builtin exceptions), after PAGE_RETRY_BASE_DELAY_SECONDS.
+NETWORK_RETRIES = 1
+# A pause for activity longer than this restarts the current screener query.
+RESTART_QUERY_AFTER_PAUSE_SECONDS = 15 * 60
 LOOKUP_QUERY = "USD"
 LOOKUP_COUNT = 1000
 
@@ -132,6 +146,21 @@ def is_retryable_status(status: int | None) -> bool:
     return status is not None and (status == 429 or 500 <= status <= 599)
 
 
+_NETWORK_ERROR_NAMES = ("Timeout", "ConnectionError")
+_NETWORK_ERROR_MODULES = ("curl_cffi", "requests", "urllib3")
+
+
+def is_network_error(exc: BaseException) -> bool:
+    """True for a timeout or connection error (curl_cffi, requests or builtin)."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    return any(
+        cls.__name__ in _NETWORK_ERROR_NAMES
+        and cls.__module__.split(".", 1)[0] in _NETWORK_ERROR_MODULES
+        for cls in type(exc).__mro__
+    )
+
+
 def retry_after_seconds(exc: BaseException) -> float | None:
     """The response's ``Retry-After`` in seconds (numeric form only), capped."""
     headers = getattr(getattr(exc, "response", None), "headers", None)
@@ -169,7 +198,7 @@ class YahooSymbolSource:
         include_otc: bool = False,
         screen: Callable[..., dict[str, Any]] | None = None,
         lookup_factory: Callable[[str], Any] | None = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] | None = None,
         gate: RefreshGate | None = None,
     ):
         """Initialize the source.
@@ -181,18 +210,22 @@ class YahooSymbolSource:
             include_otc: Also screen the US OTC venues.
             screen: Replacement for ``yfinance.screen`` (tests).
             lookup_factory: Replacement for ``yfinance.Lookup`` (tests).
-            sleep: Replacement for ``time.sleep`` (tests).
-            gate: Consulted before every request after the first: pauses
-                the fetch while TradingAgents is busy (see RefreshGate).
+            sleep: Replacement for the sleep between requests (tests); by
+                default the gate's stop-aware sleep, or ``time.sleep``
+                without a gate.
+            gate: Consulted before every request after the first of a
+                yielding fetch (pauses it while TradingAgents is busy), and
+                for its stop before every request (see RefreshGate).
         """
         self._page_delay = page_delay_seconds
         self._gate = gate
         self._market = ""
+        self._yield = False
         self._max_pages = max(1, int(max_pages))
         self._include_otc = include_otc
         self._screen = screen
         self._lookup_factory = lookup_factory
-        self._sleep = sleep
+        self._sleep = sleep or (gate.sleep if gate is not None else time.sleep)
         self._requests = 0
 
     # ------------------------------------------------------------------
@@ -211,16 +244,23 @@ class YahooSymbolSource:
         kind = "lookup" if market in ("crypto", "fx") else "screener"
         return f"yfinance {self._yf_version()} {kind}"
 
-    def fetch(self, market: str) -> list[SymbolEntry]:
+    def fetch(self, market: str, yield_when_busy: bool = True) -> list[SymbolEntry]:
         """Fetch ``market``'s full list, sorted by symbol.
+
+        ``yield_when_busy`` (only meaningful with a gate) pauses the fetch
+        between pages while TradingAgents is busy; the catalog passes False
+        for a manual refresh and a missing list.
 
         Raises:
             SymbolSourceError: Nothing usable came back, or a screener query
                 came back incomplete (short of its total, or at the page cap).
+            RefreshInterrupted: The gate was stopped (shutdown).
+            RefreshPreempted: A paused fetch gave way to manual work.
             Exception: Any yfinance / HTTP error, unchanged.
         """
         self._requests = 0
         self._market = market
+        self._yield = bool(yield_when_busy and self._gate is not None)
         if market in MARKET_EXCHANGES:
             entries = self._fetch_screened(market)
         elif market == "crypto":
@@ -265,20 +305,32 @@ class YahooSymbolSource:
                     entries.append(entry)
         return entries
 
-    def _screen_pages(self, query: Any, label: str) -> Iterator[dict[str, Any]]:
-        """Yield every row of one screener query, or raise if that is not possible.
+    def _screen_pages(self, query: Any, label: str) -> list[dict[str, Any]]:
+        """Return every row of one screener query, or raise if that is not possible.
 
         With a ``total`` in the response, pages are requested until ``offset``
         reaches it; an empty page before that means Yahoo stopped short. With
         no ``total``, only an empty page ends the query (a short page may just
         be Yahoo trimming one). Hitting the page cap first raises too: a
-        partial list must never replace a complete one.
+        partial list must never replace a complete one. After a pause longer
+        than ``RESTART_QUERY_AFTER_PAUSE_SECONDS`` the query starts over.
         """
         screen = self._screen or self._default_screen()
+        rows: list[dict[str, Any]] = []
         offset = 0
         total: int | None = None
-        for _ in range(self._max_pages):
-            self._pace()
+        pages = 0
+        while pages < self._max_pages:
+            paused = self._pace()
+            if offset and paused > RESTART_QUERY_AFTER_PAUSE_SECONDS:
+                logger.info(
+                    "Restarting screener %s from offset 0: the refresh paused for %.0f min "
+                    "and the listing may have shifted",
+                    label,
+                    paused / 60,
+                )
+                rows, offset, total, pages = [], 0, None, 0
+            pages += 1
             result = self._with_retries(
                 lambda offset=offset: screen(
                     query, offset=offset, size=PAGE_SIZE, sortField="ticker", sortAsc=True
@@ -289,18 +341,18 @@ class YahooSymbolSource:
             reported = (result or {}).get("total")
             if isinstance(reported, int) and not isinstance(reported, bool):
                 total = reported
-            yield from quotes
+            rows.extend(quotes)
             offset += len(quotes)
             if total is not None:
                 if offset >= total:
-                    return
+                    return rows
                 if not quotes:
                     raise SymbolSourceError(
                         f"Symbol screener {label} returned an empty page after {offset} of "
                         f"{total} rows"
                     )
             elif not quotes:
-                return
+                return rows
         raise SymbolSourceError(
             f"Symbol screener {label} hit the {self._max_pages}-page cap after {offset} rows"
             + (f" of {total}" if total is not None else "")
@@ -411,40 +463,72 @@ class YahooSymbolSource:
     # ------------------------------------------------------------------
 
     def _with_retries(self, request: Callable[[], Any], label: str) -> Any:
-        """Run one request, retrying it on a 5xx or 429 (see ``PAGE_RETRIES``)."""
-        for attempt in range(PAGE_RETRIES + 1):
+        """Run one request, retrying it on a 5xx / 429 or a network error.
+
+        Up to ``PAGE_RETRIES`` retries for a status, ``NETWORK_RETRIES`` for
+        a timeout / connection error; the gate's stop ends the pause before a
+        retry and is checked before it.
+        """
+        status_retries = network_retries = 0
+        while True:
             try:
                 return request()
             except Exception as exc:
                 status = http_status(exc)
-                if attempt == PAGE_RETRIES or not is_retryable_status(status):
+                if is_retryable_status(status) and status_retries < PAGE_RETRIES:
+                    delay = retry_after_seconds(exc)
+                    if delay is None:
+                        delay = PAGE_RETRY_BASE_DELAY_SECONDS * _RETRY_BACKOFF[status_retries]
+                    status_retries += 1
+                    reason, attempt, limit = f"HTTP {status}", status_retries, PAGE_RETRIES
+                elif status is None and is_network_error(exc) and network_retries < NETWORK_RETRIES:
+                    delay = PAGE_RETRY_BASE_DELAY_SECONDS
+                    network_retries += 1
+                    reason, attempt, limit = "a network error", network_retries, NETWORK_RETRIES
+                else:
                     raise
-                delay = retry_after_seconds(exc)
-                if delay is None:
-                    delay = PAGE_RETRY_BASE_DELAY_SECONDS * _RETRY_BACKOFF[attempt]
                 logger.warning(
-                    "Yahoo %s failed with HTTP %s (%s: %s); retry %d of %d in %.1fs",
+                    "Yahoo %s failed with %s (%s: %s); retry %d of %d in %.1fs",
                     label,
-                    status,
+                    reason,
                     type(exc).__name__,
                     str(exc)[:200],
-                    attempt + 1,
-                    PAGE_RETRIES,
+                    attempt,
+                    limit,
                     delay,
                 )
-                self._sleep(delay)
-        raise AssertionError("unreachable")  # pragma: no cover
+                self._sleep_checked(delay)
 
-    def _pace(self) -> None:
+    def _pace(self) -> float:
+        """Before every request: check for a stop; between requests, yield and pause.
+
+        Returns how long the gate paused this fetch for activity (seconds).
+        """
+        self._check_stopped()
+        paused = 0.0
         if self._requests:
-            if self._gate is not None:
+            if self._yield:
                 # Between pages only: the first request of a fetch starts at once.
-                self._gate.wait_until_idle(f"{self._market}, after {self._requests} request(s)")
+                result = self._gate.wait_until_idle(
+                    f"{self._market}, after {self._requests} request(s)"
+                )
+                paused = result.paused_seconds
+                if result.released:
+                    self._yield = False  # a manual refresh took this fetch over
             delay = self._page_delay() if callable(self._page_delay) else self._page_delay
             delay = max(0.0, float(delay))
             if delay:
-                self._sleep(delay)
+                self._sleep_checked(delay)
         self._requests += 1
+        return paused
+
+    def _sleep_checked(self, seconds: float) -> None:
+        self._sleep(seconds)
+        self._check_stopped()
+
+    def _check_stopped(self) -> None:
+        if self._gate is not None:
+            self._gate.check_stopped()
 
     @staticmethod
     def _default_screen() -> Callable[..., dict[str, Any]]:
