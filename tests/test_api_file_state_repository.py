@@ -57,7 +57,7 @@ class TestFileStateRepositoryLoadState:
         (path-traversal safety) rather than interpolating it directly.
 
         safe_ticker_component() validates but does not change casing (see
-        tradingagents/dataflows/utils.py), and neither does the write side
+        tradingagents/dataflows/symbols.py), and neither does the write side
         (trading_graph.py writes results under whatever case the caller
         passed in) -- so, unlike checkpointer.py's own ticker handling, a
         ticker here is matched case-sensitively end to end. The fixture

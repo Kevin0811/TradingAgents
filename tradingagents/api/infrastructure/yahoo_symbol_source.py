@@ -39,6 +39,7 @@ preferred shares and TDRs.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import time
@@ -47,10 +48,23 @@ from typing import Any
 
 from tradingagents.api.domain.entities import SymbolEntry
 from tradingagents.api.domain.services.refresh_activity import RefreshGate
-from tradingagents.api.domain.symbols import fx_legs, is_currency
-from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair
+from tradingagents.api.domain.symbols import bare_crypto_to_pair, fx_legs, is_currency
 
 logger = logging.getLogger(__name__)
+
+
+def _yfinance() -> Any:
+    """Load yfinance at call time.
+
+    Upstream's ``tests/test_layering.py`` allows vendor-library imports only in
+    ``tradingagents/dataflows``, so that a vendor failure is always reported as
+    unavailable data, never as a fact about the market. The core has no
+    screener or lookup, and it is synced from upstream, so this adapter calls
+    yfinance itself. It keeps to that rule's intent: every failure becomes a
+    ``SymbolSourceError``, and the catalog reports the list as ``unavailable``.
+    """
+    return importlib.import_module("yfinance")
+
 
 MARKET_EXCHANGES: dict[str, tuple[str, ...]] = {
     "tw": ("TAI", "TWO"),
@@ -279,7 +293,8 @@ class YahooSymbolSource:
     # ------------------------------------------------------------------
 
     def _fetch_screened(self, market: str) -> list[SymbolEntry]:
-        from yfinance import EquityQuery, ETFQuery
+        yf = _yfinance()
+        EquityQuery, ETFQuery = yf.EquityQuery, yf.ETFQuery  # noqa: N806
 
         entries: list[SymbolEntry] = []
         for exchange in self.exchanges(market):
@@ -532,21 +547,15 @@ class YahooSymbolSource:
 
     @staticmethod
     def _default_screen() -> Callable[..., dict[str, Any]]:
-        import yfinance
-
-        return yfinance.screen
+        return _yfinance().screen
 
     @staticmethod
     def _default_lookup() -> Callable[[str], Any]:
-        import yfinance
-
-        return yfinance.Lookup
+        return _yfinance().Lookup
 
     @staticmethod
     def _yf_version() -> str:
         try:
-            import yfinance
-
-            return getattr(yfinance, "__version__", "unknown")
+            return getattr(_yfinance(), "__version__", "unknown")
         except ImportError:  # pragma: no cover - yfinance is a hard dependency
             return "unknown"

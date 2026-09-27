@@ -21,13 +21,12 @@ from fastapi.testclient import TestClient
 
 from tradingagents.api.app import create_app
 from tradingagents.api.domain.services import market_data_service as mds
+from tradingagents.api.domain.vendor_reports import NO_DATA_SENTINEL, UNAVAILABLE_SENTINEL
 from tradingagents.dataflows.errors import (
     NoMarketDataError,
     VendorNotConfiguredError,
     VendorRateLimitError,
 )
-from tradingagents.dataflows.interface import NO_DATA_SENTINEL, UNAVAILABLE_SENTINEL
-
 
 TOOL_PATH = "tradingagents.api.domain.services.market_data_service"
 

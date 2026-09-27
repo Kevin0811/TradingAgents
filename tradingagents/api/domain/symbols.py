@@ -1,7 +1,7 @@
 """Network-free symbol rules for the API's supported-symbols list.
 
 Everything here is purely syntactic, like the core's
-``tradingagents/dataflows/symbol_utils.py`` which it builds on (and never
+``tradingagents/dataflows/symbols.py`` which it builds on (and never
 modifies — the core is synced from upstream). It answers two questions:
 
 * which market's list must hold a given ticker (``classify_market``), so the
@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from functools import lru_cache
 from types import MappingProxyType
 
-from tradingagents.dataflows.symbol_utils import bare_crypto_to_pair, normalize_symbol
+from tradingagents.dataflows.symbols import crypto_base, normalize_symbol
 
 MARKETS: tuple[str, ...] = ("tw", "us", "jp", "crypto", "fx")
 SYMBOL_TYPES: tuple[str, ...] = ("equity", "etf", "crypto", "currency")
@@ -71,6 +71,23 @@ _JP_LOCAL_CODE = re.compile(r"^\d[0-9A-Z]\d[0-9A-Z]$")
 
 
 @lru_cache(maxsize=256)
+def bare_crypto_to_pair(raw: str) -> str | None:
+    """Return ``<BASE>-USD`` for an unquoted crypto base like ``BTC``, else None.
+
+    The core's ``normalize_symbol`` deliberately leaves a bare base alone:
+    several of them double as real exchange tickers (``BTC`` is a listed
+    spot-bitcoin ETF), so rewriting them globally would misprice equity
+    requests. The API knows when its input is a crypto asset, so it opts in
+    here. The base is checked through the core's public ``crypto_base``.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().upper().rstrip("+")
+    if not s or "-" in s:
+        return None
+    return f"{s}-USD" if crypto_base(f"{s}-USD") == s else None
+
+
 def _is_core_currency(code: str) -> bool:
     """True when the core's forex rule treats ``code`` as a currency.
 

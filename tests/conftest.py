@@ -169,4 +169,3 @@ def _offline_symbol_source(request, monkeypatch):
 
         monkeypatch.setattr(app_module, "YahooSymbolSource", _OfflineSymbolSource)
     yield
-

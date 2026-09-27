@@ -1,7 +1,7 @@
 """Shared field validators for API request schemas.
 
-Kept separate from symbol_utils.py's ticker normalization on purpose: that
-module (tradingagents/dataflows/symbol_utils.py) documents itself as purely
+Kept separate from symbols.py's ticker normalization on purpose: that
+module (tradingagents/dataflows/symbols.py) documents itself as purely
 syntactic and network-free, and is safe to call on every request including
 inside retry loops. This module does something different — it fails a
 request synchronously at the API boundary, before it ever reaches a
