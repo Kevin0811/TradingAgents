@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from tradingagents.api.core.exceptions import AnalysisError
+from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -71,7 +72,8 @@ class AnalysisService:
                     effective_config = {**(self._config or {}), **clean_overrides}
 
             graph = TradingAgentsGraph(
-                selected_analysts=selected_analysts,
+                # API names ('sentiment') -> the core's keys ('social').
+                selected_analysts=to_core_analyst_keys(selected_analysts),
                 debug=self._debug,
                 config=effective_config,
             )

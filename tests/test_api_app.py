@@ -124,8 +124,12 @@ class TestLifespan:
     """The lifespan manager must call ensure_directories() on startup."""
 
     @pytest.mark.asyncio
-    async def test_lifespan_calls_ensure_directories(self):
-        app = create_app()
+    async def test_lifespan_calls_ensure_directories(self, tmp_path):
+        # Auto-refresh off: the lifespan starts the symbol catalog, which would
+        # otherwise queue a live Yahoo fetch for its (empty) cache.
+        app = create_app(
+            overrides={"symbols_auto_refresh": False, "symbols_cache_dir": str(tmp_path)}
+        )
         # Mock ensure_directories on the config
         app.state.api_config.ensure_directories = MagicMock()
 
