@@ -20,6 +20,14 @@ import re
 from io import StringIO
 from typing import Any
 
+# Prefixes the core router puts on the text it returns instead of raising
+# (``tradingagents/dataflows/router.py``). The agent path reads them as prose;
+# the HTTP API matches on them to answer 404 / 503 instead of 200. They are
+# defined here rather than imported because the core, which is synced from
+# upstream, only emits them as literals.
+NO_DATA_SENTINEL = "NO_DATA_AVAILABLE:"
+UNAVAILABLE_SENTINEL = "DATA_UNAVAILABLE:"
+
 # Vendor column name -> canonical field. Applied after lowercasing and
 # replacing spaces with underscores, so "Adj Close" arrives as "adj_close"
 # and only genuine cross-vendor differences need a row here.
@@ -71,9 +79,7 @@ def parse_ohlcv_csv(report: str) -> list[dict[str, Any]]:
         return []
 
     body = [
-        line
-        for line in report.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+        line for line in report.splitlines() if line.strip() and not line.lstrip().startswith("#")
     ]
     if len(body) < 2:
         return []

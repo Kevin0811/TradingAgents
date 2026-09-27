@@ -6,12 +6,12 @@ import logging
 
 from pydantic import BaseModel
 
+from tradingagents.agents.rating import RATING_REVIEW, RATINGS_5_TIER, extract_rating
 from tradingagents.agents.schemas import (
     SentimentReport,
     TraderProposal,
     _coerce_optional_float,
 )
-from tradingagents.agents.utils.rating import RATING_REVIEW, RATINGS_5_TIER, extract_rating
 from tradingagents.api.core.exceptions import DataNotFoundError
 from tradingagents.api.domain.entities import DecisionState
 from tradingagents.api.domain.repositories import StateRepository
@@ -120,7 +120,7 @@ class DecisionService:
         Returns:
             Parsed ResearchPlan. ``recommendation`` is ``"REVIEW"`` rather than a
             fabricated ``"Hold"`` when no recognizable recommendation is found
-            (mirrors the core graph's rating fix, tradingagents.agents.utils.rating).
+            (mirrors the core graph's rating fix, tradingagents.agents.rating).
         """
         recommendation_raw: str | None = None
         rationale = ""
@@ -203,7 +203,7 @@ class DecisionService:
         Returns:
             Parsed PortfolioDecision. ``rating`` is ``"REVIEW"`` rather than a
             fabricated ``"Hold"`` when no recognizable rating is found (see
-            tradingagents.agents.utils.rating.extract_rating).
+            tradingagents.agents.rating.extract_rating).
         """
         executive_summary = ""
         investment_thesis = ""
