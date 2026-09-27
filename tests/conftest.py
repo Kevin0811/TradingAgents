@@ -1,6 +1,7 @@
 """Shared pytest fixtures that prevent CI hangs when API keys are absent."""
 
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,6 +55,41 @@ def _isolate_config():
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
     yield
     config_module._config = copy.deepcopy(default_config.DEFAULT_CONFIG)
+
+
+class _OfflineSymbolSource:
+    """Stands in for YahooSymbolSource in the app: every fetch fails, offline."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def fetch(self, market, yield_when_busy=True):
+        from tradingagents.api.infrastructure.yahoo_symbol_source import SymbolSourceError
+
+        raise SymbolSourceError(f"network access is disabled in tests ({market})")
+
+    def source_label(self, market):
+        return "offline (tests)"
+
+
+@pytest.fixture(autouse=True)
+def _offline_symbol_source(request, monkeypatch):
+    """Keep the app's supported-symbols catalog off the network in API tests.
+
+    ``create_app()`` builds a catalog around ``YahooSymbolSource``, and the
+    lifespan (e.g. ``with TestClient(app)``) starts it, which with the default
+    config queues a live Yahoo fetch for every market. Swap the source for one
+    that fails offline, so no test can start a real fetch by accident; a test
+    that wants a working source monkeypatches its own fake over this one. Tests
+    of ``YahooSymbolSource`` itself construct it directly with fakes and are
+    not affected.
+    """
+    module = request.module.__name__.rsplit(".", 1)[-1]
+    if module.startswith("test_api") or "tradingagents.api.app" in sys.modules:
+        from tradingagents.api import app as app_module
+
+        monkeypatch.setattr(app_module, "YahooSymbolSource", _OfflineSymbolSource)
+    yield
 
 
 @pytest.fixture()
