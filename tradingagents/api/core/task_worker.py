@@ -58,6 +58,14 @@ class TaskWorker:
         future.add_done_callback(self._log_failure)
         return future
 
+    def submit_for_caller(self, fn: Callable[[], Any]) -> Future:
+        """Queue ``fn`` like :meth:`submit` for a caller that waits on the Future.
+
+        That caller reads the outcome, so a failure is left to it rather than
+        logged here as an unobserved background error.
+        """
+        return self._executor.submit(fn)
+
     @staticmethod
     def _log_failure(future: Future) -> None:
         """Surface exceptions that would otherwise die silently in the Future."""

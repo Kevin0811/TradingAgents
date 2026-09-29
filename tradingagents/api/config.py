@@ -63,6 +63,40 @@ def symbols_env_var(key: str) -> str | None:
 
 SYMBOLS_DEFAULT_CONFIG = _symbols_defaults()
 
+# Local-model (Ollama) settings, resolved the same way as the symbols ones: an
+# empty env value counts as unset, and a config override wins over the env.
+_OLLAMA_ENV_OVERRIDES = {
+    "TRADINGAGENTS_OLLAMA_CACHE_TRIM_MB": "ollama_cache_trim_mb",
+}
+
+
+def _ollama_defaults() -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        # Unload an Ollama model once it has grown this many MB past its size
+        # right after loading (its MLX prompt cache); 0 turns the trim off.
+        "ollama_cache_trim_mb": 1024,
+    }
+    for env_var, key in _OLLAMA_ENV_OVERRIDES.items():
+        raw = os.environ.get(env_var)
+        if raw is None or not raw.strip():
+            continue  # unset or empty: the default applies
+        try:
+            defaults[key] = _coerce(raw.strip(), defaults[key])
+        except ValueError as exc:
+            raise ValueError(f"invalid {env_var}={raw!r}: {exc}") from exc
+    return defaults
+
+
+OLLAMA_DEFAULT_CONFIG = _ollama_defaults()
+
+# Whether TRADINGAGENTS_TASK_MAX_CONCURRENT was set when the process started.
+# DEFAULT_API_CONFIG (outside the API package) folds it in at import time and
+# carries a default of 2 either way, so this is how an explicit value is told
+# from the default (see ApiConfig.task_max_concurrent).
+TASK_MAX_CONCURRENT_FROM_ENV = bool(
+    (os.environ.get("TRADINGAGENTS_TASK_MAX_CONCURRENT") or "").strip()
+)
+
 
 class ApiConfig:
     """Configuration for the TradingAgents API.
@@ -82,6 +116,7 @@ class ApiConfig:
             **DEFAULT_CONFIG,
             **DEFAULT_API_CONFIG,
             **SYMBOLS_DEFAULT_CONFIG,
+            **OLLAMA_DEFAULT_CONFIG,
         }
         self._override_keys = set(overrides or ())
         if overrides:
@@ -136,6 +171,43 @@ class ApiConfig:
     def analyst_concurrency_limit(self) -> int:
         """Return the analyst concurrency limit."""
         return int(self._config.get("analyst_concurrency_limit", 4))
+
+    @property
+    def uses_ollama(self) -> bool:
+        """Whether analyses run on a local Ollama server."""
+        return str(self._config.get("llm_provider") or "").strip().lower() == "ollama"
+
+    @property
+    def task_max_concurrent(self) -> int:
+        """Effective number of analysis tasks that run at once.
+
+        An explicit ``task_max_concurrent`` (config override or
+        ``TRADINGAGENTS_TASK_MAX_CONCURRENT``) always wins. Otherwise it is 1
+        with Ollama (``llm_provider == "ollama"``) -- concurrent analyses on one
+        small local model mostly contend for it -- and the default (2) for any
+        other provider. An override of ``None`` counts as unset.
+        """
+        configured = self._config.get("task_max_concurrent")
+        explicit = TASK_MAX_CONCURRENT_FROM_ENV or (
+            "task_max_concurrent" in self._override_keys and configured is not None
+        )
+        if not explicit and self.uses_ollama:
+            return 1
+        if configured is None:
+            configured = DEFAULT_API_CONFIG.get("task_max_concurrent")
+        return int(configured if configured is not None else 2)
+
+    @property
+    def ollama_cache_trim_mb(self) -> int:
+        """Growth in MB past an Ollama model's post-load size that triggers an
+        unload to drop its prompt cache (0 = off). Negative values count as 0."""
+        return max(int(self._config.get("ollama_cache_trim_mb") or 0), 0)
+
+    @property
+    def ollama_cache_trim_active(self) -> bool:
+        """Whether analyses trim the Ollama cache: only with ``llm_provider ==
+        "ollama"`` and a budget above 0."""
+        return self.uses_ollama and self.ollama_cache_trim_mb > 0
 
     @property
     def symbols_cache_dir(self) -> Path:

@@ -142,7 +142,7 @@ class TestIndicatorNameEnum:
 @pytest.mark.unit
 class TestTaskStatusEnum:
     def test_all_status_values(self):
-        expected = {"pending", "queued", "processing", "completed", "failed"}
+        expected = {"pending", "queued", "processing", "completed", "failed", "cancelled"}
         actual = {s.value for s in TaskStatus}
         assert actual == expected
 

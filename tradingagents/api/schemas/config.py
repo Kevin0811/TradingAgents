@@ -34,9 +34,29 @@ class ConfigResponse(BaseModel):
         default=None, description="Maximum number of tasks retained in memory."
     )
     task_max_concurrent: int | None = Field(
-        default=None, description="Maximum concurrent task executions."
+        default=None,
+        description=(
+            "Effective maximum of concurrent task executions: the configured "
+            "value, or 1 by default when llm_provider is ollama (2 otherwise)."
+        ),
     )
     analyst_concurrency_limit: int | None = Field(
         default=None,
         description="Reserved for future use; analysts currently run sequentially.",
+    )
+    ollama_cache_trim_mb: int | None = Field(
+        default=None,
+        description=(
+            "With llm_provider ollama: unload a run's model once it has grown this "
+            "many MB past its post-load size, to drop its prompt cache (0 = off). "
+            "The configured value; see ollama_cache_trim_active for whether it applies."
+        ),
+    )
+    ollama_cache_trim_active: bool | None = Field(
+        default=None,
+        description=(
+            "Whether analyses trim the Ollama cache: true only when llm_provider is "
+            "ollama and ollama_cache_trim_mb is above 0. With any other provider "
+            "nothing is trimmed, whatever ollama_cache_trim_mb says."
+        ),
     )
