@@ -14,6 +14,7 @@ from tradingagents.api.core.activity_middleware import (
     yahoo_backed_paths,
 )
 from tradingagents.api.core.error_handlers import register_exception_handlers
+from tradingagents.api.core.sync_runs import SyncRuns
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
 from tradingagents.api.domain.refresh_window import RefreshWindow
@@ -24,6 +25,8 @@ from tradingagents.api.domain.services.symbol_settings import (
     SymbolSettings,
     validate_setting,
 )
+from tradingagents.api.infrastructure.log_filters import install_cancel_log_filter
+from tradingagents.api.infrastructure.ollama_cache_trimmer import OllamaCacheTrimmer
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
@@ -38,7 +41,8 @@ async def lifespan(app: FastAPI):
 
     Ensures required directories exist, loads the supported-symbols cache
     (queueing a background refresh for missing/stale markets; startup never
-    waits on the network), and tears down the task worker on exit.
+    waits on the network), and on exit cancels the synchronous analyses in
+    flight and tears down the task worker.
     """
     config: ApiConfig = app.state.api_config
     config.ensure_directories()
@@ -49,6 +53,9 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("TradingAgents API shutting down")
         app.state.symbol_catalog.shutdown()
+        # Sync POST /analyze runs stop at their next LLM call; queued ones are
+        # dropped with the worker's queue below.
+        app.state.sync_runs.cancel_all()
         # Don't wait: an in-flight analysis can take minutes and would
         # otherwise hold up shutdown.
         app.state.task_worker.shutdown(wait=False)
@@ -143,8 +150,17 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
         ttl_minutes=config.config.get("task_ttl_minutes", 60),
         max_tasks=config.config.get("task_max_tasks", 100),
     )
-    app.state.task_worker = TaskWorker(
-        max_workers=int(config.config.get("task_max_concurrent", 2)),
+    # 1 by default with Ollama (see ApiConfig.task_max_concurrent). With
+    # Ollama, synchronous POST /analyze runs queue on it too.
+    app.state.task_worker = TaskWorker(max_workers=config.task_max_concurrent)
+    app.state.sync_runs = SyncRuns()
+    # A cancelled analysis unwinds through LangChain and the core, which log
+    # it as warnings; keep only the task's own INFO line.
+    install_cancel_log_filter()
+    # One trimmer for the whole app, so checks from concurrent analyses are
+    # serialised; none unless llm_provider is ollama and the budget is above 0.
+    app.state.ollama_cache_trimmer = (
+        OllamaCacheTrimmer(config.ollama_cache_trim_mb) if config.ollama_cache_trim_active else None
     )
 
     # The supported-symbols list. Nothing is loaded until the lifespan runs;
@@ -154,8 +170,9 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     # Yahoo-backed request (tracked by the middleware below).
     app.state.symbol_settings = create_symbol_settings(config)
     task_manager = app.state.task_manager
+    sync_runs = app.state.sync_runs
     app.state.activity_monitor = ActivityMonitor(
-        busy_tasks=lambda: task_manager.active_task_count,
+        busy_tasks=lambda: task_manager.active_task_count + sync_runs.active_count,
         grace=lambda: app.state.symbol_settings.idle_grace,
     )
     app.state.symbol_catalog = create_symbol_catalog(

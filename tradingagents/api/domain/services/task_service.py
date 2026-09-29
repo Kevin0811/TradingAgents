@@ -5,8 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from tradingagents.api.core.exceptions import AnalysisError
-from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
+from tradingagents.api.core.task_manager import (
+    CANCELLED_WHILE_RUNNING,
+    CancelOutcome,
+    TaskManager,
+)
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
@@ -65,9 +69,13 @@ class TaskService:
         self, task_id: str, request: TaskCreateRequest
     ) -> None:
         """Run analysis and update the task record with the outcome."""
+        # Backstop for a queued task whose Future could not be cancelled: a
+        # task cancelled or deleted while it waited never starts.
+        cancel_event = self._task_manager.start_task(task_id)
+        if cancel_event is None:
+            logger.info("Task %s was cancelled or deleted before it started; skipping", task_id)
+            return
         try:
-            # Update status to processing
-            self._task_manager.update_task(task_id, status=TaskStatus.PROCESSING)
             logger.info("Task %s started processing", task_id)
 
             # Run the analysis
@@ -77,6 +85,7 @@ class TaskService:
                 asset_type=request.asset_type,
                 selected_analysts=tuple(request.selected_analysts),
                 overrides=resolve_overrides(request),
+                cancel_event=cancel_event,
             )
 
             # Update task with result
@@ -86,6 +95,15 @@ class TaskService:
                 result=result.to_dict(),
             )
             logger.info("Task %s completed successfully", task_id)
+
+        except AnalysisCancelled:
+            # The one INFO line of a task cancelled while it ran.
+            logger.info("Task %s cancelled while running; stopped at an LLM call", task_id)
+            self._task_manager.update_task(
+                task_id,
+                status=TaskStatus.CANCELLED,
+                message=CANCELLED_WHILE_RUNNING,
+            )
 
         except AnalysisError as e:
             logger.error("Task %s analysis failed: %s", task_id, e)
@@ -130,8 +148,12 @@ class TaskService:
         """
         return self._task_manager.list_tasks(status=status, ticker=ticker)
 
+    def cancel_task(self, task_id: str) -> CancelOutcome:
+        """Cancel a task (see ``TaskManager.cancel_task``)."""
+        return self._task_manager.cancel_task(task_id)
+
     def delete_task(self, task_id: str) -> bool:
-        """Delete a task.
+        """Delete a task, cancelling it first if it is still active.
 
         Args:
             task_id: Task UUID.
