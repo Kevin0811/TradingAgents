@@ -109,6 +109,61 @@ Supported symbols:
     Only ``.TW`` / ``.TWO`` (tw) and ``.T`` (jp) route a dotted symbol to a
     list.
 
+Analysis tasks:
+    ``POST /analyze/tasks`` queues an analysis on a worker pool of
+    ``task_max_concurrent`` workers (``TRADINGAGENTS_TASK_MAX_CONCURRENT``).
+    Unless it is set explicitly (config or env var, either wins), it is 1
+    when ``llm_provider`` is ``ollama`` -- concurrent analyses on one small
+    local model mostly contend -- and 2 otherwise. ``GET /config`` reports the
+    effective value. The one-worker default, like the cache trim below,
+    applies only when ``llm_provider == "ollama"``. With Ollama the
+    synchronous ``POST /analyze`` runs on the same worker pool, queued with
+    the tasks; with any other provider it runs on the request threadpool.
+    A sync run is cancelled (it stops at its next LLM call, or never starts
+    if still queued) when its client disconnects or the server shuts down,
+    and the request ends with 503.
+
+    A task's ``status`` is ``pending``, ``queued``, ``processing``,
+    ``completed``, ``failed`` or ``cancelled``.
+    ``POST /analyze/tasks/{task_id}/cancel`` cancels a pending or queued task
+    at once (it never runs); a processing task gets ``cancel_requested: true``
+    and stops at its next LLM call (the core graph cannot be interrupted
+    mid-call; a LangChain callback raises at the start of the next one), then
+    ends as ``cancelled``, its result discarded. A finished task answers 409.
+    A cancel can race the run's end: a task with ``cancel_requested`` may
+    still end ``completed`` or ``failed`` when its run had already passed its
+    last check. A cancel during the final decision may also leave that
+    decision in the core's decision log (``memory_log.store_decision`` runs
+    inside the graph); the API discards the result but cannot undo that.
+    ``DELETE /analyze/tasks/{task_id}`` cancels an active task the same way
+    before removing it, and just removes a finished one. A deleted running
+    task is gone (404) at once but keeps counting as active until its run has
+    stopped, so the symbols refresher does not take the app for idle.
+    LangChain's and the core's warnings about the cancel exception are
+    filtered out; each cancelled task logs one INFO line.
+
+Local model (Ollama) cache trim:
+    Ollama's MLX engine keeps a prompt-cache snapshot per request under a
+    fixed 8 GiB budget (ollama/ollama#18131), so a model grows call by call.
+    Only with ``llm_provider == "ollama"`` (no trimmer exists otherwise, and
+    ``GET /config`` reports ``ollama_cache_trim_active: false``), after each
+    LLM call of an analysis the API reads ``GET /api/ps`` and unloads the
+    run's models (its quick and deep model, nothing else) once one has grown
+    more than the budget past its baseline (``POST /api/generate`` with
+    ``keep_alive: 0``); the next call reloads it. The baseline is the size at
+    the first read of a load, capped at the model's weights (``GET
+    /api/tags``) plus 1024 MB, so a model already grown when first seen is
+    trimmed at once. The model may be shared with another app (fin-insight),
+    so a load with a new ``context_length``, or one smaller than at the last
+    trim, is measured afresh rather than unloaded. The native URL is the
+    run's ``/v1`` URL (``backend_url``, else ``OLLAMA_BASE_URL``, else the
+    default) without ``/v1``. Errors are logged and never fail the analysis.
+    See ``infrastructure/ollama_cache_trimmer.py`` for the exact rules.
+
+    - ``TRADINGAGENTS_OLLAMA_CACHE_TRIM_MB`` -> ``ollama_cache_trim_mb``
+      (1024; 0 = off). A ``create_app(overrides=...)`` value wins over the
+      env var; an empty env value counts as unset.
+
 Architecture:
     The API follows Clean Architecture principles with the following layers:
     - Core: Global exceptions, error handlers, middlewares

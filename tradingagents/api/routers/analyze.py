@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import functools
 import logging
+import threading
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from tradingagents.api.config import ApiConfig, get_config
-from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.exceptions import AnalysisCancelled
+from tradingagents.api.core.sync_runs import SyncRuns
+from tradingagents.api.core.task_manager import CancelOutcome, TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
 from tradingagents.api.dependencies import (
     get_analysis_service,
@@ -30,6 +38,9 @@ router = APIRouter(
     prefix="/analyze",
     tags=["Analysis"],
 )
+
+# How often a waiting synchronous request checks whether its client has gone.
+DISCONNECT_POLL_SECONDS = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -70,32 +81,107 @@ router = APIRouter(
         "5. **Risk Management** (aggressive/conservative/neutral) - debate risk factors\n"
         "6. **Portfolio Manager** - produce final trade decision\n\n"
         "Note: This endpoint may take significant time to respond (30s+) depending "
-        "on the LLM provider and analysis depth. It runs on the threadpool, so it "
-        "does not block other requests, but it holds the connection open for the "
-        "whole run and is not subject to `task_max_concurrent`. "
+        "on the LLM provider and analysis depth. It never blocks other requests, "
+        "but it holds the connection open for the whole run. With `llm_provider` "
+        "`ollama` it runs on the task worker pool, queued with `POST /analyze/tasks` "
+        "tasks and subject to `task_max_concurrent` (1 by default with Ollama); "
+        "with any other provider it runs on the threadpool and is not. "
         "For async operation, use `POST /analyze/tasks` instead.\n\n"
+        "The run is cancelled -- it stops at its next LLM call, or never starts if "
+        "still queued -- when the client disconnects (a client or proxy timeout "
+        "included) or the server shuts down; the request then ends with 503 "
+        "(`Analysis cancelled`), which a disconnected client never sees. As with "
+        "tasks, a cancel during the final decision may still leave it in the "
+        "core's decision log.\n\n"
         "The ticker is checked against the supported-symbols list first; see the 422 "
         "response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
     responses=TICKER_NOT_SUPPORTED_RESPONSES,
 )
-def analyze(
+async def analyze(
     request: AnalyzeRequest,
+    http_request: Request,
     analysis_service: AnalysisService = Depends(get_analysis_service),
+    task_worker: TaskWorker = Depends(get_task_worker),
+    config: ApiConfig = Depends(get_config),
 ) -> AnalyzeResponse:
     """Run the full trading analysis pipeline (synchronous)."""
     # Convert enum values to strings for the service function
     selected = tuple(a.value for a in request.selected_analysts)
-
-    result = analysis_service.run_analysis(
+    cancel_event = threading.Event()
+    run = functools.partial(
+        analysis_service.run_analysis,
         ticker=request.ticker,
         trade_date=request.trade_date,
         asset_type=request.asset_type.value,
         selected_analysts=selected,
         overrides=resolve_overrides(request),
+        cancel_event=cancel_event,
     )
 
+    sync_runs: SyncRuns = http_request.app.state.sync_runs
+    with sync_runs.track(cancel_event):
+        if config.uses_ollama:
+            # Serialised with the queued tasks: one local model, one worker
+            # by default (see ApiConfig.task_max_concurrent).
+            future: Any = task_worker.submit_for_caller(run)
+        else:
+            future = asyncio.ensure_future(run_in_threadpool(run))
+        try:
+            result = await _await_run(future, http_request, cancel_event)
+        except AnalysisCancelled:
+            logger.info(
+                "Synchronous analysis of %s on %s cancelled", request.ticker, request.trade_date
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Analysis cancelled: the client disconnected or the server is shutting down"
+                ),
+            ) from None
+
     return AnalyzeResponse(**result.to_dict())
+
+
+async def _await_run(
+    future: concurrent.futures.Future | asyncio.Future,
+    http_request: Request,
+    cancel_event: threading.Event,
+) -> Any:
+    """Wait for a sync run, cancelling it once its client has disconnected.
+
+    The run is cancelled through ``cancel_event`` (and, if it is still queued,
+    by cancelling its Future), and this keeps waiting until it has stopped, so
+    the worker slot is free again when the request ends. Should this coroutine
+    itself be cancelled (a server past its graceful-shutdown timeout), the run
+    is cancelled the same way before that propagates.
+
+    Raises:
+        AnalysisCancelled: the run was cancelled, queued or running.
+    """
+    waiter = (
+        asyncio.wrap_future(future) if isinstance(future, concurrent.futures.Future) else future
+    )
+
+    def cancel_run() -> None:
+        cancel_event.set()
+        if isinstance(future, concurrent.futures.Future):
+            future.cancel()  # dropped from the queue if it has not started
+
+    try:
+        while True:
+            done, _ = await asyncio.wait({waiter}, timeout=DISCONNECT_POLL_SECONDS)
+            if done:
+                break
+            if not cancel_event.is_set() and await http_request.is_disconnected():
+                logger.info("Client of a synchronous analysis disconnected; cancelling the run")
+                cancel_run()
+    except asyncio.CancelledError:
+        cancel_run()
+        raise
+    if waiter.cancelled():
+        raise AnalysisCancelled("analysis cancelled before it started")
+    return waiter.result()
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +201,11 @@ def analyze(
         "of creating a duplicate.\n\n"
         "If the task queue is full (task_max_tasks limit exceeded), returns "
         "429 Too Many Requests.\n\n"
-        "Tasks are queued automatically when concurrency limit is reached. "
+        "Tasks are queued automatically when concurrency limit is reached "
+        "(`task_max_concurrent`; 1 by default with Ollama, see `GET /config`). "
         "Use `GET /analyze/tasks/{task_id}` to check the status and retrieve "
-        "results when completed.\n\n"
+        "results when completed, and `POST /analyze/tasks/{task_id}/cancel` to "
+        "stop it.\n\n"
         "The ticker is checked against the supported-symbols list before anything is "
         "queued; see the 422 response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
@@ -159,7 +247,9 @@ async def create_analysis_task(
     if is_new:
         # Queued in the worker pool; it starts once a slot frees up.
         task_manager.update_task(task.task_id, status=TaskStatus.QUEUED)
-        task_worker.submit(task_service.execute_analysis, task.task_id, request)
+        future = task_worker.submit(task_service.execute_analysis, task.task_id, request)
+        # Kept so cancelling a queued task drops it from the worker's queue.
+        task_manager.attach_future(task.task_id, future)
         status_code = status.HTTP_202_ACCEPTED
     else:
         # Existing active task found: return it without queuing
@@ -175,7 +265,10 @@ async def create_analysis_task(
     "/tasks",
     response_model=list[TaskResponse],
     summary="List analysis tasks",
-    description="List analysis tasks with optional filters for status and ticker.",
+    description=(
+        "List analysis tasks with optional filters for status and ticker. Statuses: "
+        "`pending`, `queued`, `processing`, `completed`, `failed`, `cancelled`."
+    ),
 )
 async def list_analysis_tasks(
     status_filter: TaskStatus | None = Query(
@@ -199,7 +292,9 @@ async def list_analysis_tasks(
     summary="Get analysis task status",
     description=(
         "Get the current status and result of an analysis task. "
-        "Poll this endpoint until status is 'completed' or 'failed'."
+        "Poll this endpoint until status is 'completed', 'failed' or 'cancelled'. "
+        "A processing task that was asked to cancel reports `cancel_requested: true` "
+        "until it stops."
     ),
 )
 async def get_analysis_task(
@@ -216,13 +311,63 @@ async def get_analysis_task(
     return task
 
 
+@router.post(
+    "/tasks/{task_id}/cancel",
+    response_model=TaskResponse,
+    summary="Cancel an analysis task",
+    description=(
+        "Cancel an analysis task and return it.\n\n"
+        "- **pending/queued**: cancelled at once; it never runs. The task comes back "
+        "with status `cancelled`.\n"
+        "- **processing**: the run stops at its next LLM call (the analysis cannot "
+        "be interrupted mid-call). The task comes back with status `processing` and "
+        "`cancel_requested: true`; poll `GET /analyze/tasks/{task_id}` until the "
+        "status is `cancelled`.\n"
+        "- **completed/failed/cancelled**: nothing to cancel; 409.\n\n"
+        "A cancelled task is never reported as `failed`; its `message` says when "
+        "it was cancelled and it has no `result`. A cancel can race the run's end, "
+        "though: a processing task with `cancel_requested: true` may still end "
+        "`completed` or `failed` when the run had already passed its last check. "
+        "A cancel during the final decision may also leave that decision in the "
+        "core's decision log (the core stores it before the API can discard the "
+        "result)."
+    ),
+    responses={
+        404: {"description": "Task not found"},
+        409: {"description": "Task already finished (completed, failed or cancelled)"},
+    },
+)
+async def cancel_analysis_task(
+    task_id: str,
+    task_service: TaskService = Depends(get_task_service),
+) -> TaskResponse:
+    """Cancel a queued or running analysis task."""
+    outcome = task_service.cancel_task(task_id)
+    task = task_service.get_task(task_id)
+    if outcome == CancelOutcome.NOT_FOUND or task is None:
+        # task is None: deleted (or expired) between the cancel and this read.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+    if outcome == CancelOutcome.FINISHED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task {task_id} already finished with status '{task.status.value}'",
+        )
+    return task
+
+
 @router.delete(
     "/tasks/{task_id}",
     summary="Delete an analysis task",
     description=(
-        "Delete an analysis task. "
-        "Warning: Deleting a queued/processing task will not stop the "
-        "background execution, but the result will be discarded."
+        "Delete an analysis task. A pending, queued or processing task is cancelled "
+        "first (see `POST /analyze/tasks/{task_id}/cancel`): a queued one never runs, "
+        "and a running one stops at its next LLM call, its result discarded. "
+        "Finished tasks (completed, failed, cancelled) are simply removed. The task "
+        "is gone (404) at once; a running one still occupies its worker, and counts "
+        "as active, until it has stopped."
     ),
     status_code=status.HTTP_204_NO_CONTENT,
 )
@@ -230,7 +375,7 @@ async def delete_analysis_task(
     task_id: str,
     task_service: TaskService = Depends(get_task_service),
 ) -> Response:
-    """Delete an analysis task."""
+    """Delete an analysis task, cancelling it first if it is still active."""
     deleted = task_service.delete_task(task_id)
     if not deleted:
         raise HTTPException(

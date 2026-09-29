@@ -34,3 +34,11 @@ class ExternalServiceError(TradingAgentsAPIError):
     """Raised when an external service (LLM, Data Provider) fails."""
 
     pass
+
+
+class AnalysisCancelled(Exception):
+    """Raised inside a running analysis once its task was cancelled.
+
+    Deliberately not a ``TradingAgentsAPIError``: it ends a task as
+    ``cancelled``, never as a failure or an HTTP error.
+    """

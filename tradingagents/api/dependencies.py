@@ -51,12 +51,14 @@ async def get_state_repository(
 
 
 async def get_analysis_service(
+    request: Request,
     config: ApiConfig = Depends(get_config),
 ) -> AnalysisService:
-    """Create an analysis service."""
+    """Create an analysis service, sharing the app's Ollama cache trimmer."""
     return AnalysisService(
         config=config.config,
         debug=config.debug,
+        cache_trimmer=getattr(request.app.state, "ollama_cache_trimmer", None),
     )
 
 
