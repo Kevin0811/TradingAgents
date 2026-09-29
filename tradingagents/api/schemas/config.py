@@ -48,6 +48,15 @@ class ConfigResponse(BaseModel):
         default=None,
         description=(
             "With llm_provider ollama: unload a run's model once it has grown this "
-            "many MB past its post-load size, to drop its prompt cache (0 = off)."
+            "many MB past its post-load size, to drop its prompt cache (0 = off). "
+            "The configured value; see ollama_cache_trim_active for whether it applies."
+        ),
+    )
+    ollama_cache_trim_active: bool | None = Field(
+        default=None,
+        description=(
+            "Whether analyses trim the Ollama cache: true only when llm_provider is "
+            "ollama and ollama_cache_trim_mb is above 0. With any other provider "
+            "nothing is trimmed, whatever ollama_cache_trim_mb says."
         ),
     )

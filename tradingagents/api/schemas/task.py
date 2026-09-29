@@ -72,6 +72,7 @@ class TaskResponse(BaseModel):
         description=(
             "True once the task was cancelled (POST /analyze/tasks/{task_id}/cancel). "
             "A processing task keeps status 'processing' with this flag until it stops "
-            "at its next LLM call, then ends as 'cancelled'."
+            "at its next LLM call, then ends as 'cancelled' -- or, when the cancel "
+            "raced the run's end, as 'completed' or 'failed'."
         ),
     )

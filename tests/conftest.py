@@ -124,3 +124,37 @@ def _offline_symbol_source(request, monkeypatch):
 
         monkeypatch.setattr(app_module, "YahooSymbolSource", _OfflineSymbolSource)
     yield
+
+
+_TRIMMER_MODULE = "tradingagents.api.infrastructure.ollama_cache_trimmer"
+
+
+@pytest.fixture(autouse=True)
+def ollama_http_guard(request, monkeypatch):
+    """Keep the Ollama cache trimmer's real HTTP client off any Ollama server.
+
+    With ``llm_provider`` ollama (a contributor's ``.env`` may set it), every
+    LLM call of an analysis makes the trimmer read ``/api/ps`` and maybe POST
+    an unload. Its real client, ``UrllibOllamaHttp``, is replaced here by one
+    that records the URL and raises; the trimmer swallows the error, so the
+    fixture fails the test at teardown instead. A test that wants HTTP hands
+    the trimmer a fake client (``OllamaCacheTrimmer(..., http=fake)``); one
+    that checks this guard reads, then clears, the list of refused URLs it
+    yields.
+    """
+    module = request.module.__name__.rsplit(".", 1)[-1]
+    if not (module.startswith("test_api") or _TRIMMER_MODULE in sys.modules):
+        yield []
+        return
+    from tradingagents.api.infrastructure import ollama_cache_trimmer
+
+    refused: list[str] = []
+
+    def refuse(self, url, *args, **kwargs):
+        refused.append(url)
+        raise OSError(f"test tried to reach Ollama: {url}")
+
+    monkeypatch.setattr(ollama_cache_trimmer.UrllibOllamaHttp, "get_json", refuse)
+    monkeypatch.setattr(ollama_cache_trimmer.UrllibOllamaHttp, "post_json", refuse)
+    yield refused
+    assert not refused, f"the test made real Ollama HTTP calls: {refused}"

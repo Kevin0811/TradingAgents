@@ -54,4 +54,5 @@ def get_current_config(config: ApiConfig = Depends(get_config)) -> ConfigRespons
         task_max_concurrent=config.task_max_concurrent,
         analyst_concurrency_limit=c.get("analyst_concurrency_limit"),
         ollama_cache_trim_mb=config.ollama_cache_trim_mb,
+        ollama_cache_trim_active=config.ollama_cache_trim_active,
     )

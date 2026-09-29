@@ -183,19 +183,31 @@ class ApiConfig:
 
         An explicit ``task_max_concurrent`` (config override or
         ``TRADINGAGENTS_TASK_MAX_CONCURRENT``) always wins. Otherwise it is 1
-        with Ollama -- concurrent analyses on one small local model mostly
-        contend for it -- and the default (2) for any other provider.
+        with Ollama (``llm_provider == "ollama"``) -- concurrent analyses on one
+        small local model mostly contend for it -- and the default (2) for any
+        other provider. An override of ``None`` counts as unset.
         """
-        explicit = "task_max_concurrent" in self._override_keys or TASK_MAX_CONCURRENT_FROM_ENV
+        configured = self._config.get("task_max_concurrent")
+        explicit = TASK_MAX_CONCURRENT_FROM_ENV or (
+            "task_max_concurrent" in self._override_keys and configured is not None
+        )
         if not explicit and self.uses_ollama:
             return 1
-        return int(self._config.get("task_max_concurrent", 2))
+        if configured is None:
+            configured = DEFAULT_API_CONFIG.get("task_max_concurrent")
+        return int(configured if configured is not None else 2)
 
     @property
     def ollama_cache_trim_mb(self) -> int:
         """Growth in MB past an Ollama model's post-load size that triggers an
         unload to drop its prompt cache (0 = off). Negative values count as 0."""
         return max(int(self._config.get("ollama_cache_trim_mb") or 0), 0)
+
+    @property
+    def ollama_cache_trim_active(self) -> bool:
+        """Whether analyses trim the Ollama cache: only with ``llm_provider ==
+        "ollama"`` and a budget above 0."""
+        return self.uses_ollama and self.ollama_cache_trim_mb > 0
 
     @property
     def symbols_cache_dir(self) -> Path:

@@ -5,6 +5,7 @@ All HTTP goes through a fake; nothing reaches the network or a real model.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,8 @@ from tradingagents.api.infrastructure.llm_callbacks import OllamaCacheTrimHandle
 from tradingagents.api.infrastructure.ollama_cache_trimmer import (
     BACKOFF_CHECKS,
     FAILURES_BEFORE_BACKOFF,
+    NOT_TAKEN_BACKOFF_CHECKS,
+    WEIGHTS_OVERHEAD_MB,
     OllamaCacheTrimmer,
     normalize_model_name,
     ollama_native_url,
@@ -30,26 +33,45 @@ MODEL = "qwen3.5:4b-mlx"
 
 
 class FakeHttp:
-    """Scripted /api/ps sizes and unload answers; records every request."""
+    """Scripted /api/ps sizes and unload answers; records every request.
 
-    def __init__(self, sizes=None, unload_answer=None):
-        self.sizes = list(sizes or [])  # MB per /api/ps read; None = not loaded
+    ``sizes`` are MB per /api/ps read (None = not loaded), or ``(MB,
+    context_length)`` pairs. ``weights`` is the model's /api/tags size in MB
+    (None = not listed); ``tags_error`` makes /api/tags fail.
+    """
+
+    def __init__(self, sizes=None, unload_answer=None, weights=None):
+        self.sizes = list(sizes or [])
         self.ps_error: Exception | None = None
         self.unload_answer = unload_answer or {"done_reason": "unload"}
         self.unload_error: Exception | None = None
+        self.weights = weights
+        self.tags_error: Exception | None = None
         self.gets: list[str] = []
+        self.tags_gets: list[str] = []
         self.posts: list[tuple[str, dict]] = []
         self.extra_models: list[dict] = []
 
     def get_json(self, url, timeout):
-        self.gets.append(url)
         assert timeout <= 5
+        if url.endswith("/api/tags"):
+            self.tags_gets.append(url)
+            if self.tags_error is not None:
+                raise self.tags_error
+            if self.weights is None:
+                return {"models": []}
+            return {"models": [{"name": MODEL, "model": MODEL, "size": self.weights * MB}]}
+        self.gets.append(url)
         if self.ps_error is not None:
             raise self.ps_error
         size = self.sizes.pop(0) if self.sizes else None
         models = list(self.extra_models)
         if size is not None:
-            models.append({"name": MODEL, "model": MODEL, "size": size * MB, "size_vram": 0})
+            size, ctx = size if isinstance(size, tuple) else (size, None)
+            entry = {"name": MODEL, "model": MODEL, "size": size * MB, "size_vram": 0}
+            if ctx is not None:
+                entry["context_length"] = ctx
+            models.append(entry)
         return {"models": models}
 
     def post_json(self, url, payload, timeout):
@@ -122,6 +144,8 @@ class TestTrimDecision:
         sizes = iter([4000, 6000])
 
         def get_json(url, timeout):
+            if url.endswith("/api/tags"):
+                return {"models": []}
             http.extra_models[0]["size"] = next(sizes) * MB
             return {"models": http.extra_models}
 
@@ -153,7 +177,7 @@ class TestSharedModelAndFailures:
             trimmer.check(URL, [MODEL])
         assert len(http.posts) == 1
 
-    def test_still_over_budget_after_a_trim_unloads_again(self):
+    def test_as_large_after_a_trim_is_retried_once(self):
         http = FakeHttp(sizes=[4000, 5100, 5200])
         trimmer = _trimmer(http)
         trimmer.check(URL, [MODEL])
@@ -223,6 +247,139 @@ class TestSharedModelAndFailures:
         for t in threads:
             t.join()
         assert peak == 1
+
+
+@pytest.mark.unit
+class TestReloadsByAnotherApp:
+    """M1: fin-insight shares the model and reloads it with its own num_ctx."""
+
+    def test_a_smaller_reload_past_the_old_budget_is_re_anchored_not_unloaded(self):
+        # Trimmed at 5100; reloaded (by the other app) at 5060: smaller than at
+        # the trim, yet more than 1024 MB past the old baseline of 4000.
+        http = FakeHttp(sizes=[4000, 5100, 5060, 5200, 6100])
+        trimmer = _trimmer(http)
+        results = [trimmer.check(URL, [MODEL])[0] for _ in range(5)]
+        assert [r.trimmed for r in results] == [False, True, False, False, True]
+        assert results[2].baseline == 5060 * MB
+        assert len(http.posts) == 2
+
+    def test_a_reload_with_another_context_length_starts_over(self):
+        # The reviewer's sequence, with /api/ps reporting the loads' contexts.
+        http = FakeHttp(sizes=[(4000, 4096), (5100, 4096), (5200, 8192), (5300, 8192)])
+        trimmer = _trimmer(http)
+        results = [trimmer.check(URL, [MODEL])[0] for _ in range(4)]
+        assert [r.trimmed for r in results] == [False, True, False, False]
+        assert results[2].baseline == 5200 * MB
+        assert len(http.posts) == 1
+
+    def test_a_context_length_change_without_a_trim_starts_over(self):
+        http = FakeHttp(sizes=[(4000, 4096), (4500, 4096), (6000, 32768), (6100, 32768)])
+        trimmer = _trimmer(http)
+        results = [trimmer.check(URL, [MODEL])[0] for _ in range(4)]
+        assert not any(r.trimmed for r in results)
+        assert results[2].baseline == 6000 * MB
+
+    def test_an_unload_not_taken_is_retried_once_then_backs_off(self, caplog):
+        # Answered unloads, but the model stays as large (or keeps coming back
+        # larger): one retry at once, then only every NOT_TAKEN_BACKOFF_CHECKS-th.
+        http = FakeHttp(sizes=[4000, 5100] + [5200] * (NOT_TAKEN_BACKOFF_CHECKS + 1))
+        trimmer = _trimmer(http)
+        logger = "tradingagents.api.infrastructure.ollama_cache_trimmer"
+        with caplog.at_level(logging.INFO, logger=logger):
+            trimmer.check(URL, [MODEL])
+            assert trimmer.check(URL, [MODEL])[0].trimmed  # the trim
+            assert trimmer.check(URL, [MODEL])[0].trimmed  # not taken #1: retried
+            deferred = [trimmer.check(URL, [MODEL])[0] for _ in range(NOT_TAKEN_BACKOFF_CHECKS - 1)]
+            assert all(r.deferred for r in deferred)
+            assert len(http.posts) == 2
+            assert trimmer.check(URL, [MODEL])[0].trimmed  # the 20th due check
+        not_taken = [r for r in caplog.records if "as large after its cache trim" in r.message]
+        assert [r.levelno for r in not_taken] == [logging.INFO, logging.WARNING]
+
+    def test_not_taken_unloads_do_not_count_as_failures(self):
+        http = FakeHttp(sizes=[4000, 5100, 5200, 5200, 4100, 5200])
+        trimmer = _trimmer(http)
+        for _ in range(5):
+            trimmer.check(URL, [MODEL])
+        state = trimmer._models[f"{URL} {MODEL}"]
+        assert state.failures == 0
+        # 4100 < 5200 at the last trim: a reload, so the counter starts over.
+        assert state.not_taken == 0 and state.baseline == 4100 * MB
+        assert trimmer.check(URL, [MODEL])[0].trimmed  # +1100 over the new baseline
+
+
+@pytest.mark.unit
+class TestWeightsReference:
+    """M2: a model already grown at first sight is trimmed on that first check."""
+
+    def test_a_bloated_model_is_trimmed_on_the_first_check(self):
+        http = FakeHttp(sizes=[12000, 4100, 4300], weights=3000)
+        trimmer = _trimmer(http)
+        first = trimmer.check(URL, [MODEL])[0]
+        assert first.trimmed
+        assert first.baseline == (3000 + WEIGHTS_OVERHEAD_MB) * MB
+        after = trimmer.check(URL, [MODEL])[0]  # reloaded: measured from here
+        assert not after.trimmed and after.baseline == 4100 * MB
+        assert not trimmer.check(URL, [MODEL])[0].trimmed
+        assert len(http.posts) == 1
+        assert http.tags_gets == [f"{URL}/api/tags"]
+
+    def test_a_fresh_load_below_the_reference_keeps_its_own_baseline(self):
+        http = FakeHttp(sizes=[4000, 4600], weights=3000)
+        trimmer = _trimmer(http)
+        assert trimmer.check(URL, [MODEL])[0].baseline == 4000 * MB
+        assert not trimmer.check(URL, [MODEL])[0].trimmed
+
+    def test_the_weights_are_read_once_per_server_and_model(self):
+        http = FakeHttp(sizes=[4000, None, 4000, 4100], weights=3000)
+        trimmer = _trimmer(http)
+        for _ in range(4):
+            trimmer.check(URL, [MODEL])
+        assert http.tags_gets == [f"{URL}/api/tags"]
+        other = "http://other.test:11434"
+        http.sizes = [4000]
+        trimmer.check(other, [MODEL])
+        assert http.tags_gets == [f"{URL}/api/tags", f"{other}/api/tags"]
+
+    @pytest.mark.parametrize("broken", ["error", "unlisted"])
+    def test_without_the_weights_the_first_read_is_the_baseline(self, broken):
+        http = FakeHttp(sizes=[12000, 12500], weights=None if broken == "unlisted" else 3000)
+        if broken == "error":
+            http.tags_error = OSError("connection refused")
+        trimmer = _trimmer(http)
+        assert trimmer.check(URL, [MODEL])[0].baseline == 12000 * MB
+        assert not trimmer.check(URL, [MODEL])[0].trimmed
+        assert http.posts == []
+
+    def test_a_model_whose_loads_are_that_large_is_trimmed_once_at_most(self):
+        # A long context (or a preallocated cache) makes every fresh load
+        # 9000 MB: the reference trim is taken back, and not used again.
+        http = FakeHttp(sizes=[9000, 9000, 9100, None, 9000, 9050], weights=3000)
+        trimmer = _trimmer(http)
+        results = [trimmer.check(URL, [MODEL])[0] for _ in range(6)]
+        assert [r.trimmed for r in results] == [True, False, False, False, False, False]
+        assert results[4].baseline == 9000 * MB
+        assert trimmer._models[f"{URL} {MODEL}"].not_taken == 0
+
+
+@pytest.mark.unit
+class TestMisnamedModel:
+    def test_warns_once_when_other_models_are_loaded_but_not_ours(self, caplog):
+        http = FakeHttp()
+        http.extra_models = [{"name": "qwen3.5:4b", "model": "qwen3.5:4b", "size": 4000 * MB}]
+        trimmer = _trimmer(http)
+        with caplog.at_level(logging.WARNING):
+            trimmer.check(URL, ["qwen3.5:4b-mlxx"])
+            trimmer.check(URL, ["qwen3.5:4b-mlxx"])
+        warnings = [r for r in caplog.records if "not among the loaded ones" in r.message]
+        assert len(warnings) == 1
+        assert "qwen3.5:4b-mlxx" in warnings[0].message and "qwen3.5:4b" in warnings[0].message
+
+    def test_nothing_loaded_is_not_a_misnamed_model(self, caplog):
+        trimmer = _trimmer(FakeHttp())
+        with caplog.at_level(logging.WARNING):
+            trimmer.check(URL, [MODEL])
+        assert not [r for r in caplog.records if "not among the loaded ones" in r.message]
 
 
 @pytest.mark.unit
@@ -312,9 +469,10 @@ class TestCallbackWiring:
         assert not [c for c in callbacks if isinstance(c, OllamaCacheTrimHandler)]
 
     def test_app_shares_one_trimmer_and_budget_zero_disables_it(self):
-        app = create_app(overrides={"llm_provider": "ollama"})
+        app = create_app(overrides={"llm_provider": "ollama", "ollama_cache_trim_mb": 1024})
         assert app.state.ollama_cache_trimmer.budget_mb == 1024
-        assert create_app(overrides={"ollama_cache_trim_mb": 0}).state.ollama_cache_trimmer is None
+        off = create_app(overrides={"llm_provider": "ollama", "ollama_cache_trim_mb": 0})
+        assert off.state.ollama_cache_trimmer is None
 
     def test_task_runs_use_the_apps_trimmer(self, monkeypatch):
         monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
@@ -338,3 +496,30 @@ class TestCallbackWiring:
             app.state.task_worker.shutdown(wait=True)
         [handler] = [c for c in captured["callbacks"] if isinstance(c, OllamaCacheTrimHandler)]
         assert handler._trimmer is app.state.ollama_cache_trimmer
+
+
+@pytest.mark.unit
+class TestNoTestReachesOllama:
+    """M3: the conftest guard refuses the trimmer's real HTTP client."""
+
+    def test_the_guard_refuses_real_ollama_calls(self, ollama_http_guard, monkeypatch):
+        monkeypatch.setenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1")
+
+        class Graph:
+            def __init__(self, *args, callbacks=None, **kwargs):
+                self.model = FakeListChatModel(responses=["a"], callbacks=callbacks)
+
+            def propagate(self, *args, **kwargs):
+                self.model.invoke("x")  # the trim handler checks after it
+                return {"final_trade_decision": "Buy"}, "Buy"
+
+        app = create_app(overrides={"llm_provider": "ollama"})
+        assert type(app.state.ollama_cache_trimmer._http).__name__ == "UrllibOllamaHttp"
+        with patch("tradingagents.api.domain.services.analysis_service.TradingAgentsGraph", Graph):
+            resp = TestClient(app).post(
+                "/api/v1/analyze", json={"ticker": "AAPL", "trade_date": "2026-06-01"}
+            )
+            app.state.task_worker.shutdown(wait=True)
+        assert resp.status_code == 200  # the refused read never fails the run
+        assert ollama_http_guard == ["http://host.docker.internal:11434/api/ps"]
+        ollama_http_guard.clear()  # seen: don't fail this test at teardown

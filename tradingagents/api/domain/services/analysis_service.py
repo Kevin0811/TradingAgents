@@ -72,6 +72,11 @@ class AnalysisService:
                 deep_think_llm) merged on top of the service's base config. None
                 values are ignored, so callers can pass a sparse dict.
             cancel_event: Set to cancel the run: it stops at its next LLM call.
+                A cancel during the last step may come too late for the core's
+                own side effects: the Portfolio Manager's decision can already
+                be in the core's decision log (``memory_log.store_decision``)
+                when the run is cancelled. The API discards the result all the
+                same; it cannot undo that write (the core is not edited here).
 
         Returns:
             AnalysisResult with all reports and decisions.
@@ -118,7 +123,8 @@ class AnalysisService:
             if cancel_event is not None and cancel_event.is_set():
                 # Whatever the core made of the cancel exception on its way up
                 # (re-raised, wrapped, or a later error), the run was cancelled.
-                logger.info("Analysis of %s on %s cancelled", ticker, trade_date)
+                # The caller logs the one INFO line per cancelled run.
+                logger.debug("Analysis of %s on %s cancelled", ticker, trade_date)
                 raise AnalysisCancelled("analysis cancelled") from e
             logger.exception("Analysis failed for %s on %s", ticker, trade_date)
             raise AnalysisError(

@@ -97,7 +97,8 @@ class TaskService:
             logger.info("Task %s completed successfully", task_id)
 
         except AnalysisCancelled:
-            logger.info("Task %s cancelled while running", task_id)
+            # The one INFO line of a task cancelled while it ran.
+            logger.info("Task %s cancelled while running; stopped at an LLM call", task_id)
             self._task_manager.update_task(
                 task_id,
                 status=TaskStatus.CANCELLED,
