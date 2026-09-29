@@ -109,6 +109,39 @@ Supported symbols:
     Only ``.TW`` / ``.TWO`` (tw) and ``.T`` (jp) route a dotted symbol to a
     list.
 
+Analysis tasks:
+    ``POST /analyze/tasks`` queues an analysis on a worker pool of
+    ``task_max_concurrent`` workers (``TRADINGAGENTS_TASK_MAX_CONCURRENT``).
+    Unless it is set explicitly (config or env var, either wins), it is 1
+    when ``llm_provider`` is ``ollama`` -- concurrent analyses on one small
+    local model mostly contend -- and 2 otherwise. ``GET /config`` reports the
+    effective value.
+
+    A task's ``status`` is ``pending``, ``queued``, ``processing``,
+    ``completed``, ``failed`` or ``cancelled``.
+    ``POST /analyze/tasks/{task_id}/cancel`` cancels a pending or queued task
+    at once (it never runs); a processing task gets ``cancel_requested: true``
+    and stops at its next LLM call (the core graph cannot be interrupted
+    mid-call; a LangChain callback raises at the start of the next one), then
+    ends as ``cancelled``, its result discarded. A finished task answers 409.
+    ``DELETE /analyze/tasks/{task_id}`` cancels an active task the same way
+    before removing it, and just removes a finished one.
+
+Local model (Ollama) cache trim:
+    Ollama's MLX engine keeps a prompt-cache snapshot per request under a
+    fixed 8 GiB budget (ollama/ollama#18131), so a model grows call by call.
+    With ``llm_provider == "ollama"``, after each LLM call of an analysis the
+    API reads ``GET /api/ps`` and unloads the run's models (its quick and deep
+    model, nothing else) once one has grown more than the budget past its
+    size after loading (``POST /api/generate`` with ``keep_alive: 0``); the
+    next call reloads it. The native URL is the run's ``/v1`` URL
+    (``backend_url``, else ``OLLAMA_BASE_URL``, else the default) without
+    ``/v1``. Errors are logged and never fail the analysis.
+
+    - ``TRADINGAGENTS_OLLAMA_CACHE_TRIM_MB`` -> ``ollama_cache_trim_mb``
+      (1024; 0 = off). A ``create_app(overrides=...)`` value wins over the
+      env var; an empty env value counts as unset.
+
 Architecture:
     The API follows Clean Architecture principles with the following layers:
     - Core: Global exceptions, error handlers, middlewares

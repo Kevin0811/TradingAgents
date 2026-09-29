@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
 
 from tradingagents.api.config import ApiConfig, get_config
-from tradingagents.api.core.task_manager import TaskManager
+from tradingagents.api.core.task_manager import CancelOutcome, TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
 from tradingagents.api.dependencies import (
     get_analysis_service,
@@ -115,9 +115,11 @@ def analyze(
         "of creating a duplicate.\n\n"
         "If the task queue is full (task_max_tasks limit exceeded), returns "
         "429 Too Many Requests.\n\n"
-        "Tasks are queued automatically when concurrency limit is reached. "
+        "Tasks are queued automatically when concurrency limit is reached "
+        "(`task_max_concurrent`; 1 by default with Ollama, see `GET /config`). "
         "Use `GET /analyze/tasks/{task_id}` to check the status and retrieve "
-        "results when completed.\n\n"
+        "results when completed, and `POST /analyze/tasks/{task_id}/cancel` to "
+        "stop it.\n\n"
         "The ticker is checked against the supported-symbols list before anything is "
         "queued; see the 422 response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
@@ -159,7 +161,9 @@ async def create_analysis_task(
     if is_new:
         # Queued in the worker pool; it starts once a slot frees up.
         task_manager.update_task(task.task_id, status=TaskStatus.QUEUED)
-        task_worker.submit(task_service.execute_analysis, task.task_id, request)
+        future = task_worker.submit(task_service.execute_analysis, task.task_id, request)
+        # Kept so cancelling a queued task drops it from the worker's queue.
+        task_manager.attach_future(task.task_id, future)
         status_code = status.HTTP_202_ACCEPTED
     else:
         # Existing active task found: return it without queuing
@@ -175,7 +179,10 @@ async def create_analysis_task(
     "/tasks",
     response_model=list[TaskResponse],
     summary="List analysis tasks",
-    description="List analysis tasks with optional filters for status and ticker.",
+    description=(
+        "List analysis tasks with optional filters for status and ticker. Statuses: "
+        "`pending`, `queued`, `processing`, `completed`, `failed`, `cancelled`."
+    ),
 )
 async def list_analysis_tasks(
     status_filter: TaskStatus | None = Query(
@@ -199,7 +206,9 @@ async def list_analysis_tasks(
     summary="Get analysis task status",
     description=(
         "Get the current status and result of an analysis task. "
-        "Poll this endpoint until status is 'completed' or 'failed'."
+        "Poll this endpoint until status is 'completed', 'failed' or 'cancelled'. "
+        "A processing task that was asked to cancel reports `cancel_requested: true` "
+        "until it stops."
     ),
 )
 async def get_analysis_task(
@@ -216,13 +225,55 @@ async def get_analysis_task(
     return task
 
 
+@router.post(
+    "/tasks/{task_id}/cancel",
+    response_model=TaskResponse,
+    summary="Cancel an analysis task",
+    description=(
+        "Cancel an analysis task and return it.\n\n"
+        "- **pending/queued**: cancelled at once; it never runs. The task comes back "
+        "with status `cancelled`.\n"
+        "- **processing**: the run stops at its next LLM call (the analysis cannot "
+        "be interrupted mid-call). The task comes back with status `processing` and "
+        "`cancel_requested: true`; poll `GET /analyze/tasks/{task_id}` until the "
+        "status is `cancelled`.\n"
+        "- **completed/failed/cancelled**: nothing to cancel; 409.\n\n"
+        "A cancelled task is never reported as `failed`; its `message` says when "
+        "it was cancelled and it has no `result`."
+    ),
+    responses={
+        404: {"description": "Task not found"},
+        409: {"description": "Task already finished (completed, failed or cancelled)"},
+    },
+)
+async def cancel_analysis_task(
+    task_id: str,
+    task_service: TaskService = Depends(get_task_service),
+) -> TaskResponse:
+    """Cancel a queued or running analysis task."""
+    outcome = task_service.cancel_task(task_id)
+    if outcome == CancelOutcome.NOT_FOUND:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+    task = task_service.get_task(task_id)
+    if outcome == CancelOutcome.FINISHED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task {task_id} already finished with status '{task.status.value}'",
+        )
+    return task
+
+
 @router.delete(
     "/tasks/{task_id}",
     summary="Delete an analysis task",
     description=(
-        "Delete an analysis task. "
-        "Warning: Deleting a queued/processing task will not stop the "
-        "background execution, but the result will be discarded."
+        "Delete an analysis task. A pending, queued or processing task is cancelled "
+        "first (see `POST /analyze/tasks/{task_id}/cancel`): a queued one never runs, "
+        "and a running one stops at its next LLM call, its result discarded. "
+        "Finished tasks (completed, failed, cancelled) are simply removed."
     ),
     status_code=status.HTTP_204_NO_CONTENT,
 )
@@ -230,7 +281,7 @@ async def delete_analysis_task(
     task_id: str,
     task_service: TaskService = Depends(get_task_service),
 ) -> Response:
-    """Delete an analysis task."""
+    """Delete an analysis task, cancelling it first if it is still active."""
     deleted = task_service.delete_task(task_id)
     if not deleted:
         raise HTTPException(

@@ -23,6 +23,11 @@ class TaskStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+# A task in one of these states has ended and never changes again.
+FINISHED_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED})
 
 
 class TaskCreateRequest(RunOverridesMixin):
@@ -62,3 +67,11 @@ class TaskResponse(BaseModel):
     error: str | None = None
     result: dict | None = None
     message: str | None = None
+    cancel_requested: bool = Field(
+        default=False,
+        description=(
+            "True once the task was cancelled (POST /analyze/tasks/{task_id}/cancel). "
+            "A processing task keeps status 'processing' with this flag until it stops "
+            "at its next LLM call, then ends as 'cancelled'."
+        ),
+    )

@@ -24,6 +24,7 @@ from tradingagents.api.domain.services.symbol_settings import (
     SymbolSettings,
     validate_setting,
 )
+from tradingagents.api.infrastructure.ollama_cache_trimmer import OllamaCacheTrimmer
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
@@ -143,8 +144,12 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
         ttl_minutes=config.config.get("task_ttl_minutes", 60),
         max_tasks=config.config.get("task_max_tasks", 100),
     )
-    app.state.task_worker = TaskWorker(
-        max_workers=int(config.config.get("task_max_concurrent", 2)),
+    # 1 by default with Ollama (see ApiConfig.task_max_concurrent).
+    app.state.task_worker = TaskWorker(max_workers=config.task_max_concurrent)
+    # One trimmer for the whole app, so checks from concurrent analyses are
+    # serialised. Analyses use it only when their provider is Ollama.
+    app.state.ollama_cache_trimmer = (
+        OllamaCacheTrimmer(config.ollama_cache_trim_mb) if config.ollama_cache_trim_mb else None
     )
 
     # The supported-symbols list. Nothing is loaded until the lifespan runs;
