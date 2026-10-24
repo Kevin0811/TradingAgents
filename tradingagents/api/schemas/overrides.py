@@ -52,26 +52,31 @@ class RunOverridesMixin(BaseModel):
     )
     deep_think_llm: str | None = Field(
         default=None,
+        min_length=1,
         description="Override the deep-thinking model for this run.",
     )
     quick_think_llm: str | None = Field(
         default=None,
+        min_length=1,
         description="Override the quick-thinking model for this run.",
     )
     deep_think_provider: str | None = Field(
         default=None,
+        min_length=1,
         description=(
             "Run the deep-thinking model on another provider for this run (e.g. "
             "'anthropic' with deep_think_llm 'claude-opus-5-5'), using that "
             "provider's default endpoint and its API key from the server "
-            "environment. Default: the server's llm_provider."
+            "environment. Set deep_think_llm with it. Default: the server's "
+            "llm_provider."
         ),
     )
     quick_think_provider: str | None = Field(
         default=None,
+        min_length=1,
         description=(
-            "Run the quick-thinking model on another provider for this run; see "
-            "deep_think_provider."
+            "Run the quick-thinking model on another provider for this run; set "
+            "quick_think_llm with it. See deep_think_provider."
         ),
     )
     anthropic_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = Field(

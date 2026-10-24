@@ -127,7 +127,9 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     except ValueError as exc:
         # Logged, not raised: the data and symbol endpoints need no LLM, and
         # analysis requests are refused with this message (see check_run_config).
-        logger.error("LLM configuration will fail every analysis: %s", exc)
+        logger.error(
+            "LLM configuration will fail analyses that use the server's default models: %s", exc
+        )
 
     # Import routers here to avoid circular imports
     from tradingagents.api.routers.analysts import router as analysts_router

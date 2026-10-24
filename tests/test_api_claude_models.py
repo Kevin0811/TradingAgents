@@ -5,7 +5,8 @@ Covers:
   (per-tier providers, max_tokens, llm_max_retries)
 - check_llm_config refuses a temperature the tier's Anthropic model rejects,
   offline (no API key, nothing sent), and an unknown provider
-- the per-request provider / anthropic_effort overrides, GET /config, and the
+- the per-request provider / anthropic_effort overrides (a tier moved to
+  another provider uses that provider's default endpoint), GET /config, and the
   400 that /analyze and /analyze/tasks return for a configuration that would
   fail every LLM call
 """
@@ -16,9 +17,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from tradingagents.api.app import create_app
 from tradingagents.api.core.exceptions import InvalidRequestError
+from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.config_overrides import (
     check_run_config,
     resolve_overrides,
@@ -117,6 +120,21 @@ class TestCheckLlmConfig:
         with pytest.raises(ValueError, match="Unsupported LLM provider"):
             check_llm_config({"llm_provider": "nope"})
 
+    @pytest.mark.parametrize(
+        "config",
+        [{"llm_provider": None}, {"llm_provider": "ollama", "temperature": [1]}],
+        ids=["none-provider", "list-temperature"],
+    )
+    def test_a_value_of_the_wrong_type_is_a_value_error(self, config):
+        with pytest.raises(ValueError, match="^quick-thinking tier: "):
+            check_llm_config(config)
+
+    def test_a_model_the_client_cannot_build_names_its_tier(self):
+        config = {**ANTHROPIC, "quick_think_llm": "claude-haiku-4-5",
+                  "deep_think_llm": None, "temperature": 0.2}
+        with pytest.raises(ValueError, match="^deep-thinking tier: "):
+            check_llm_config(config)
+
 
 @pytest.mark.unit
 class TestRunOverrides:
@@ -132,7 +150,55 @@ class TestRunOverrides:
             "deep_think_provider": "anthropic",
             "quick_think_provider": "ollama",
             "anthropic_effort": "xhigh",
+            "deep_think_backend_url": None,
+            "quick_think_backend_url": None,
         }
+
+    def test_a_tier_moved_to_another_provider_uses_its_default_endpoint(
+        self, mock_create_llm_client
+    ):
+        server = {
+            "llm_provider": "ollama",
+            "backend_url": "http://ollama:11434/v1",
+            "deep_think_llm": "qwen3",
+            "quick_think_llm": "qwen3",
+            "deep_think_backend_url": "http://ollama:11434/v1",
+        }
+        request = AnalyzeRequest(
+            ticker="AAPL", trade_date="2026-06-01",
+            deep_think_provider="anthropic", deep_think_llm="claude-opus-5-5",
+        )
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.TradingAgentsGraph"
+        ) as graph:
+            graph.return_value.propagate.return_value = ({}, "HOLD")
+            AnalysisService(config=server).run_analysis(
+                "AAPL", "2026-06-01", overrides=resolve_overrides(request)
+            )
+        run_config = graph.call_args.kwargs["config"]
+
+        LLMProviderFactory(config=run_config).create_deep_thinking_llm()
+        kwargs = mock_create_llm_client.call_args.kwargs
+        assert kwargs["provider"] == "anthropic"
+        assert kwargs["base_url"] is None
+
+    @pytest.mark.parametrize("tier", ["deep", "quick"])
+    def test_a_provider_without_a_model_is_refused(self, tier):
+        request = AnalyzeRequest(
+            ticker="AAPL", trade_date="2026-06-01", **{f"{tier}_think_provider": "anthropic"}
+        )
+        with pytest.raises(InvalidRequestError) as exc_info:
+            check_run_config(ANTHROPIC, resolve_overrides(request))
+        assert exc_info.value.detail == (
+            f"set {tier}_think_llm together with {tier}_think_provider"
+        )
+
+    @pytest.mark.parametrize(
+        "field", ["deep_think_llm", "quick_think_llm", "deep_think_provider", "quick_think_provider"]
+    )
+    def test_an_empty_model_or_provider_is_a_validation_error(self, field):
+        with pytest.raises(ValidationError):
+            AnalyzeRequest(ticker="AAPL", trade_date="2026-06-01", **{field: ""})
 
     def test_unknown_effort_is_a_validation_error(self):
         with pytest.raises(ValueError):
@@ -164,11 +230,40 @@ class TestRoutes:
         run.assert_not_called()
 
     def test_task_create_refuses_the_task_before_queuing_it(self):
-        app = create_app(self.SERVER)
-        client = TestClient(app)
-        resp = client.post("/api/v1/analyze/tasks", json=self.BODY)
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.AnalysisService.run_analysis"
+        ) as run:
+            app = create_app(self.SERVER)
+            client = TestClient(app)
+            resp = client.post("/api/v1/analyze/tasks", json=self.BODY)
         assert resp.status_code == 400
         assert app.state.task_manager.active_task_count == 0
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["/api/v1/analyze", "/api/v1/analyze/tasks"])
+    def test_an_empty_model_override_is_a_422(self, path):
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.AnalysisService.run_analysis"
+        ) as run:
+            client = TestClient(create_app(ANTHROPIC))
+            resp = client.post(path, json={**self.BODY, "deep_think_llm": ""})
+        assert resp.status_code == 422
+        run.assert_not_called()
+
+    @pytest.mark.parametrize("path", ["/api/v1/analyze", "/api/v1/analyze/tasks"])
+    def test_a_provider_without_a_model_is_a_400(self, path):
+        with patch(
+            "tradingagents.api.domain.services.analysis_service.AnalysisService.run_analysis"
+        ) as run:
+            client = TestClient(create_app(ANTHROPIC))
+            resp = client.post(
+                path,
+                json={"ticker": "AAPL", "trade_date": "2026-06-01",
+                      "quick_think_provider": "anthropic"},
+            )
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == "set quick_think_llm together with quick_think_provider"
+        run.assert_not_called()
 
     def test_get_config_shows_the_tier_providers_and_effort(self):
         client = TestClient(
@@ -180,6 +275,9 @@ class TestRoutes:
         assert body["quick_think_provider"] == "ollama"
         assert body["anthropic_effort"] == "high"
 
-    def test_startup_logs_a_configuration_that_fails_every_run(self, caplog):
+    def test_startup_logs_a_configuration_that_fails_the_default_models(self, caplog):
         create_app({**ANTHROPIC, "deep_think_llm": "claude-sonnet-5-5", "temperature": 0.2})
-        assert "LLM configuration will fail every analysis" in caplog.text
+        assert (
+            "LLM configuration will fail analyses that use the server's default models"
+            in caplog.text
+        )

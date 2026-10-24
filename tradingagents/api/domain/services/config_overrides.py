@@ -25,6 +25,12 @@ _PASSTHROUGH_FIELDS = (
     "llm_max_retries",
 )
 
+_TIERS = ("deep", "quick")
+
+# Keys resolve_overrides sets to None on purpose: there a None clears the
+# server's value instead of being skipped (see AnalysisService.run_analysis).
+CLEARED_KEYS = frozenset(f"{tier}_think_backend_url" for tier in _TIERS)
+
 
 def resolve_overrides(request: Any) -> dict[str, Any]:
     """Build a config-override dict from a request's RunOverridesMixin fields.
@@ -46,6 +52,13 @@ def resolve_overrides(request: Any) -> dict[str, Any]:
         if value is not None:
             overrides[field] = value
 
+    # A tier moved to another provider must not inherit the server's endpoint for
+    # that tier (e.g. Claude calls sent to an Ollama URL): it uses the provider's
+    # default endpoint. Requests cannot set endpoints themselves.
+    for tier in _TIERS:
+        if f"{tier}_think_provider" in overrides:
+            overrides[f"{tier}_think_backend_url"] = None
+
     return overrides
 
 
@@ -56,6 +69,13 @@ def check_run_config(config: dict[str, Any], overrides: dict[str, Any]) -> None:
     for the request. Raised before the run is queued, so the caller gets a 400
     instead of a task that fails midway.
     """
+    for tier in _TIERS:
+        # The server's model name belongs to the server's provider for the tier.
+        if f"{tier}_think_provider" in overrides and f"{tier}_think_llm" not in overrides:
+            raise InvalidRequestError(
+                "Invalid LLM configuration",
+                detail=f"set {tier}_think_llm together with {tier}_think_provider",
+            )
     try:
         check_llm_config({**config, **overrides})
     except ValueError as exc:

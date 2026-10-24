@@ -10,7 +10,6 @@ settings, ``max_tokens``, ``llm_max_retries``) instead of keeping its own copy.
 
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -22,7 +21,13 @@ TIERS: tuple[str, ...] = ("quick", "deep")
 
 
 def _full_config(config: dict[str, Any]) -> dict[str, Any]:
-    """``config`` on top of DEFAULT_CONFIG: the core reads keys a partial dict may omit."""
+    """``config`` on top of DEFAULT_CONFIG: the core reads keys a partial dict may omit.
+
+    A key missing from ``config`` takes DEFAULT_CONFIG's value, which includes
+    TRADINGAGENTS_* env and .env overrides (before, a partial dict fell back to
+    hard-coded "openai" / "o3-mini" / "gpt-4o-mini"). The API always passes a
+    full ApiConfig, so only direct callers with a partial dict see this.
+    """
     return {**DEFAULT_CONFIG, **config}
 
 
@@ -40,14 +45,13 @@ def check_llm_config(config: dict[str, Any]) -> None:
     for tier in TIERS:
         try:
             client = create_tier_client(config, tier)
-        except ValueError as exc:
-            raise ValueError(f"{tier}-thinking tier: {exc}") from exc
-        if tier_provider(config, tier) != "anthropic" or temperature in (None, ""):
-            continue
-        with warnings.catch_warnings():
-            # The core warns on models missing from its catalog; not this check's concern.
-            warnings.simplefilter("ignore", RuntimeWarning)
+            if tier_provider(config, tier) != "anthropic" or temperature in (None, ""):
+                continue
             llm = client.get_llm()
+        # TypeError/AttributeError: a value of the wrong type (e.g. a None provider
+        # or a list temperature); pydantic's ValidationError is a ValueError.
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError(f"{tier}-thinking tier: {exc}") from exc
         build_payload = getattr(llm, "_get_request_payload", None)
         if build_payload is None:
             continue
@@ -55,8 +59,9 @@ def check_llm_config(config: dict[str, Any]) -> None:
             build_payload([HumanMessage(content="ping")])
         except ValueError as exc:
             raise ValueError(
-                f"{tier}-thinking model {config[f'{tier}_think_llm']!r} refuses the configured "
-                f"temperature ({exc}). Unset TRADINGAGENTS_TEMPERATURE or pick another model."
+                f"{tier}-thinking model {config[f'{tier}_think_llm']!r} rejects the server's "
+                f"temperature setting ({exc}). Choose a model that accepts it, or unset "
+                "TRADINGAGENTS_TEMPERATURE on the server."
             ) from exc
 
 
@@ -67,6 +72,9 @@ class LLMProviderFactory:
     - Default values from default_config.py
     - Overrides from .env file (TRADINGAGENTS_* variables)
     - API keys from environment (OPENAI_API_KEY, etc.)
+
+    A partial ``config`` is completed from DEFAULT_CONFIG (env and .env
+    included), not from hard-coded OpenAI defaults; see ``_full_config``.
     """
 
     def __init__(self, config: dict[str, Any] | None = None):
