@@ -30,6 +30,7 @@ from tradingagents.api.domain.services.config_overrides import (
     resolve_overrides,
 )
 from tradingagents.api.domain.services.task_service import TaskService
+from tradingagents.api.schemas.error import AnalysisErrorResponse
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
 from tradingagents.api.schemas.symbols import TICKER_NOT_SUPPORTED_RESPONSES
@@ -103,10 +104,22 @@ DISCONNECT_POLL_SECONDS = 1.0
         "(`Analysis cancelled`), which a disconnected client never sees. As with "
         "tasks, a cancel during the final decision may still leave it in the "
         "core's decision log.\n\n"
+        "The response's `token_usage` counts the run's LLM calls and tokens per model "
+        "tier and model. A run that fails ends with 500, its body carrying the "
+        "usage so far as `token_usage` (`partial: true`).\n\n"
         "The ticker is checked against the supported-symbols list first; see the 422 "
         "response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
-    responses=TICKER_NOT_SUPPORTED_RESPONSES,
+    responses={
+        **TICKER_NOT_SUPPORTED_RESPONSES,
+        500: {
+            "model": AnalysisErrorResponse,
+            "description": (
+                "The analysis failed. `token_usage` (`partial: true`) counts the LLM "
+                "calls it made before failing."
+            ),
+        },
+    },
 )
 async def analyze(
     request: AnalyzeRequest,
@@ -152,7 +165,7 @@ async def analyze(
                 ),
             ) from None
 
-    return AnalyzeResponse(**result.to_dict())
+    return AnalyzeResponse(**result.to_dict(), token_usage=result.token_usage)
 
 
 async def _await_run(
@@ -307,7 +320,9 @@ async def list_analysis_tasks(
         "Get the current status and result of an analysis task. "
         "Poll this endpoint until status is 'completed', 'failed' or 'cancelled'. "
         "A processing task that was asked to cancel reports `cancel_requested: true` "
-        "until it stops."
+        "until it stops. Once the run has ended, `token_usage` counts its LLM calls and "
+        "tokens per model tier and model, with `partial: true` when it failed or was "
+        "cancelled."
     ),
 )
 async def get_analysis_task(

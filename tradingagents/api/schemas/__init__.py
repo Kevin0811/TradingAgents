@@ -1,7 +1,7 @@
 """Pydantic schemas for API request/response models."""
 
 from tradingagents.api.schemas.enums import AnalystType, AssetType
-from tradingagents.api.schemas.error import ErrorResponse
+from tradingagents.api.schemas.error import AnalysisErrorResponse, ErrorResponse
 from tradingagents.api.schemas.request import (
     AnalyzeRequest,
     FundamentalsRequest,
@@ -32,6 +32,7 @@ from tradingagents.api.schemas.response import (
     StockDataResponse,
     TraderProposalResponse,
 )
+from tradingagents.api.schemas.token_usage import TierTokenUsage, TokenUsage, TokenUsageTotals
 
 __all__ = [
     # Requests
@@ -62,9 +63,13 @@ __all__ = [
     "TraderProposalResponse",
     "PortfolioDecisionResponse",
     "SentimentReportResponse",
+    "TokenUsage",
+    "TierTokenUsage",
+    "TokenUsageTotals",
     # Enums
     "AssetType",
     "AnalystType",
     # Error
     "ErrorResponse",
+    "AnalysisErrorResponse",
 ]

@@ -43,9 +43,15 @@ class AnalysisResult:
     trader_investment_plan: str | None = None
     final_trade_decision: str | None = None
     signal: str | None = None
+    # The run's token usage (see schemas.token_usage.TokenUsage).
+    token_usage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
+        """Convert the reports and decisions to a dictionary.
+
+        ``token_usage`` is left out: a task reports it in a field of its own,
+        beside ``result``, as it does for a failed or cancelled run.
+        """
         return {
             "ticker": self.ticker,
             "trade_date": self.trade_date,

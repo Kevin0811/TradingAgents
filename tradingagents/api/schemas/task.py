@@ -8,6 +8,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from tradingagents.api.schemas.overrides import RunOverridesMixin
+from tradingagents.api.schemas.token_usage import TokenUsage
 from tradingagents.api.schemas.validators import (
     normalize_asset_type,
     validate_ticker_shape,
@@ -74,5 +75,13 @@ class TaskResponse(BaseModel):
             "A processing task keeps status 'processing' with this flag until it stops "
             "at its next LLM call, then ends as 'cancelled' -- or, when the cancel "
             "raced the run's end, as 'completed' or 'failed'."
+        ),
+    )
+    token_usage: TokenUsage | None = Field(
+        default=None,
+        description=(
+            "Token usage of the run's LLM calls, per model tier and model. Set when the "
+            "run ends, whether it completed, failed or was cancelled (then with "
+            "partial: true); null until then, and for a task cancelled before it ran."
         ),
     )

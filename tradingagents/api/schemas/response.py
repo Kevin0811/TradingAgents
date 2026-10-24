@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Re-use structured schemas from agents package
 from tradingagents.agents.schemas import SentimentReport, TraderProposal
+from tradingagents.api.schemas.token_usage import TokenUsage
 
 # ---------------------------------------------------------------------------
 # Rating enums for markdown-parsed decisions
@@ -77,6 +78,13 @@ class AnalyzeResponse(BaseModel):
     trader_investment_plan: str | None = None
     final_trade_decision: str | None = None
     signal: str | None = None
+    token_usage: TokenUsage | None = Field(
+        default=None,
+        description=(
+            "Token usage of the run's LLM calls, per model tier and model; partial is "
+            "false here, as this response comes only from a run that completed."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
