@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -15,7 +15,7 @@ from tradingagents.api.schemas.validators import (
 )
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     """Status of an analysis task."""
 
     PENDING = "pending"

@@ -11,7 +11,7 @@ import logging
 import threading
 from concurrent.futures import Future
 from datetime import datetime, timedelta
-from enum import Enum
+from enum import StrEnum
 from uuid import uuid4
 
 from tradingagents.api.schemas.task import (
@@ -27,7 +27,7 @@ CANCELLED_BEFORE_START = "Cancelled before it started."
 CANCELLED_WHILE_RUNNING = "Cancelled while running; stopped at its next LLM call."
 
 
-class CancelOutcome(str, Enum):
+class CancelOutcome(StrEnum):
     """What :meth:`TaskManager.cancel_task` did."""
 
     NOT_FOUND = "not_found"
