@@ -15,9 +15,14 @@ Usage:
     invoke env                  # copy .env.example to .env
 """
 
-from invoke.tasks import task
 import os
-import sys
+import shlex
+from pathlib import Path
+
+from invoke.tasks import task
+
+# Absolute, so `invoke` works from any subdirectory of the repository.
+KEYCHAIN_ENV = Path(__file__).resolve().parent / "scripts" / "keychain-env"
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +85,9 @@ def with_keys(cmd):
     See scripts/keychain-env: only stored keys are exported, .env supplies the
     rest. Windows has no Keychain or bash, so the command runs as is there.
     """
-    return cmd if os.name == "nt" else f"scripts/keychain-env run {cmd}"
+    if os.name == "nt":
+        return cmd
+    return f"{shlex.quote(str(KEYCHAIN_ENV))} run {cmd}"
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +138,9 @@ def analyze(c, ticker=None, date=None, checkpoint=False, clear_checkpoints=False
     if clear_checkpoints:
         flags += " --clear-checkpoints"
     if ticker:
-        flags += f" {ticker}"
+        flags += f" {shlex.quote(ticker)}"
     if date:
-        flags += f" --date {date}"
+        flags += f" --date {shlex.quote(date)}"
     cmd = f"tradingagents analyze{flags}"
     print(f"Running: {cmd}")
     c.run(with_keys(cmd.strip()))

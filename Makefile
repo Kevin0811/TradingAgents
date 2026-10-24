@@ -20,8 +20,9 @@ TAG ?= dev
 # Targets that need API keys run through this: it exports the keys stored in
 # the macOS Keychain (see `make keychain-add`) and leaves the rest to .env.
 KEYCHAIN_ENV := scripts/keychain-env run
-# `docker compose` plus an override passing those keys into service $(1). The
-# override arrives through a pipe (bash process substitution), so nothing is
+# `docker compose` plus an override passing into service $(1) only the keys that
+# run took from the Keychain; a key merely set in the shell still comes from
+# .env inside the container, as before. The override arrives through a pipe (bash process substitution), so nothing is
 # written to disk and stdin stays free for interactive runs.
 compose_with_keys = docker compose -f docker-compose.yml -f <(scripts/keychain-env compose-override $(1))
 

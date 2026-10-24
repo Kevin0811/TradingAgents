@@ -6,7 +6,7 @@
 #   scripts/keychain-env remove <VAR>              delete a stored key
 #   scripts/keychain-env list                      which keys are stored (no values)
 #   scripts/keychain-env compose-override <svc>    compose override passing the
-#                                                  exported keys into <svc>
+#                                                  keys `run` exported into <svc>
 #
 # Each key is a generic-password item whose service is "tradingagents.<VAR>",
 # under the current user. `run` exports only the keys that have an item and are
@@ -17,6 +17,9 @@ set -euo pipefail
 
 PREFIX="${TRADINGAGENTS_KEYCHAIN_PREFIX:-tradingagents.}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# `run` records here the names (never values) of the keys it exported from the
+# Keychain, so compose-override passes only those into a container.
+EXPORTED_VAR=TRADINGAGENTS_KEYCHAIN_EXPORTED
 
 usage() {
   sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
@@ -24,44 +27,102 @@ usage() {
 }
 
 has_keychain() { command -v security >/dev/null 2>&1; }
+need_keychain() {
+  has_keychain || { echo "keychain-env: the macOS 'security' tool is not available" >&2; exit 1; }
+}
+
+is_var() { [[ "$1" =~ ^[A-Z][A-Z0-9_]*$ ]]; }
+
+# Print each space-separated word of $1 on its own line, with globbing off so a
+# word like `*` stays literal.
+words() {
+  local glob_was_off="" word
+  case "$-" in *f*) glob_was_off=1 ;; esac
+  set -f
+  for word in $1; do printf '%s\n' "$word"; done
+  [[ -n "$glob_was_off" ]] || set +f
+}
 
 # Secret-looking names from .env.example, so keys upstream adds are covered,
 # plus a few read from the environment but not listed there, plus any named in
-# TRADINGAGENTS_KEYCHAIN_VARS (space-separated).
+# TRADINGAGENTS_KEYCHAIN_VARS (space-separated). Commented-out (`#FOO_KEY=`,
+# `## FOO_KEY=`) and `export FOO_KEY=` lines count too.
 key_vars() {
+  local var
   {
     if [[ -f "$ROOT/.env.example" ]]; then
-      sed -nE 's/^#?[[:space:]]*([A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET)[A-Z0-9_]*)=.*/\1/p' \
+      sed -nE 's/^[[:space:]]*#*[[:space:]]*(export[[:space:]]+)?([A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET)[A-Z0-9_]*)=.*/\2/p' \
         "$ROOT/.env.example" | grep -v '^TRADINGAGENTS_' || true
     fi
     printf '%s\n' AZURE_OPENAI_API_KEY ALPHA_VANTAGE_API_KEY
-    for var in ${TRADINGAGENTS_KEYCHAIN_VARS:-}; do printf '%s\n' "$var"; done
+    while read -r var; do
+      if is_var "$var"; then
+        printf '%s\n' "$var"
+      else
+        echo "keychain-env: ignoring TRADINGAGENTS_KEYCHAIN_VARS entry '$var': not a variable name" >&2
+      fi
+    done < <(words "${TRADINGAGENTS_KEYCHAIN_VARS:-}")
   } | sort -u
 }
 
 check_var() {
-  [[ "${1:-}" =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo "keychain-env: not a variable name: '${1:-}'" >&2; exit 2; }
+  is_var "${1:-}" || { echo "keychain-env: not a variable name: '${1:-}'" >&2; exit 2; }
 }
 
-lookup() { security find-generic-password -a "$USER" -s "$PREFIX$1" -w 2>/dev/null; }
+# Read the item for $1 into LOOKUP_VALUE; fails when there is no item. The value
+# stays in this shell: never printed, never in argv. `-w` would print a value
+# holding a newline or a non-ASCII byte as bare hex, indistinguishable from a
+# key that is hex itself, so read the `-g` line on stderr instead:
+#   password: "plain"            or   password: 0x<HEX>  "escaped"
+# The 0x form is decoded with xxd, fed by the printf builtin through a pipe.
+# API keys never end in a newline, so trailing CR/LF are dropped.
+LOOKUP_VALUE=""
+lookup() {
+  local out rest=""
+  LOOKUP_VALUE=""
+  out="$(security find-generic-password -a "$USER" -s "$PREFIX$1" -g 2>&1 >/dev/null)" || return 1
+  # Parameter expansion only: a here-string would go through a temp file.
+  case "$out" in
+    password:*) rest="${out#password:}" ;;
+    *$'\n'password:*) rest="${out#*$'\n'password:}" ;;
+  esac
+  out=""
+  rest="${rest%%$'\n'*}"
+  rest="${rest# }"
+  case "$rest" in
+    0x*)
+      rest="${rest#0x}"
+      LOOKUP_VALUE="$(printf '%s' "${rest%% *}" | xxd -r -p)"
+      ;;
+    \"*\") LOOKUP_VALUE="${rest#\"}"; LOOKUP_VALUE="${LOOKUP_VALUE%\"}" ;;
+    *) LOOKUP_VALUE="$rest" ;;
+  esac
+  rest=""
+  while [[ "$LOOKUP_VALUE" == *$'\n' || "$LOOKUP_VALUE" == *$'\r' ]]; do
+    LOOKUP_VALUE="${LOOKUP_VALUE%?}"
+  done
+}
 
 cmd_run() {
   [[ $# -gt 0 ]] || usage
   if has_keychain; then
-    local var value
+    local var exported="${!EXPORTED_VAR:-}"
     while read -r var; do
       [[ -n "${!var:-}" ]] && continue
-      if value="$(lookup "$var")" && [[ -n "$value" ]]; then
-        export "$var=$value"
+      if lookup "$var" && [[ -n "$LOOKUP_VALUE" ]]; then
+        export "$var=$LOOKUP_VALUE"
+        exported="${exported:+$exported }$var"
       fi
     done < <(key_vars)
+    LOOKUP_VALUE=""
+    export "$EXPORTED_VAR=$exported"
   fi
   exec "$@"
 }
 
 cmd_add() {
   check_var "${1:-}"
-  has_keychain || { echo "keychain-env: the macOS 'security' tool is not available" >&2; exit 1; }
+  need_keychain
   # -w as the last option makes security prompt, so the key never reaches
   # argv or the shell history. -U replaces an existing item.
   security add-generic-password -U -a "$USER" -s "$PREFIX$1" -l "TradingAgents $1" -w
@@ -70,32 +131,38 @@ cmd_add() {
 
 cmd_remove() {
   check_var "${1:-}"
+  need_keychain
   security delete-generic-password -a "$USER" -s "$PREFIX$1" >/dev/null
   echo "Removed Keychain item '$PREFIX$1'."
 }
 
+# Same lookup as `run`, so an empty item, which `run` skips, shows as `empty`.
 cmd_list() {
-  has_keychain || { echo "keychain-env: the macOS 'security' tool is not available" >&2; exit 1; }
+  need_keychain
   local var
   while read -r var; do
-    # Without -w, find prints only the item's attributes; discard them anyway.
-    if security find-generic-password -a "$USER" -s "$PREFIX$var" >/dev/null 2>&1; then
-      printf '  stored   %s\n' "$var"
-    else
+    if ! lookup "$var"; then
       printf '  -        %s\n' "$var"
+    elif [[ -z "$LOOKUP_VALUE" ]]; then
+      printf '  empty    %s\n' "$var"
+    else
+      printf '  stored   %s\n' "$var"
     fi
   done < <(key_vars)
+  LOOKUP_VALUE=""
 }
 
-# A compose override that passes the keys set in this environment into one
-# service. Names only, no values: compose reads the values from the shell. A key
-# that is not set is left out, so the service's env_file (.env) still supplies it.
+# A compose override that passes into one service the keys `run` exported from
+# the Keychain (named in $TRADINGAGENTS_KEYCHAIN_EXPORTED). Names only, no
+# values: compose reads the values from the shell. Any other key, even one set
+# in the shell, is left out, so the service's env_file (.env) still supplies it
+# just as it would without the Keychain.
 cmd_compose_override() {
   local service="${1:-}" var found=()
   [[ "$service" =~ ^[A-Za-z0-9_.-]+$ ]] || usage
   while read -r var; do
-    [[ -n "${!var:-}" ]] && found+=("$var")
-  done < <(key_vars)
+    if is_var "$var" && [[ -n "${!var:-}" ]]; then found+=("$var"); fi
+  done < <(words "${!EXPORTED_VAR:-}" | sort -u)
   if [[ ${#found[@]} -eq 0 ]]; then
     printf 'services:\n  %s: {}\n' "$service"
     return
