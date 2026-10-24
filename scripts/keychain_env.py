@@ -3,8 +3,10 @@
 
   python scripts/keychain_env.py run -- <command> [args...]
       run a command with the stored keys exported
-  python scripts/keychain_env.py compose [--service NAME]... -- <compose args...>
-      run `docker compose` with an override passing those keys into NAME
+  python scripts/keychain_env.py compose [--secrets] [--service NAME]... -- <compose args...>
+      run `docker compose` with an override passing those keys into NAME:
+      as environment variables, or with --secrets as Compose secrets
+      (files under /run/secrets, read by scripts/container_secrets.py)
   python scripts/keychain_env.py add <VAR>       store a key (hidden prompt)
   python scripts/keychain_env.py remove <VAR>    delete a stored key
   python scripts/keychain_env.py list            which keys are stored (no values)
@@ -32,6 +34,8 @@ Environment:
   TRADINGAGENTS_KEYCHAIN_VARS    extra key names to look up, space-separated
   TRADINGAGENTS_KEYCHAIN_QUIET   "1" silences the hints `run`/`compose` print
                                  when they fall back to .env only
+  TRADINGAGENTS_DOTENV_PATH      the .env `compose` checks for leftover copies
+                                 of keyring keys (default: .env at the repo root)
 
 Standalone on purpose: stdlib plus the optional `keyring` package, and no
 import of `tradingagents`, so it works before the package is installed.
@@ -56,7 +60,13 @@ EXPORTED_VAR = "TRADINGAGENTS_KEYCHAIN_EXPORTED"
 QUIET_VAR = "TRADINGAGENTS_KEYCHAIN_QUIET"
 EXTRA_VARS = ("AZURE_OPENAI_API_KEY", "ALPHA_VANTAGE_API_KEY")
 VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
-SERVICE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# A compose service name that is also safe as a plain YAML mapping key.
+SERVICE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+# YAML 1.1 booleans/null: as a mapping key they would not be the service name.
+RESERVED_SERVICES = frozenset({"true", "false", "null", "yes", "no", "on", "off"})
+DOTENV_VAR = "TRADINGAGENTS_DOTENV_PATH"
+# A `NAME=` assignment in .env (names only; the value is never captured).
+DOTENV_NAME_RE = re.compile(r"^\s*(export\s+)?([A-Z][A-Z0-9_]*)\s*=")
 # Secret-looking names in .env.example, also commented out (`#FOO_KEY=`,
 # `  ## FOO_KEY=`) or after `export`.
 EXAMPLE_RE = re.compile(r"^\s*#*\s*(export\s+)?([A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET)[A-Z0-9_]*)=")
@@ -66,7 +76,7 @@ HINT = (
 )
 USAGE = """\
 usage: keychain_env.py run -- <command> [args...]
-       keychain_env.py compose [--service NAME]... -- <docker compose args...>
+       keychain_env.py compose [--secrets] [--service NAME]... -- <docker compose args...>
        keychain_env.py add <VAR>
        keychain_env.py remove <VAR>
        keychain_env.py list
@@ -312,15 +322,72 @@ def cmd_run(args: list[str]) -> None:
         sys.exit(126)
 
 
-def compose_override(services: list[str], names: list[str]) -> str:
-    """A compose override passing `names` (never values) into each service."""
+def is_service(name: str) -> bool:
+    return bool(SERVICE_RE.match(name)) and name.lower() not in RESERVED_SERVICES
+
+
+def dotenv_names() -> set[str]:
+    """Names assigned in the repo's .env (never values); empty if it is unreadable."""
+    path = Path(os.environ.get(DOTENV_VAR) or ROOT / ".env")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):  # missing, a directory, unreadable, ...
+        return set()
+    names = set()
+    for line in text.splitlines():
+        m = DOTENV_NAME_RE.match(line)
+        if m:
+            names.add(m.group(2))
+    return names
+
+
+def warn_dotenv_copies(names: list[str]) -> None:
+    """One warning naming the keyring keys that .env still sets as well.
+
+    The service's env_file puts every .env line into the container config, so
+    that copy stays visible in `docker inspect` whatever the keyring passes in.
+    """
+    both = sorted(set(names) & dotenv_names())
+    if both:
+        verb = "is" if len(both) == 1 else "are"
+        err(f"{', '.join(both)} {verb} also set in .env; that copy stays visible in "
+            "docker inspect (Config.Env) - remove it from .env")
+
+
+def secret_name(var: str) -> str:
+    """The top-level Compose secret name for `var` (validated by the caller)."""
+    return f"tradingagents_{var.lower()}"
+
+
+def compose_override(services: list[str], names: list[str], secrets: bool = False) -> str:
+    """A compose override passing `names` (never values) into each service.
+
+    By default each name is listed under the service's `environment:`, so
+    compose copies the value from its own environment into the container
+    config (visible to `docker inspect`). With `secrets`, each name becomes a
+    top-level secret whose source is that environment variable, mounted in the
+    service as /run/secrets/<NAME>: not in the container config or env. The
+    image must then load those files itself (Dockerfile.api does, through
+    scripts/container_secrets.py).
+
+    Every name and service has been validated (VAR_RE, SERVICE_RE), so plain
+    string formatting is safe YAML here: no quoting or escaping is needed.
+    """
     lines = ["services:"]
     for svc in services:
-        if names:
+        if not names:
+            lines.append(f"  {svc}: {{}}")
+        elif secrets:
+            lines += [f"  {svc}:", "    secrets:"]
+            for name in names:
+                lines += [f"      - source: {secret_name(name)}", f"        target: {name}"]
+        else:
             lines += [f"  {svc}:", "    environment:"]
             lines += [f"      - {name}" for name in names]
-        else:
-            lines.append(f"  {svc}: {{}}")
+    if secrets and names:
+        lines.append("secrets:")
+        for name in names:
+            lines += [f"  {secret_name(name)}:", f"    environment: {name}"]
     return "\n".join(lines) + "\n"
 
 
@@ -352,11 +419,22 @@ def cmd_compose(args: list[str]) -> None:
     $TRADINGAGENTS_KEYCHAIN_EXPORTED) are listed: compose reads their values
     from the environment. Any other key, even one set in the shell, is left out
     so the service's env_file (.env) still supplies it, as without a keyring.
+
+    `--secrets` passes them as Compose secrets instead of environment variables
+    (see compose_override); the image must load /run/secrets itself.
+
+    In both modes, a key that the repo's .env also sets is reported (names
+    only): the keyring value wins in the container, but env_file still copies
+    the .env value into the container config.
     """
     services: list[str] = []
+    secrets = False
     i = 0
     while i < len(args) and args[i] != "--":
-        if args[i] == "--service" and i + 1 < len(args) and SERVICE_RE.match(args[i + 1]):
+        if args[i] == "--secrets":
+            secrets = True
+            i += 1
+        elif args[i] == "--service" and i + 1 < len(args) and is_service(args[i + 1]):
             services.append(args[i + 1])
             i += 2
         else:
@@ -369,10 +447,11 @@ def cmd_compose(args: list[str]) -> None:
     names = sorted(
         {n for n in env.get(EXPORTED_VAR, "").split() if is_var(n) and env.get(n)}
     )
+    warn_dotenv_copies(names)
     fd, path = tempfile.mkstemp(suffix=".yml")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(compose_override(services, names))
+            f.write(compose_override(services, names, secrets))
         argv = ["docker", "compose", "-f", "docker-compose.yml", "-f", path, *compose_args]
         code = wait_child(argv, env, cwd=ROOT)
     finally:
