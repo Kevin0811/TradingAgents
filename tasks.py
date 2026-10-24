@@ -17,12 +17,14 @@ Usage:
 
 import os
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 from invoke.tasks import task
 
 # Absolute, so `invoke` works from any subdirectory of the repository.
-KEYCHAIN_ENV = Path(__file__).resolve().parent / "scripts" / "keychain-env"
+KEYCHAIN_ENV = Path(__file__).resolve().parent / "scripts" / "keychain_env.py"
 
 
 # ---------------------------------------------------------------------------
@@ -79,15 +81,25 @@ def env(c, enterprise=False):
     print(f"Created {dst}")
 
 
-def with_keys(cmd):
-    """Prefix ``cmd`` so API keys stored in the macOS Keychain reach it.
-
-    See scripts/keychain-env: only stored keys are exported, .env supplies the
-    rest. Windows has no Keychain or bash, so the command runs as is there.
-    """
+def quote(arg):
+    """Quote one argument for the shell invoke runs: cmd.exe on Windows."""
     if os.name == "nt":
-        return cmd
-    return f"{shlex.quote(str(KEYCHAIN_ENV))} run {cmd}"
+        return subprocess.list2cmdline([str(arg)])
+    return shlex.quote(str(arg))
+
+
+def keychain_cmd(*args):
+    """``python scripts/keychain_env.py <args>`` with this interpreter, quoted."""
+    return " ".join([quote(sys.executable), quote(KEYCHAIN_ENV), *args])
+
+
+def with_keys(cmd):
+    """Prefix ``cmd`` so API keys stored in the OS keyring reach it.
+
+    See scripts/keychain_env.py: only stored keys are exported, .env supplies
+    the rest; without ``keyring`` the command runs as is. Same on every OS.
+    """
+    return f"{keychain_cmd('run', '--')} {cmd}"
 
 
 # ---------------------------------------------------------------------------
@@ -138,12 +150,24 @@ def analyze(c, ticker=None, date=None, checkpoint=False, clear_checkpoints=False
     if clear_checkpoints:
         flags += " --clear-checkpoints"
     if ticker:
-        flags += f" {shlex.quote(ticker)}"
+        flags += f" {quote(ticker)}"
     if date:
-        flags += f" --date {shlex.quote(date)}"
+        flags += f" --date {quote(date)}"
     cmd = f"tradingagents analyze{flags}"
     print(f"Running: {cmd}")
     c.run(with_keys(cmd.strip()))
+
+
+@task(help={"var": "Variable name, e.g. ANTHROPIC_API_KEY"})
+def keychain_add(c, var):
+    """Store an API key in the OS keyring (hidden prompt)."""
+    c.run(keychain_cmd("add", quote(var)), pty=os.name != "nt")
+
+
+@task
+def keychain_list(c):
+    """Show which API keys are stored in the OS keyring (no values)."""
+    c.run(keychain_cmd("list"))
 
 
 # ---------------------------------------------------------------------------
