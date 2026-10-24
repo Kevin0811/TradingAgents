@@ -338,6 +338,7 @@ def test_api_secrets_symlink_swapped_in_is_not_followed(h, tmp_path):
 
 @pytest.mark.parametrize("name", [
     "PATH", "HOME", "SHELL", "USER", "PWD", "IFS", "PYTHONPATH", "PYTHONSTARTUP",
+    "SSLKEYLOGFILE",
     "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "SSL_CERT_FILE",
     "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "TRADINGAGENTS_SECRETS_DIR",
     # Reserved even though they look like secrets:

@@ -51,6 +51,9 @@ Limits, i.e. where the values still are:
     not only the server's user; so can anyone who can `docker exec` into it,
     and the process environment (/proc/<pid>/environ) as well. Docker access
     on the host is effectively root.
+  - The secrets directory itself is trusted: only its entries are checked for
+    symlinks, so a directory that is itself a symlink is followed. Replacing
+    /run/secrets needs root inside the container already.
   - On the host, the `docker compose` process that created the container holds
     the values in its environment while it runs (`make docker-run-api` runs in
     the foreground), readable by the same user or root.
@@ -78,6 +81,8 @@ SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS")
 RESERVED_NAMES = frozenset({
     "PATH", "HOME", "SHELL", "USER", "PWD", "IFS",
     DIR_VAR, "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # Contains KEY, but tells TLS libraries to log session keys to a file.
+    "SSLKEYLOGFILE",
 })
 RESERVED_PREFIXES = ("LD_", "DYLD_", "PYTHON", "SSL_CERT_")
 # O_NOFOLLOW: a symlink swapped in after the scan fails to open (ELOOP).
