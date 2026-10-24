@@ -25,7 +25,10 @@ from tradingagents.api.dependencies import (
     get_task_worker,
 )
 from tradingagents.api.domain.services.analysis_service import AnalysisService
-from tradingagents.api.domain.services.config_overrides import resolve_overrides
+from tradingagents.api.domain.services.config_overrides import (
+    check_run_config,
+    resolve_overrides,
+)
 from tradingagents.api.domain.services.task_service import TaskService
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
@@ -71,8 +74,15 @@ DISCONNECT_POLL_SECONDS = 1.0
         "- `max_debate_rounds`, `max_risk_discuss_rounds`: explicit round counts "
         "(1-5), take precedence over `research_depth`\n"
         "- `deep_think_llm`, `quick_think_llm`: override the models used for this run\n"
+        "- `deep_think_provider`, `quick_think_provider`: run a tier on another "
+        "provider (e.g. 'anthropic' with `deep_think_llm` 'claude-opus-5-5')\n"
+        "- `anthropic_effort`: 'low'/'medium'/'high'/'xhigh'/'max' for Claude models "
+        "that support it\n"
         "- `max_tokens`, `llm_max_retries`: cap output tokens / retry attempts for "
         "this run\n\n"
+        "A configuration that would fail every LLM call (an unknown provider, or a "
+        "server `temperature` the chosen Claude model rejects, as Sonnet 5.5 and "
+        "Fable 5.1 do) is refused with 400 before the run starts.\n\n"
         "**Pipeline Steps:**\n"
         "1. **Analysts** (market, social, news, fundamentals) - gather data and produce reports\n"
         "2. **Researchers** (bull/bear) - debate the investment thesis\n"
@@ -108,6 +118,8 @@ async def analyze(
     """Run the full trading analysis pipeline (synchronous)."""
     # Convert enum values to strings for the service function
     selected = tuple(a.value for a in request.selected_analysts)
+    overrides = resolve_overrides(request)
+    check_run_config(config.config, overrides)
     cancel_event = threading.Event()
     run = functools.partial(
         analysis_service.run_analysis,
@@ -115,7 +127,7 @@ async def analyze(
         trade_date=request.trade_date,
         asset_type=request.asset_type.value,
         selected_analysts=selected,
-        overrides=resolve_overrides(request),
+        overrides=overrides,
         cancel_event=cancel_event,
     )
 
@@ -219,6 +231,7 @@ async def create_analysis_task(
     config: ApiConfig = Depends(get_config),
 ) -> JSONResponse:
     """Create an analysis task or return existing one if duplicate."""
+    check_run_config(config.config, resolve_overrides(request))
     max_tasks = int(config.config.get("task_max_tasks", 100))
 
     def queue_full_response() -> JSONResponse:

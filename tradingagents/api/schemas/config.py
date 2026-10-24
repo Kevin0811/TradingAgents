@@ -19,6 +19,9 @@ class ConfigResponse(BaseModel):
     llm_provider: str | None = None
     deep_think_llm: str | None = None
     quick_think_llm: str | None = None
+    deep_think_provider: str | None = None
+    quick_think_provider: str | None = None
+    anthropic_effort: str | None = None
     backend_url: str | None = None
     temperature: float | None = None
     llm_max_retries: int | None = None

@@ -19,7 +19,7 @@ from tradingagents.api.infrastructure.llm_provider import LLMProviderFactory
 @pytest.fixture(autouse=True)
 def _mock_create_llm_client():
     """Mock the underlying create_llm_client to avoid real API calls."""
-    with patch("tradingagents.api.infrastructure.llm_provider.create_llm_client") as mock:
+    with patch("tradingagents.llm_clients.factory.create_llm_client") as mock:
         mock_client = MagicMock()
         mock_client.get_llm.return_value = MagicMock()
         mock.return_value = mock_client

@@ -9,6 +9,7 @@ from typing import Any
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
+from tradingagents.api.domain.services.config_overrides import CLEARED_KEYS
 from tradingagents.api.infrastructure.llm_callbacks import (
     CancelOnLLMStart,
     OllamaCacheTrimHandler,
@@ -70,7 +71,8 @@ class AnalysisService:
             selected_analysts: Tuple of analyst types to include.
             overrides: Optional per-run config overrides (e.g. max_debate_rounds,
                 deep_think_llm) merged on top of the service's base config. None
-                values are ignored, so callers can pass a sparse dict.
+                values are ignored, so callers can pass a sparse dict, except
+                for ``CLEARED_KEYS``, where None clears the base config's value.
             cancel_event: Set to cancel the run: it stops at its next LLM call.
                 A cancel during the last step may come too late for the core's
                 own side effects: the Portfolio Manager's decision can already
@@ -88,7 +90,9 @@ class AnalysisService:
         try:
             effective_config = self._config
             if overrides:
-                clean_overrides = {k: v for k, v in overrides.items() if v is not None}
+                clean_overrides = {
+                    k: v for k, v in overrides.items() if v is not None or k in CLEARED_KEYS
+                }
                 if clean_overrides:
                     effective_config = {**(self._config or {}), **clean_overrides}
 
