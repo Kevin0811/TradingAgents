@@ -10,16 +10,39 @@
 #   make docker-build    # build the CLI image
 #   make api             # run the API server locally
 #   make cli             # launch the interactive CLI
+#   make keychain-add VAR=ANTHROPIC_API_KEY   # keep a key in the OS keyring
 
+# Windows (cmd.exe / Git Bash) ships `python`; elsewhere `python3` is the safe name.
+ifeq ($(OS),Windows_NT)
+PYTHON ?= python
+else
 PYTHON ?= python3
+endif
 IMAGE ?= tradingagents
 IMAGE_API ?= tradingagents-api
 TAG ?= dev
+
+# Targets that need API keys run through this: it exports the keys stored in
+# the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret
+# Service; see `make keychain-add`) and leaves the rest to .env. Without
+# `keyring` or a usable backend it prints a hint and runs the command as is.
+# Environment knobs (see scripts/keychain_env.py):
+#   TRADINGAGENTS_KEYRING_SERVICE=name  keyring service (default tradingagents)
+#   TRADINGAGENTS_KEYCHAIN_VARS="A B"   extra key names to look up
+#   TRADINGAGENTS_KEYCHAIN_QUIET=1      no hint when falling back to .env only
+KEYCHAIN = $(PYTHON) scripts/keychain_env.py
+KEYCHAIN_ENV := $(KEYCHAIN) run --
+# `docker compose` plus a temporary override (names only, deleted afterwards)
+# passing into the service only the keys taken from the keyring; a key merely
+# set in the shell still comes from .env inside the container, as before.
+#   $(KEYCHAIN_COMPOSE) --service <svc> -- <docker compose args...>
+KEYCHAIN_COMPOSE := $(KEYCHAIN) compose
 
 .PHONY: help \
 	install install-api install-dev env \
 	docker-build docker-build-api docker-run docker-run-ollama docker-run-api \
 	api api-reload cli \
+	keychain-add keychain-remove keychain-list \
 	test test-unit test-integration test-smoke test-api \
 	lint format clean
 
@@ -33,14 +56,17 @@ help: ## Show this help
 # Installation
 # ---------------------------------------------------------------------------
 
+# `keyring` (for the keychain-* targets and KEYCHAIN_ENV) is installed here, not
+# declared in pyproject.toml: that file comes from upstream, and leaving it
+# alone keeps fork syncs conflict-free. Everything still works without it.
 install: ## Install the base package
-	pip install -e .
+	pip install -e . keyring
 
 install-api: ## Install with API extras (fastapi + uvicorn)
-	pip install -e ".[api]"
+	pip install -e ".[api]" keyring
 
 install-dev: ## Install with api + dev + bedrock extras
-	pip install -e ".[api,dev,bedrock]"
+	pip install -e ".[api,dev,bedrock]" keyring
 
 env: ## Copy .env.example to .env (skips if .env already exists)
 	@test -f .env || cp .env.example .env
@@ -56,26 +82,41 @@ docker-build-api: ## Build the API server Docker image
 	docker build -t $(IMAGE_API):$(TAG) -f Dockerfile.api .
 
 docker-run: ## Run the CLI in Docker (interactive)
-	docker compose run --rm tradingagents
+	$(KEYCHAIN_COMPOSE) --service tradingagents -- run --rm tradingagents
 
 docker-run-ollama: ## Run the CLI in Docker with the Ollama profile
-	docker compose --profile ollama run --rm tradingagents-ollama
+	$(KEYCHAIN_COMPOSE) --service tradingagents-ollama -- --profile ollama run --rm tradingagents-ollama
 
 docker-run-api: ## Run the API server in Docker (foreground, port 8000)
-	docker compose up tradingagents-api
+	$(KEYCHAIN_COMPOSE) --service tradingagents-api -- up tradingagents-api
 
 # ---------------------------------------------------------------------------
 # API server / CLI
 # ---------------------------------------------------------------------------
 
 api: ## Start the API server locally (0.0.0.0:8000)
-	$(PYTHON) run_server.py --host 0.0.0.0 --port 8000
+	$(KEYCHAIN_ENV) $(PYTHON) run_server.py --host 0.0.0.0 --port 8000
 
 api-reload: ## Start the API server locally with auto-reload
-	$(PYTHON) run_server.py --host 0.0.0.0 --port 8000 --reload
+	$(KEYCHAIN_ENV) $(PYTHON) run_server.py --host 0.0.0.0 --port 8000 --reload
 
 cli: ## Launch the interactive CLI
-	$(PYTHON) -m cli.main
+	$(KEYCHAIN_ENV) $(PYTHON) -m cli.main
+
+# ---------------------------------------------------------------------------
+# API keys in the OS keyring (pip install keyring; see scripts/keychain_env.py)
+# ---------------------------------------------------------------------------
+
+keychain-add: ## Store an API key in the OS keyring (VAR=ANTHROPIC_API_KEY; hidden prompt)
+	@test -n "$(VAR)" || { echo "usage: make keychain-add VAR=ANTHROPIC_API_KEY"; exit 2; }
+	@$(KEYCHAIN) add "$(VAR)"
+
+keychain-remove: ## Delete a stored API key (VAR=ANTHROPIC_API_KEY)
+	@test -n "$(VAR)" || { echo "usage: make keychain-remove VAR=ANTHROPIC_API_KEY"; exit 2; }
+	@$(KEYCHAIN) remove "$(VAR)"
+
+keychain-list: ## Show which API keys are stored in the OS keyring (no values)
+	@$(KEYCHAIN) list
 
 # ---------------------------------------------------------------------------
 # Testing

@@ -35,7 +35,8 @@ jobs:
           python -m pip install --upgrade pip
           # api extra (fastapi/uvicorn) is required too: tests/test_api_*.py
           # import tradingagents.api, which imports fastapi at module load time.
-          pip install -e ".[dev,api]"
+          # keyring: tests/test_api_keychain_env.py (scripts/keychain_env.py).
+          pip install -e ".[dev,api]" keyring
       - name: Run api test suite
         # Scoped to this fork's actual focus (the API layer). Same -k filter
         # as `invoke test-api` / `make test-api`.
