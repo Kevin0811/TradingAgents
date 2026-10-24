@@ -35,12 +35,34 @@ KEYCHAIN_ENV := $(KEYCHAIN) run --
 # `docker compose` plus a temporary override (names only, deleted afterwards)
 # passing into the service only the keys taken from the keyring; a key merely
 # set in the shell still comes from .env inside the container, as before.
-#   $(KEYCHAIN_COMPOSE) --service <svc> -- <docker compose args...>
+#   $(KEYCHAIN_COMPOSE) [--secrets] --service <svc> -- <docker compose args...>
+# Where the values end up:
+#   - API (docker-run-api*): with --secrets, as Compose secrets, i.e. files
+#     /run/secrets/<VAR> that Dockerfile.api's entrypoint
+#     (scripts/container_secrets.py) loads into the server's environment. They
+#     are not in the container config, so `docker inspect` does not show them.
+#   - CLI (docker-run, docker-run-ollama): as environment variables, since they
+#     run upstream's Dockerfile, which has no such entrypoint; `docker inspect`
+#     shows those values (Config.Env).
+# Either way, anyone who can `docker exec` into the container can still read
+# them (/run/secrets, the process environment): Docker access is root access.
+# Secrets are not hidden everywhere either:
+#   - Compose copies them into the container, so /run/secrets/* is in its
+#     writable layer: `docker diff` lists the files and `docker export` /
+#     `docker commit` include them, also while the container is stopped. They
+#     are gone only when the container is removed (`docker compose down`).
+#   - The files are mode 0444: any user inside the container can read them.
+#   - While `docker compose` runs, its process environment on the host holds
+#     the values, readable by the same user or root.
+# Once a key is in the keyring, remove it from .env: env_file still copies the
+# .env value into the container config (`docker inspect` shows it, whichever
+# value wins). `compose` warns, naming the keys, when .env still sets one.
 KEYCHAIN_COMPOSE := $(KEYCHAIN) compose
 
 .PHONY: help \
 	install install-api install-dev env \
 	docker-build docker-build-api docker-run docker-run-ollama docker-run-api \
+	docker-run-api-detached \
 	api api-reload cli \
 	keychain-add keychain-remove keychain-list \
 	test test-unit test-integration test-smoke test-api \
@@ -87,8 +109,29 @@ docker-run: ## Run the CLI in Docker (interactive)
 docker-run-ollama: ## Run the CLI in Docker with the Ollama profile
 	$(KEYCHAIN_COMPOSE) --service tradingagents-ollama -- --profile ollama run --rm tradingagents-ollama
 
-docker-run-api: ## Run the API server in Docker (foreground, port 8000)
-	$(KEYCHAIN_COMPOSE) --service tradingagents-api -- up tradingagents-api
+# --build: the image must contain the secrets entrypoint (an image built before
+# it would ignore /run/secrets); unchanged layers come from the build cache.
+# --force-recreate: Compose's config hash covers the secret's declaration, not
+# the value it takes from the environment, so without it `up` leaves a running
+# container as it is, and its /run/secrets and server keep the OLD key after
+# the key is rotated in the keyring. (A stopped one gets the current value
+# when `up` starts it again; recreating covers both.)
+docker-run-api: ## Run the API server in Docker (foreground, port 8000; keys as secrets)
+	$(KEYCHAIN_COMPOSE) --secrets --service tradingagents-api -- up --build --force-recreate tradingagents-api
+
+# Compose copies the secret files into the container, so deleting the temporary
+# override once `up -d` returns is fine: a plain `docker compose stop` / `start`
+# (without the override) keeps the copied files and their values. A compose
+# command that IS given the override (or an equivalent one), `start` included,
+# copies the values again from its own environment: run it through
+# $(KEYCHAIN_COMPOSE), or compose takes the key from .env (its interpolation
+# file) or, if .env lacks it, fails to start the container. Stop it with
+# `docker compose down`, which also deletes the copied secrets. A plain
+# `docker compose up` (without this target) sees a changed config and can
+# recreate the container without the keyring keys.
+# --force-recreate: see docker-run-api.
+docker-run-api-detached: ## Run the API server in Docker in the background (port 8000; keys as secrets)
+	$(KEYCHAIN_COMPOSE) --secrets --service tradingagents-api -- up -d --build --force-recreate tradingagents-api
 
 # ---------------------------------------------------------------------------
 # API server / CLI
