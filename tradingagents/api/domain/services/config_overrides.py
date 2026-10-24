@@ -9,10 +9,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from tradingagents.api.core.exceptions import InvalidRequestError
+from tradingagents.api.infrastructure.llm_provider import check_llm_config
+
 # CLI's own Shallow/Medium/Deep presets (cli/utils.py::select_research_depth).
 _RESEARCH_DEPTH_PRESETS = {"shallow": 1, "medium": 3, "deep": 5}
 
-_PASSTHROUGH_FIELDS = ("deep_think_llm", "quick_think_llm", "max_tokens", "llm_max_retries")
+_PASSTHROUGH_FIELDS = (
+    "deep_think_llm",
+    "quick_think_llm",
+    "deep_think_provider",
+    "quick_think_provider",
+    "anthropic_effort",
+    "max_tokens",
+    "llm_max_retries",
+)
 
 
 def resolve_overrides(request: Any) -> dict[str, Any]:
@@ -36,3 +47,16 @@ def resolve_overrides(request: Any) -> dict[str, Any]:
             overrides[field] = value
 
     return overrides
+
+
+def check_run_config(config: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Reject a run whose model settings would fail on every LLM call.
+
+    ``config`` is the server's, ``overrides`` what ``resolve_overrides`` built
+    for the request. Raised before the run is queued, so the caller gets a 400
+    instead of a task that fails midway.
+    """
+    try:
+        check_llm_config({**config, **overrides})
+    except ValueError as exc:
+        raise InvalidRequestError("Invalid LLM configuration", detail=str(exc)) from exc

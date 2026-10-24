@@ -25,6 +25,7 @@ from tradingagents.api.domain.services.symbol_settings import (
     SymbolSettings,
     validate_setting,
 )
+from tradingagents.api.infrastructure.llm_provider import check_llm_config
 from tradingagents.api.infrastructure.log_filters import install_cancel_log_filter
 from tradingagents.api.infrastructure.ollama_cache_trimmer import OllamaCacheTrimmer
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
@@ -121,6 +122,12 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     """
     config = ApiConfig(overrides)
     set_config(config)
+    try:
+        check_llm_config(config.config)
+    except ValueError as exc:
+        # Logged, not raised: the data and symbol endpoints need no LLM, and
+        # analysis requests are refused with this message (see check_run_config).
+        logger.error("LLM configuration will fail every analysis: %s", exc)
 
     # Import routers here to avoid circular imports
     from tradingagents.api.routers.analysts import router as analysts_router
