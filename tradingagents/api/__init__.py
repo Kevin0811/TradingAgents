@@ -142,6 +142,18 @@ Analysis tasks:
     LangChain's and the core's warnings about the cancel exception are
     filtered out; each cancelled task logs one INFO line.
 
+Token usage:
+    A task, once its run has ended, and the sync ``POST /analyze`` response
+    carry ``token_usage``: the run's LLM calls and input, output and prompt-
+    cache tokens per (tier, model), with totals, and ``partial: true`` when
+    the run failed or was cancelled (a failed sync run's 500 body carries it
+    too). The core gives both tiers one callback list, so the API tags each
+    tier's model with its tier after building the graph and a callback reads
+    the tag (``TokenUsageRecorder`` in ``infrastructure.llm_callbacks``). A
+    tier model wrapped by the core (a retry, binding or fallbacks wrapper) has
+    the model inside tagged; one that cannot be tagged is skipped with a
+    WARNING, and its calls are then counted nowhere.
+
 Local model (Ollama) cache trim:
     Ollama's MLX engine keeps a prompt-cache snapshot per request under a
     fixed 8 GiB budget (ollama/ollama#18131), so a model grows call by call.

@@ -14,6 +14,7 @@ from tradingagents.api.core.task_manager import (
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
+from tradingagents.api.schemas.token_usage import token_usage_model
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,11 @@ class TaskService:
     def _run_analysis_with_status_updates(
         self, task_id: str, request: TaskCreateRequest
     ) -> None:
-        """Run analysis and update the task record with the outcome."""
+        """Run analysis and update the task record with the outcome.
+
+        The run's token usage goes on the task however the run ends: from the
+        result, or from the ``AnalysisCancelled``/``AnalysisError`` it raised.
+        """
         # Backstop for a queued task whose Future could not be cancelled: a
         # task cancelled or deleted while it waited never starts.
         cancel_event = self._task_manager.start_task(task_id)
@@ -93,16 +98,18 @@ class TaskService:
                 task_id,
                 status=TaskStatus.COMPLETED,
                 result=result.to_dict(),
+                token_usage=token_usage_model(result.token_usage),
             )
             logger.info("Task %s completed successfully", task_id)
 
-        except AnalysisCancelled:
+        except AnalysisCancelled as e:
             # The one INFO line of a task cancelled while it ran.
             logger.info("Task %s cancelled while running; stopped at an LLM call", task_id)
             self._task_manager.update_task(
                 task_id,
                 status=TaskStatus.CANCELLED,
                 message=CANCELLED_WHILE_RUNNING,
+                token_usage=token_usage_model(e.token_usage),
             )
 
         except AnalysisError as e:
@@ -111,6 +118,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.FAILED,
                 error=str(e.detail) if e.detail else str(e),
+                token_usage=token_usage_model(e.token_usage),
             )
 
         except Exception as e:
@@ -162,3 +170,4 @@ class TaskService:
             True if task was deleted, False if not found.
         """
         return self._task_manager.delete_task(task_id)
+
