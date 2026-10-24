@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _SPEC = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
@@ -97,7 +97,7 @@ class RefreshWindow:
         """``now`` if inside the window, else the window's next start (UTC)."""
         now = _aware(now)
         if self.contains(now):
-            return now.astimezone(timezone.utc)
+            return now.astimezone(UTC)
         local = now.astimezone(self.tz)
         candidate = local.replace(
             hour=self.start.hour, minute=self.start.minute, second=0, microsecond=0
@@ -106,8 +106,8 @@ class RefreshWindow:
             candidate = (local + timedelta(days=1)).replace(
                 hour=self.start.hour, minute=self.start.minute, second=0, microsecond=0
             )
-        return candidate.astimezone(timezone.utc)
+        return candidate.astimezone(UTC)
 
 
 def _aware(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)

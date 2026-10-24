@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 
-class AssetType(str, Enum):
+class AssetType(StrEnum):
     """Supported asset types for analysis."""
 
     STOCK = "stock"
     CRYPTO = "crypto"
 
 
-class AnalystType(str, Enum):
+class AnalystType(StrEnum):
     """Available analyst agents.
 
     ``social`` is the core's key for the social-media sentiment analyst.
@@ -28,7 +28,7 @@ class AnalystType(str, Enum):
     FUNDAMENTALS = "fundamentals"
 
 
-class ReportType(str, Enum):
+class ReportType(StrEnum):
     """Type of fundamental data to retrieve."""
 
     ALL = "all"
@@ -38,14 +38,14 @@ class ReportType(str, Enum):
     INCOME_STATEMENT = "income_statement"
 
 
-class ReportFreq(str, Enum):
+class ReportFreq(StrEnum):
     """Reporting frequency for financial statements."""
 
     ANNUAL = "annual"
     QUARTERLY = "quarterly"
 
 
-class IndicatorName(str, Enum):
+class IndicatorName(StrEnum):
     """Technical indicator names accepted by the data vendors.
 
     These are the exact keys both vendor implementations key off — see
@@ -70,7 +70,7 @@ class IndicatorName(str, Enum):
     MFI = "mfi"  # yfinance only
 
 
-class SymbolMarket(str, Enum):
+class SymbolMarket(StrEnum):
     """Markets covered by the supported-symbols list."""
 
     TW = "tw"
@@ -80,7 +80,7 @@ class SymbolMarket(str, Enum):
     FX = "fx"
 
 
-class SymbolType(str, Enum):
+class SymbolType(StrEnum):
     """Instrument types on the supported-symbols list."""
 
     EQUITY = "equity"
@@ -89,7 +89,7 @@ class SymbolType(str, Enum):
     CURRENCY = "currency"
 
 
-class SymbolListStatus(str, Enum):
+class SymbolListStatus(StrEnum):
     """Load state of one market's supported-symbols list."""
 
     READY = "ready"  # list loaded (it may still be stale; see ``stale``)

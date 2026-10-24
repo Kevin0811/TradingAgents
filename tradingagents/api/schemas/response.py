@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -22,7 +22,7 @@ from tradingagents.agents.schemas import SentimentReport, TraderProposal
 # rating out of the rendered markdown, so it needs its own, API-only enum.
 
 
-class ResearchPlanRecommendation(str, Enum):
+class ResearchPlanRecommendation(StrEnum):
     """5-tier recommendation plus REVIEW when it could not be parsed from the report."""
 
     BUY = "Buy"
@@ -33,7 +33,7 @@ class ResearchPlanRecommendation(str, Enum):
     REVIEW = "REVIEW"
 
 
-class PortfolioDecisionRating(str, Enum):
+class PortfolioDecisionRating(StrEnum):
     """5-tier rating plus REVIEW when it could not be parsed from the report."""
 
     BUY = "Buy"
