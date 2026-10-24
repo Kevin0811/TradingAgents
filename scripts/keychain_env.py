@@ -34,6 +34,8 @@ Environment:
   TRADINGAGENTS_KEYCHAIN_VARS    extra key names to look up, space-separated
   TRADINGAGENTS_KEYCHAIN_QUIET   "1" silences the hints `run`/`compose` print
                                  when they fall back to .env only
+  TRADINGAGENTS_DOTENV_PATH      the .env `compose` checks for leftover copies
+                                 of keyring keys (default: .env at the repo root)
 
 Standalone on purpose: stdlib plus the optional `keyring` package, and no
 import of `tradingagents`, so it works before the package is installed.
@@ -58,7 +60,13 @@ EXPORTED_VAR = "TRADINGAGENTS_KEYCHAIN_EXPORTED"
 QUIET_VAR = "TRADINGAGENTS_KEYCHAIN_QUIET"
 EXTRA_VARS = ("AZURE_OPENAI_API_KEY", "ALPHA_VANTAGE_API_KEY")
 VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
-SERVICE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# A compose service name that is also safe as a plain YAML mapping key.
+SERVICE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+# YAML 1.1 booleans/null: as a mapping key they would not be the service name.
+RESERVED_SERVICES = frozenset({"true", "false", "null", "yes", "no", "on", "off"})
+DOTENV_VAR = "TRADINGAGENTS_DOTENV_PATH"
+# A `NAME=` assignment in .env (names only; the value is never captured).
+DOTENV_NAME_RE = re.compile(r"^\s*(export\s+)?([A-Z][A-Z0-9_]*)\s*=")
 # Secret-looking names in .env.example, also commented out (`#FOO_KEY=`,
 # `  ## FOO_KEY=`) or after `export`.
 EXAMPLE_RE = re.compile(r"^\s*#*\s*(export\s+)?([A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET)[A-Z0-9_]*)=")
@@ -314,6 +322,38 @@ def cmd_run(args: list[str]) -> None:
         sys.exit(126)
 
 
+def is_service(name: str) -> bool:
+    return bool(SERVICE_RE.match(name)) and name.lower() not in RESERVED_SERVICES
+
+
+def dotenv_names() -> set[str]:
+    """Names assigned in the repo's .env (never values); empty if it is unreadable."""
+    path = Path(os.environ.get(DOTENV_VAR) or ROOT / ".env")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):  # missing, a directory, unreadable, ...
+        return set()
+    names = set()
+    for line in text.splitlines():
+        m = DOTENV_NAME_RE.match(line)
+        if m:
+            names.add(m.group(2))
+    return names
+
+
+def warn_dotenv_copies(names: list[str]) -> None:
+    """One warning naming the keyring keys that .env still sets as well.
+
+    The service's env_file puts every .env line into the container config, so
+    that copy stays visible in `docker inspect` whatever the keyring passes in.
+    """
+    both = sorted(set(names) & dotenv_names())
+    if both:
+        verb = "is" if len(both) == 1 else "are"
+        err(f"{', '.join(both)} {verb} also set in .env; that copy stays visible in "
+            "docker inspect (Config.Env) - remove it from .env")
+
+
 def secret_name(var: str) -> str:
     """The top-level Compose secret name for `var` (validated by the caller)."""
     return f"tradingagents_{var.lower()}"
@@ -382,6 +422,10 @@ def cmd_compose(args: list[str]) -> None:
 
     `--secrets` passes them as Compose secrets instead of environment variables
     (see compose_override); the image must load /run/secrets itself.
+
+    In both modes, a key that the repo's .env also sets is reported (names
+    only): the keyring value wins in the container, but env_file still copies
+    the .env value into the container config.
     """
     services: list[str] = []
     secrets = False
@@ -390,7 +434,7 @@ def cmd_compose(args: list[str]) -> None:
         if args[i] == "--secrets":
             secrets = True
             i += 1
-        elif args[i] == "--service" and i + 1 < len(args) and SERVICE_RE.match(args[i + 1]):
+        elif args[i] == "--service" and i + 1 < len(args) and is_service(args[i + 1]):
             services.append(args[i + 1])
             i += 2
         else:
@@ -403,6 +447,7 @@ def cmd_compose(args: list[str]) -> None:
     names = sorted(
         {n for n in env.get(EXPORTED_VAR, "").split() if is_var(n) and env.get(n)}
     )
+    warn_dotenv_copies(names)
     fd, path = tempfile.mkstemp(suffix=".yml")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

@@ -10,6 +10,8 @@ from __future__ import annotations
 import ast
 import importlib.util
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -271,3 +273,154 @@ def test_api_secrets_dockerfile_uses_entrypoint():
     assert 'CMD ["python", "run_server.py", "--host", "0.0.0.0", "--port", "8000"]' in text
     dockerignore = (REPO / ".dockerignore").read_text().split()
     assert "scripts" not in dockerignore and "scripts/" not in dockerignore
+
+
+# ---- symlinks and special files (never followed or read) ----------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need POSIX")
+def test_api_secrets_symlink_to_outside_file_skipped(h, tmp_path, monkeypatch):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("dummy-outside-value\n")
+    h.values.append("dummy-outside-value")
+    monkeypatch.setenv("OPENAI_API_KEY", "from-dotenv")
+    (h.dir / "OPENAI_API_KEY").symlink_to(outside)
+    h.put("ANTHROPIC_API_KEY", "dummy-regular")
+    child, _, cap = h.main("true")
+    assert child.env["OPENAI_API_KEY"] == "from-dotenv"
+    assert child.env["ANTHROPIC_API_KEY"] == "dummy-regular"
+    assert cap.err == "container-secrets: skipping OPENAI_API_KEY: not a regular file\n"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_api_secrets_symlink_to_fifo_skipped(h, tmp_path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    (h.dir / "OTHER_KEY").symlink_to(fifo)
+    child, _, cap = h.main("true")  # would block forever if the FIFO were opened
+    assert "OTHER_KEY" not in child.env
+    assert "skipping OTHER_KEY: not a regular file" in cap.err
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs mkfifo")
+def test_api_secrets_fifo_swapped_in_is_not_read(tmp_path):
+    # A FIFO that replaces the file between the scan and the open: O_NONBLOCK
+    # keeps the open from blocking and fstat rejects it. In a subprocess, so a
+    # regression fails on the timeout instead of hanging the test run.
+    fifo = tmp_path / "OTHER_KEY"
+    os.mkfifo(fifo)
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('cs', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "print(m.read_secret(sys.argv[1], 'OTHER_KEY'))\n"
+    )
+    res = subprocess.run([sys.executable, "-c", code, str(fifo)],
+                         capture_output=True, text=True, timeout=15)
+    assert res.stdout == "None\n"
+    assert "skipping OTHER_KEY: not a regular file" in res.stderr
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="needs O_NOFOLLOW")
+def test_api_secrets_symlink_swapped_in_is_not_followed(h, tmp_path):
+    # A symlink that replaces the file after the scan: the open itself refuses it.
+    outside = tmp_path / "outside.txt"
+    outside.write_text("dummy-outside-value")
+    (h.dir / "OTHER_KEY").symlink_to(outside)
+    assert h.mod.read_secret(str(h.dir / "OTHER_KEY"), "OTHER_KEY") is None
+    err = h.capsys.readouterr().err
+    assert "skipping OTHER_KEY: cannot read it" in err
+    assert "dummy-outside-value" not in err
+
+
+# ---- name policy ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", [
+    "PATH", "HOME", "SHELL", "USER", "PWD", "IFS", "PYTHONPATH", "PYTHONSTARTUP",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "TRADINGAGENTS_SECRETS_DIR",
+    # Reserved even though they look like secrets:
+    "PYTHON_KEYRING_BACKEND", "LD_SECRET_KEY", "SSL_CERT_PASSWORD",
+])
+def test_api_secrets_reserved_name_rejected(h, monkeypatch, name):
+    before = os.environ.get(name)
+    h.put(name, "dummy-reserved-value")
+    child, _, cap = h.main("true")
+    assert child.env.get(name) == before
+    assert cap.err == f"container-secrets: skipping {name!r}: reserved variable name\n"
+
+
+@pytest.mark.parametrize("name", ["FOO", "DEBUG", "OPENAI_BASE_URL", "TRADINGAGENTS_LLM_PROVIDER"])
+def test_api_secrets_non_secret_name_rejected(h, monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    h.put(name, "dummy-plain-value")
+    child, _, cap = h.main("true")
+    assert name not in child.env
+    assert cap.err.count("\n") == 1
+    assert f"skipping {name!r}: not a secret name" in cap.err
+
+
+@pytest.mark.parametrize("name", ["DB_PASSWORD", "SMTP_PASS", "CLIENT_SECRET", "GH_TOKEN"])
+def test_api_secrets_secret_markers_accepted(h, monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    h.put(name, "dummy-accepted")
+    child, _, cap = h.main("true")
+    assert child.env[name] == "dummy-accepted"
+    assert cap.err == ""
+
+
+def test_api_secrets_every_keychain_key_name_is_accepted(monkeypatch):
+    # keychain_env.py turns these names (from the repo's .env.example) into
+    # secrets; container_secrets.py must load every one of them.
+    spec = importlib.util.spec_from_file_location(
+        "keychain_env_for_names", REPO / "scripts" / "keychain_env.py")
+    keychain = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(keychain)
+    monkeypatch.delenv("TRADINGAGENTS_KEYCHAIN_VARS", raising=False)
+    names = keychain.key_vars()
+    assert {"OPENAI_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "OPENAI_COMPATIBLE_API_KEY"} <= set(names)
+    mod = load_script()
+    assert {n: mod.name_problem(n) for n in names} == dict.fromkeys(names)
+
+
+# ---- Makefile ---------------------------------------------------------------------
+
+API_TARGETS = ("docker-run-api", "docker-run-api-detached")
+
+
+def makefile_recipes(text):
+    """{target: [recipe lines]} for plain `target: ...` rules of a Makefile."""
+    recipes, current = {}, None
+    for line in text.splitlines():
+        if line.startswith("\t") and current:
+            recipes[current].append(line.strip())
+            continue
+        m = re.match(r"^([A-Za-z0-9_.-]+)\s*:(?!=)", line)
+        current = m.group(1) if m else None
+        if current:
+            recipes[current] = []
+    return recipes
+
+
+@pytest.mark.parametrize("target", API_TARGETS)
+def test_api_secrets_makefile_api_targets_force_recreate(target):
+    # Compose does not hash secret values: without --force-recreate, `up` keeps
+    # the existing container and its old key after a keyring rotation.
+    recipe = makefile_recipes((REPO / "Makefile").read_text())[target]
+    assert recipe, target
+    line = " ".join(recipe)
+    assert "--secrets" in line
+    assert re.search(r"\bup\b.*\s--force-recreate\b", line), line
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="needs make")
+def test_api_secrets_make_dry_run_force_recreate():
+    res = subprocess.run(
+        ["make", "-n", "-C", str(REPO), *API_TARGETS],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode == 0, res.stderr
+    lines = [ln for ln in res.stdout.splitlines() if "compose" in ln]
+    assert len(lines) == 2, res.stdout
+    assert all(" up " in ln and "--force-recreate" in ln for ln in lines), lines

@@ -315,6 +315,24 @@ def test_api_keychain_usage_errors_exit_2(h):
         assert res.child is None
 
 
+@pytest.mark.parametrize("name", [
+    "true", "false", "null", "yes", "no", "on", "off", "TRUE", "Yes", "Off", "NULL",
+    "-api", ".api", "1api", "api:x", "a b", "api#", "",
+])
+def test_api_keychain_compose_rejects_unsafe_service_names(h, name):
+    res = h.main("compose", "--service", name, "--", "up")
+    assert res.code == 2, name
+    assert "usage:" in res.err
+    assert res.child is None
+
+
+@pytest.mark.parametrize("name", ["api", "_api", "tradingagents-api", "a.b_c-1", "On2", "nope"])
+def test_api_keychain_compose_accepts_service_names(h, name):
+    res = h.main("compose", "--service", name, "--", "up")
+    assert res.code == 0, res.err
+    assert res.child.override == f"services:\n  {name}: {{}}\n"
+
+
 # ---- list / add / remove ------------------------------------------------------
 
 
@@ -402,6 +420,103 @@ def test_api_keychain_compose_lists_only_keyring_exports(h, store, monkeypatch):
     assert Path(child.cwd) == h.root
     assert child.env["OPENAI_API_KEY"] == "sk-fake-openai"
     assert not Path(child.override_path).exists()
+
+
+# ---- .env copies of keyring keys ------------------------------------------------
+
+DOTENV = "TRADINGAGENTS_DOTENV_PATH"
+DOTENV_TEXT = (
+    "# comment OPENAI_API_KEY=dummy-dotenv-commented\n"
+    "OPENAI_API_KEY=dummy-dotenv-openai\n"
+    "  export ANTHROPIC_API_KEY = dummy-dotenv-anthropic\n"
+    "GOOGLE_API_KEY=dummy-dotenv-google\n"
+    "lower_key=dummy-dotenv-lower\n"
+)
+DOTENV_VALUES = ("dummy-dotenv-commented", "dummy-dotenv-openai",
+                 "dummy-dotenv-anthropic", "dummy-dotenv-google", "dummy-dotenv-lower")
+
+
+def keyring_exports(h, monkeypatch, **values):
+    """As if an outer `run` had exported these from the keyring (no keyring here)."""
+    monkeypatch.setenv("TRADINGAGENTS_KEYCHAIN_QUIET", "1")
+    for name, value in values.items():
+        monkeypatch.setenv(name, h.secret(value))
+    monkeypatch.setenv(EXPORTED, " ".join(values))
+
+
+def dotenv(h, monkeypatch, tmp_path, text=DOTENV_TEXT):
+    path = tmp_path / "dummy.env"
+    path.write_text(text)
+    for value in DOTENV_VALUES:
+        h.secret(value)  # Harness.main asserts none of these is ever printed
+    monkeypatch.setenv(DOTENV, str(path))
+    return path
+
+
+@pytest.mark.parametrize("secrets", [[], ["--secrets"]])
+def test_api_keychain_compose_warns_about_dotenv_copies(h, monkeypatch, tmp_path, secrets):
+    keyring_exports(h, monkeypatch, OPENAI_API_KEY="dummy-kr-openai",
+                    ANTHROPIC_API_KEY="dummy-kr-anthropic", XAI_API_KEY="dummy-kr-xai")
+    dotenv(h, monkeypatch, tmp_path)
+    res = h.main("compose", *secrets, "--service", "api", "--", "up")
+    assert res.code == 0
+    assert res.err == (
+        "keychain-env: ANTHROPIC_API_KEY, OPENAI_API_KEY are also set in .env; that copy "
+        "stays visible in docker inspect (Config.Env) - remove it from .env\n"
+    )
+    # Only keyring exports are named: GOOGLE_API_KEY is only in .env.
+    assert "GOOGLE" not in res.err and "XAI" not in res.err
+    for value in DOTENV_VALUES:
+        assert value not in res.output
+        assert value not in res.child.override
+    # The keyring value is what compose passes on.
+    assert res.child.env["OPENAI_API_KEY"] == "dummy-kr-openai"
+
+
+def test_api_keychain_compose_dotenv_single_key_wording(h, monkeypatch, tmp_path):
+    keyring_exports(h, monkeypatch, ANTHROPIC_API_KEY="dummy-kr-anthropic")
+    dotenv(h, monkeypatch, tmp_path)
+    res = h.main("compose", "--secrets", "--service", "api", "--", "up")
+    assert res.err.startswith("keychain-env: ANTHROPIC_API_KEY is also set in .env;")
+    assert res.err.count("\n") == 1
+
+
+def test_api_keychain_compose_no_warning_without_overlap(h, monkeypatch, tmp_path):
+    keyring_exports(h, monkeypatch, XAI_API_KEY="dummy-kr-xai")
+    dotenv(h, monkeypatch, tmp_path)
+    res = h.main("compose", "--secrets", "--service", "api", "--", "up")
+    assert res.code == 0
+    assert res.err == ""
+
+
+@pytest.mark.parametrize("how", ["missing", "directory", "unreadable"])
+def test_api_keychain_compose_no_warning_without_readable_dotenv(h, monkeypatch, tmp_path, how):
+    keyring_exports(h, monkeypatch, OPENAI_API_KEY="dummy-kr-openai")
+    if how == "missing":
+        monkeypatch.setenv(DOTENV, str(tmp_path / "nope.env"))
+    elif how == "directory":
+        monkeypatch.setenv(DOTENV, str(tmp_path))
+    else:
+        path = dotenv(h, monkeypatch, tmp_path)
+        real_read = Path.read_text
+
+        def deny(self, *a, **kw):
+            if self == path:
+                raise PermissionError(13, "Permission denied")
+            return real_read(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", deny)
+    res = h.main("compose", "--service", "api", "--", "up")
+    assert res.code == 0
+    assert res.err == ""
+
+
+def test_api_keychain_compose_dotenv_defaults_to_repo_root(h, monkeypatch):
+    keyring_exports(h, monkeypatch, OPENAI_API_KEY="dummy-kr-openai")
+    (h.root / ".env").write_text("OPENAI_API_KEY=dummy-dotenv-openai\n")
+    h.secret("dummy-dotenv-openai")
+    res = h.main("compose", "--service", "api", "--", "up")
+    assert res.err.startswith("keychain-env: OPENAI_API_KEY is also set in .env;")
 
 
 def test_api_keychain_compose_empty_override_and_global_flags(h, monkeypatch):
