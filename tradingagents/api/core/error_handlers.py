@@ -42,10 +42,11 @@ async def trading_agents_api_error_handler(
         request.url.path,
     )
 
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": exc.message, "detail": exc.detail},
-    )
+    content = {"error": exc.message, "detail": exc.detail}
+    if isinstance(exc, AnalysisError) and exc.token_usage is not None:
+        # A failed sync run's usage so far (partial: true), as the field reports it.
+        content["token_usage"] = exc.token_usage
+    return JSONResponse(status_code=status_code, content=content)
 
 
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:

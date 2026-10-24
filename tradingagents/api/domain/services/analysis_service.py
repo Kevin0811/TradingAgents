@@ -11,14 +11,19 @@ from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
 from tradingagents.api.domain.services.config_overrides import CLEARED_KEYS
 from tradingagents.api.infrastructure.llm_callbacks import (
+    TIER_METADATA_KEY,
+    TIERS,
     CancelOnLLMStart,
     OllamaCacheTrimHandler,
+    TokenUsageRecorder,
 )
 from tradingagents.api.infrastructure.ollama_cache_trimmer import (
     OllamaCacheTrimmer,
     ollama_native_url,
 )
+from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.trading_graph import TradingAgentsGraph
+from tradingagents.llm_clients import tier_provider
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +86,16 @@ class AnalysisService:
                 same; it cannot undo that write (the core is not edited here).
 
         Returns:
-            AnalysisResult with all reports and decisions.
+            AnalysisResult with all reports and decisions, and the run's token
+            usage.
 
         Raises:
             AnalysisCancelled: ``cancel_event`` was set before the run ended.
             AnalysisError: If the analysis fails.
+            Either carries the run's token usage so far in ``token_usage``
+            (``partial`` true).
         """
+        usage: TokenUsageRecorder | None = None
         try:
             effective_config = self._config
             if overrides:
@@ -96,13 +105,16 @@ class AnalysisService:
                 if clean_overrides:
                     effective_config = {**(self._config or {}), **clean_overrides}
 
+            # The config the core runs on: it falls back the same way.
+            usage = TokenUsageRecorder(_tier_models(effective_config or DEFAULT_CONFIG))
             graph = TradingAgentsGraph(
                 # API names ('sentiment') -> the core's keys ('social').
                 selected_analysts=to_core_analyst_keys(selected_analysts),
                 debug=self._debug,
                 config=effective_config,
-                callbacks=self._callbacks(effective_config, cancel_event) or None,
+                callbacks=self._callbacks(effective_config, cancel_event, usage),
             )
+            _tag_tiers(graph)
 
             final_state, signal = graph.propagate(ticker, trade_date, asset_type=asset_type)
             if cancel_event is not None and cancel_event.is_set():
@@ -121,23 +133,31 @@ class AnalysisService:
                 trader_investment_plan=final_state.get("trader_investment_plan"),
                 final_trade_decision=final_state.get("final_trade_decision"),
                 signal=signal,
+                token_usage=usage.summary(partial=False),
             )
 
         except Exception as e:
+            # The calls made before it stopped (an analyst still running in
+            # another thread may add more, too late for this snapshot).
+            token_usage = usage.summary(partial=True) if usage is not None else None
             if cancel_event is not None and cancel_event.is_set():
                 # Whatever the core made of the cancel exception on its way up
                 # (re-raised, wrapped, or a later error), the run was cancelled.
                 # The caller logs the one INFO line per cancelled run.
                 logger.debug("Analysis of %s on %s cancelled", ticker, trade_date)
-                raise AnalysisCancelled("analysis cancelled") from e
+                raise AnalysisCancelled("analysis cancelled", token_usage=token_usage) from e
             logger.exception("Analysis failed for %s on %s", ticker, trade_date)
             raise AnalysisError(
                 message=f"Analysis failed for {ticker} on {trade_date}",
                 detail=str(e),
+                token_usage=token_usage,
             ) from e
 
     def _callbacks(
-        self, config: dict[str, Any] | None, cancel_event: threading.Event | None
+        self,
+        config: dict[str, Any] | None,
+        cancel_event: threading.Event | None,
+        usage: TokenUsageRecorder,
     ) -> list:
         """The LLM callback handlers for one run (the core attaches them to every LLM)."""
         callbacks: list = []
@@ -157,4 +177,37 @@ class AnalysisService:
                     [m for m in models if m],
                 )
             )
+        # Last, so a call the cancel handler refuses to start is never counted.
+        callbacks.append(usage)
         return callbacks
+
+
+def _tier_models(config: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """Each tier's (provider, configured model) in ``config``, for the usage report."""
+    return {
+        tier: (
+            tier_provider(config, tier) if config.get("llm_provider") else "",
+            str(config.get(f"{tier}_think_llm") or ""),
+        )
+        for tier in TIERS
+    }
+
+
+def _tag_tiers(graph: Any) -> None:
+    """Tag each tier's model with its tier, for :class:`TokenUsageRecorder`.
+
+    The core builds one model object per tier and hands that same object to
+    every agent (bound runnables wrap it, they do not copy it), so its metadata,
+    set here after construction, reaches the callbacks of each of its calls.
+    Existing metadata is kept.
+    """
+    for tier in TIERS:
+        llm = getattr(graph, f"{tier}_thinking_llm", None)
+        if llm is None:
+            # Only a stand-in graph lacks one; a core that renamed these is
+            # caught by test_api_token_usage, which builds the real graph.
+            logger.debug("No %s-tier model on the graph; its token usage is not counted", tier)
+            continue
+        metadata = getattr(llm, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        llm.metadata = {**metadata, TIER_METADATA_KEY: tier}
