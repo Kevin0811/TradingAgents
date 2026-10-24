@@ -40,7 +40,11 @@ jobs:
       - name: Run api test suite
         # Scoped to this fork's actual focus (the API layer). Same -k filter
         # as `invoke test-api` / `make test-api`.
-        run: pytest -q -k test_api
+        # A hung test fails the job instead of leaving it in progress: pytest
+        # dumps every thread's stack after 120s in one test, and the step is
+        # killed after 15 minutes (the suite itself takes well under a minute).
+        timeout-minutes: 15
+        run: pytest -q -k test_api -o faulthandler_timeout=120
 
   smoke-install:
     name: clean-install smoke
