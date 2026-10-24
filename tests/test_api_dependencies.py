@@ -20,7 +20,7 @@ from tradingagents.api.dependencies import get_llm_factory
 @pytest.mark.asyncio
 async def test_get_llm_factory_honors_config_overrides():
     with patch(
-        "tradingagents.api.infrastructure.llm_provider.create_llm_client"
+        "tradingagents.llm_clients.factory.create_llm_client"
     ) as mock_create:
         mock_client = MagicMock()
         mock_client.get_llm.return_value = MagicMock()
