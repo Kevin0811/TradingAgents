@@ -39,7 +39,7 @@ from tradingagents.api.domain.vendor_reports import (
 from tradingagents.dataflows.errors import (
     NoMarketDataError,
     VendorNotConfiguredError,
-    VendorRateLimitError,
+    VendorUnavailableError,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,7 @@ class MarketDataService:
             result = tool.invoke(payload)
         except NoMarketDataError as exc:
             raise DataNotFoundError("No market data available", detail=str(exc)) from exc
-        except (VendorNotConfiguredError, VendorRateLimitError) as exc:
+        except (VendorNotConfiguredError, VendorUnavailableError) as exc:
             # A server-side vendor problem, not something the caller can fix.
             # Checked before ValueError: VendorNotConfiguredError is also one.
             raise ExternalServiceError("Data vendor unavailable", detail=str(exc)) from exc

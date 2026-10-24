@@ -25,7 +25,7 @@ from tradingagents.api.domain.vendor_reports import NO_DATA_SENTINEL, UNAVAILABL
 from tradingagents.dataflows.errors import (
     NoMarketDataError,
     VendorNotConfiguredError,
-    VendorRateLimitError,
+    VendorUnavailableError,
 )
 
 TOOL_PATH = "tradingagents.api.domain.services.market_data_service"
@@ -196,8 +196,8 @@ class TestStockDataEndpoint:
         assert resp.status_code == 404
         assert "NOPE" in resp.json()["detail"]
 
-    def test_rate_limited_vendor_returns_503(self, client):
-        tool = _FakeTool(error=VendorRateLimitError("throttled"))
+    def test_unavailable_vendor_returns_503(self, client):
+        tool = _FakeTool(error=VendorUnavailableError("throttled"))
         with _patch("get_stock_data", tool):
             resp = client.get(
                 "/api/v1/data/stock/AAPL", params={"trade_date": "2026-08-01"}

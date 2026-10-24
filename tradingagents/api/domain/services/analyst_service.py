@@ -115,7 +115,7 @@ class AnalystService:
         )
 
         identity = resolve_instrument_identity(ticker)
-        instrument_context = build_instrument_context(ticker, asset_type, identity)
+        instrument_context = build_instrument_context(ticker, asset_type, identity, trade_date)
 
         tools = [get_stock_data, get_indicators, get_verified_market_snapshot]
 
@@ -155,10 +155,8 @@ class AnalystService:
             config=self._config,
         )
 
-        identity = resolve_instrument_identity(ticker)
-        instrument_context = build_instrument_context(ticker, asset_type, identity)
-
-        init_state = self._create_init_state(ticker, trade_date, asset_type, instrument_context)
+        # The core's own run-start state, so it tracks upstream's state schema.
+        init_state = graph.create_run_state(ticker, trade_date, asset_type=asset_type)
         final_state = graph.graph.invoke(init_state)
 
         # Map analyst type to state key
@@ -171,47 +169,3 @@ class AnalystService:
         key = state_key_map.get(analyst_type, "")
         return final_state.get(key, "")
 
-    def _create_init_state(
-        self,
-        ticker: str,
-        trade_date: str,
-        asset_type: str,
-        instrument_context: str,
-    ) -> dict[str, Any]:
-        """Create initial state for graph execution."""
-        return {
-            "messages": [],
-            "company_of_interest": ticker,
-            "asset_type": asset_type,
-            "instrument_context": instrument_context,
-            "trade_date": trade_date,
-            "sender": "user",
-            "market_report": "",
-            "sentiment_report": "",
-            "news_report": "",
-            "fundamentals_report": "",
-            "investment_debate_state": {
-                "bull_history": "",
-                "bear_history": "",
-                "history": "",
-                "current_response": "",
-                "judge_decision": "",
-                "count": 0,
-            },
-            "investment_plan": "",
-            "trader_investment_plan": "",
-            "risk_debate_state": {
-                "aggressive_history": "",
-                "conservative_history": "",
-                "neutral_history": "",
-                "history": "",
-                "latest_speaker": "",
-                "current_aggressive_response": "",
-                "current_conservative_response": "",
-                "current_neutral_response": "",
-                "judge_decision": "",
-                "count": 0,
-            },
-            "final_trade_decision": "",
-            "past_context": "",
-        }
