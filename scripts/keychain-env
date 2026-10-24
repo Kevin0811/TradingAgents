@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Keep API keys in the macOS Keychain instead of .env.
+#
+#   scripts/keychain-env run <command> [args...]   run with stored keys exported
+#   scripts/keychain-env add <VAR>                 store a key (hidden prompt)
+#   scripts/keychain-env remove <VAR>              delete a stored key
+#   scripts/keychain-env list                      which keys are stored (no values)
+#   scripts/keychain-env compose-override <svc>    compose override passing the
+#                                                  exported keys into <svc>
+#
+# Each key is a generic-password item whose service is "tradingagents.<VAR>",
+# under the current user. `run` exports only the keys that have an item and are
+# not already set, so .env still supplies the rest: python-dotenv never
+# overrides a variable that is already set, and an empty export would count as
+# set. Without the `security` tool (not macOS) `run` just runs the command.
+set -euo pipefail
+
+PREFIX="${TRADINGAGENTS_KEYCHAIN_PREFIX:-tradingagents.}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+  exit 2
+}
+
+has_keychain() { command -v security >/dev/null 2>&1; }
+
+# Secret-looking names from .env.example, so keys upstream adds are covered,
+# plus a few read from the environment but not listed there, plus any named in
+# TRADINGAGENTS_KEYCHAIN_VARS (space-separated).
+key_vars() {
+  {
+    if [[ -f "$ROOT/.env.example" ]]; then
+      sed -nE 's/^#?[[:space:]]*([A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET)[A-Z0-9_]*)=.*/\1/p' \
+        "$ROOT/.env.example" | grep -v '^TRADINGAGENTS_' || true
+    fi
+    printf '%s\n' AZURE_OPENAI_API_KEY ALPHA_VANTAGE_API_KEY
+    for var in ${TRADINGAGENTS_KEYCHAIN_VARS:-}; do printf '%s\n' "$var"; done
+  } | sort -u
+}
+
+check_var() {
+  [[ "${1:-}" =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo "keychain-env: not a variable name: '${1:-}'" >&2; exit 2; }
+}
+
+lookup() { security find-generic-password -a "$USER" -s "$PREFIX$1" -w 2>/dev/null; }
+
+cmd_run() {
+  [[ $# -gt 0 ]] || usage
+  if has_keychain; then
+    local var value
+    while read -r var; do
+      [[ -n "${!var:-}" ]] && continue
+      if value="$(lookup "$var")" && [[ -n "$value" ]]; then
+        export "$var=$value"
+      fi
+    done < <(key_vars)
+  fi
+  exec "$@"
+}
+
+cmd_add() {
+  check_var "${1:-}"
+  has_keychain || { echo "keychain-env: the macOS 'security' tool is not available" >&2; exit 1; }
+  # -w as the last option makes security prompt, so the key never reaches
+  # argv or the shell history. -U replaces an existing item.
+  security add-generic-password -U -a "$USER" -s "$PREFIX$1" -l "TradingAgents $1" -w
+  echo "Stored $1 as Keychain item '$PREFIX$1'."
+}
+
+cmd_remove() {
+  check_var "${1:-}"
+  security delete-generic-password -a "$USER" -s "$PREFIX$1" >/dev/null
+  echo "Removed Keychain item '$PREFIX$1'."
+}
+
+cmd_list() {
+  has_keychain || { echo "keychain-env: the macOS 'security' tool is not available" >&2; exit 1; }
+  local var
+  while read -r var; do
+    # Without -w, find prints only the item's attributes; discard them anyway.
+    if security find-generic-password -a "$USER" -s "$PREFIX$var" >/dev/null 2>&1; then
+      printf '  stored   %s\n' "$var"
+    else
+      printf '  -        %s\n' "$var"
+    fi
+  done < <(key_vars)
+}
+
+# A compose override that passes the keys set in this environment into one
+# service. Names only, no values: compose reads the values from the shell. A key
+# that is not set is left out, so the service's env_file (.env) still supplies it.
+cmd_compose_override() {
+  local service="${1:-}" var found=()
+  [[ "$service" =~ ^[A-Za-z0-9_.-]+$ ]] || usage
+  while read -r var; do
+    [[ -n "${!var:-}" ]] && found+=("$var")
+  done < <(key_vars)
+  if [[ ${#found[@]} -eq 0 ]]; then
+    printf 'services:\n  %s: {}\n' "$service"
+    return
+  fi
+  printf 'services:\n  %s:\n    environment:\n' "$service"
+  printf '      - %s\n' "${found[@]}"
+}
+
+case "${1:-}" in
+  run) shift; cmd_run "$@" ;;
+  add) shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  list) shift; cmd_list ;;
+  compose-override) shift; cmd_compose_override "$@" ;;
+  *) usage ;;
+esac

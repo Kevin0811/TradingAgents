@@ -74,6 +74,15 @@ def env(c, enterprise=False):
     print(f"Created {dst}")
 
 
+def with_keys(cmd):
+    """Prefix ``cmd`` so API keys stored in the macOS Keychain reach it.
+
+    See scripts/keychain-env: only stored keys are exported, .env supplies the
+    rest. Windows has no Keychain or bash, so the command runs as is there.
+    """
+    return cmd if os.name == "nt" else f"scripts/keychain-env run {cmd}"
+
+
 # ---------------------------------------------------------------------------
 # API Server
 # ---------------------------------------------------------------------------
@@ -92,7 +101,7 @@ def api(c, host="0.0.0.0", port=8000, reload=False, r=False):
     cmd = f"python run_server.py --host {host} --port {port} {reload_flag}".strip()
     print(f"Starting API server: {host}:{port}")
     print(f"Docs: http://localhost:{port}/api/v1/docs")
-    c.run(cmd)
+    c.run(with_keys(cmd))
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +112,7 @@ def api(c, host="0.0.0.0", port=8000, reload=False, r=False):
 @task
 def cli(c):
     """Launch the interactive CLI."""
-    c.run("python -m cli.main")
+    c.run(with_keys("python -m cli.main"))
 
 
 @task(
@@ -127,7 +136,7 @@ def analyze(c, ticker=None, date=None, checkpoint=False, clear_checkpoints=False
         flags += f" --date {date}"
     cmd = f"tradingagents analyze{flags}"
     print(f"Running: {cmd}")
-    c.run(cmd.strip())
+    c.run(with_keys(cmd.strip()))
 
 
 # ---------------------------------------------------------------------------

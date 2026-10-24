@@ -10,16 +10,26 @@
 #   make docker-build    # build the CLI image
 #   make api             # run the API server locally
 #   make cli             # launch the interactive CLI
+#   make keychain-add VAR=ANTHROPIC_API_KEY   # keep a key in the macOS Keychain
 
 PYTHON ?= python3
 IMAGE ?= tradingagents
 IMAGE_API ?= tradingagents-api
 TAG ?= dev
 
+# Targets that need API keys run through this: it exports the keys stored in
+# the macOS Keychain (see `make keychain-add`) and leaves the rest to .env.
+KEYCHAIN_ENV := scripts/keychain-env run
+# `docker compose` plus an override passing those keys into service $(1). The
+# override arrives through a pipe (bash process substitution), so nothing is
+# written to disk and stdin stays free for interactive runs.
+compose_with_keys = docker compose -f docker-compose.yml -f <(scripts/keychain-env compose-override $(1))
+
 .PHONY: help \
 	install install-api install-dev env \
 	docker-build docker-build-api docker-run docker-run-ollama docker-run-api \
 	api api-reload cli \
+	keychain-add keychain-remove keychain-list \
 	test test-unit test-integration test-smoke test-api \
 	lint format clean
 
@@ -56,26 +66,41 @@ docker-build-api: ## Build the API server Docker image
 	docker build -t $(IMAGE_API):$(TAG) -f Dockerfile.api .
 
 docker-run: ## Run the CLI in Docker (interactive)
-	docker compose run --rm tradingagents
+	$(KEYCHAIN_ENV) bash -c '$(call compose_with_keys,tradingagents) run --rm tradingagents'
 
 docker-run-ollama: ## Run the CLI in Docker with the Ollama profile
-	docker compose --profile ollama run --rm tradingagents-ollama
+	$(KEYCHAIN_ENV) bash -c '$(call compose_with_keys,tradingagents-ollama) --profile ollama run --rm tradingagents-ollama'
 
 docker-run-api: ## Run the API server in Docker (foreground, port 8000)
-	docker compose up tradingagents-api
+	$(KEYCHAIN_ENV) bash -c '$(call compose_with_keys,tradingagents-api) up tradingagents-api'
 
 # ---------------------------------------------------------------------------
 # API server / CLI
 # ---------------------------------------------------------------------------
 
 api: ## Start the API server locally (0.0.0.0:8000)
-	$(PYTHON) run_server.py --host 0.0.0.0 --port 8000
+	$(KEYCHAIN_ENV) $(PYTHON) run_server.py --host 0.0.0.0 --port 8000
 
 api-reload: ## Start the API server locally with auto-reload
-	$(PYTHON) run_server.py --host 0.0.0.0 --port 8000 --reload
+	$(KEYCHAIN_ENV) $(PYTHON) run_server.py --host 0.0.0.0 --port 8000 --reload
 
 cli: ## Launch the interactive CLI
-	$(PYTHON) -m cli.main
+	$(KEYCHAIN_ENV) $(PYTHON) -m cli.main
+
+# ---------------------------------------------------------------------------
+# API keys in the macOS Keychain
+# ---------------------------------------------------------------------------
+
+keychain-add: ## Store an API key in the Keychain (VAR=ANTHROPIC_API_KEY; hidden prompt)
+	@test -n "$(VAR)" || { echo "usage: make keychain-add VAR=ANTHROPIC_API_KEY"; exit 2; }
+	@scripts/keychain-env add "$(VAR)"
+
+keychain-remove: ## Delete a stored API key (VAR=ANTHROPIC_API_KEY)
+	@test -n "$(VAR)" || { echo "usage: make keychain-remove VAR=ANTHROPIC_API_KEY"; exit 2; }
+	@scripts/keychain-env remove "$(VAR)"
+
+keychain-list: ## Show which API keys are stored in the Keychain (no values)
+	@scripts/keychain-env list
 
 # ---------------------------------------------------------------------------
 # Testing
