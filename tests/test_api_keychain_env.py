@@ -415,6 +415,98 @@ def test_api_keychain_compose_empty_override_and_global_flags(h, monkeypatch):
     assert res.child.argv[6:] == ["--profile", "ollama", "run", "--rm", "a"]
 
 
+SECRETS_OVERRIDE = (
+    "services:\n"
+    "  api:\n"
+    "    secrets:\n"
+    "      - source: tradingagents_earlier_key\n"
+    "        target: EARLIER_KEY\n"
+    "      - source: tradingagents_openai_api_key\n"
+    "        target: OPENAI_API_KEY\n"
+    "secrets:\n"
+    "  tradingagents_earlier_key:\n"
+    "    environment: EARLIER_KEY\n"
+    "  tradingagents_openai_api_key:\n"
+    "    environment: OPENAI_API_KEY\n"
+)
+
+
+def test_api_keychain_compose_secrets_lists_only_keyring_exports(h, store, monkeypatch):
+    put(store, h, "OPENAI_API_KEY", "sk-fake-openai")
+    # Only in the shell: .env must still win, so it is not a secret.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", h.secret("sk-shell-anthropic"))
+    monkeypatch.setenv("EARLIER_KEY", h.secret("sk-earlier"))
+    monkeypatch.setenv(EXPORTED, "EARLIER_KEY")
+    res = h.main("compose", "--secrets", "--service", "api", "--", "up", "--build", "api")
+    assert res.code == 0
+    child = res.child
+    assert child.override == SECRETS_OVERRIDE
+    assert "ANTHROPIC" not in child.override
+    assert child.argv == [
+        "docker", "compose", "-f", "docker-compose.yml", "-f", child.override_path,
+        "up", "--build", "api",
+    ]
+    # Compose reads the secret values from its own environment.
+    assert child.env["OPENAI_API_KEY"] == "sk-fake-openai"
+    assert child.env["EARLIER_KEY"] == "sk-earlier"
+    assert not Path(child.override_path).exists()
+
+
+def test_api_keychain_compose_secrets_names_only_no_environment(h, store, monkeypatch):
+    put(store, h, "OPENAI_API_KEY", "sk-fake-openai")
+    monkeypatch.setenv("EARLIER_KEY", h.secret("sk-earlier"))
+    monkeypatch.setenv(EXPORTED, "EARLIER_KEY")
+    # --secrets after --service is accepted too.
+    res = h.main("compose", "--service", "api", "--secrets", "--", "up")
+    override = res.child.override
+    for value in h.values:
+        assert value not in override
+    assert "sk-" not in override
+    # The only `environment:` keys are the secret sources (top level), never a
+    # service-level environment list that would land in Config.Env.
+    service_part, _, secrets_part = override.partition("\nsecrets:\n")
+    assert "environment" not in service_part
+    assert not re.search(r"^\s*- (EARLIER_KEY|OPENAI_API_KEY)$", override, re.M)
+    assert secrets_part.count("environment:") == 2
+
+
+def test_api_keychain_compose_secrets_empty_override(h, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", h.secret("sk-shell-openai"))
+    res = h.main("compose", "--secrets", "--service", "a", "--service", "b", "--", "up")
+    assert res.child.override == "services:\n  a: {}\n  b: {}\n"
+    assert not Path(res.child.override_path).exists()
+
+
+def test_api_keychain_compose_secrets_two_services_share_top_level(h, store):
+    put(store, h, "OPENAI_API_KEY", "sk-fake-openai")
+    res = h.main("compose", "--secrets", "--service", "a", "--service", "b", "--", "up")
+    assert res.child.override == (
+        "services:\n"
+        "  a:\n    secrets:\n"
+        "      - source: tradingagents_openai_api_key\n        target: OPENAI_API_KEY\n"
+        "  b:\n    secrets:\n"
+        "      - source: tradingagents_openai_api_key\n        target: OPENAI_API_KEY\n"
+        "secrets:\n"
+        "  tradingagents_openai_api_key:\n    environment: OPENAI_API_KEY\n"
+    )
+
+
+def test_api_keychain_compose_secrets_deletes_override_when_child_fails(h, store):
+    put(store, h, "OPENAI_API_KEY", "sk-fake-openai")
+    FakePopen.returncode = 3
+    res = h.main("compose", "--secrets", "--service", "api", "--", "up")
+    assert res.code == 3
+    assert "secrets:" in res.child.override
+    assert not Path(res.child.override_path).exists()
+
+
+def test_api_keychain_compose_default_mode_unchanged_by_secrets_flag(h, store):
+    put(store, h, "OPENAI_API_KEY", "sk-fake-openai")
+    res = h.main("compose", "--service", "api", "--", "up")
+    assert "secrets" not in res.child.override
+    assert "environment:" in res.child.override
+
+
 def test_api_keychain_compose_deletes_override_when_child_fails(h, store):
     put(store, h, "OPENAI_API_KEY", "sk-fake-openai")
     FakePopen.returncode = 17

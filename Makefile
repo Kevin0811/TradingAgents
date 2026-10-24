@@ -35,12 +35,23 @@ KEYCHAIN_ENV := $(KEYCHAIN) run --
 # `docker compose` plus a temporary override (names only, deleted afterwards)
 # passing into the service only the keys taken from the keyring; a key merely
 # set in the shell still comes from .env inside the container, as before.
-#   $(KEYCHAIN_COMPOSE) --service <svc> -- <docker compose args...>
+#   $(KEYCHAIN_COMPOSE) [--secrets] --service <svc> -- <docker compose args...>
+# Where the values end up:
+#   - API (docker-run-api*): with --secrets, as Compose secrets, i.e. files
+#     /run/secrets/<VAR> that Dockerfile.api's entrypoint
+#     (scripts/container_secrets.py) loads into the server's environment. They
+#     are not in the container config, so `docker inspect` does not show them.
+#   - CLI (docker-run, docker-run-ollama): as environment variables, since they
+#     run upstream's Dockerfile, which has no such entrypoint; `docker inspect`
+#     shows those values (Config.Env).
+# Either way, anyone who can `docker exec` into the container can still read
+# them (/run/secrets, the process environment): Docker access is root access.
 KEYCHAIN_COMPOSE := $(KEYCHAIN) compose
 
 .PHONY: help \
 	install install-api install-dev env \
 	docker-build docker-build-api docker-run docker-run-ollama docker-run-api \
+	docker-run-api-detached \
 	api api-reload cli \
 	keychain-add keychain-remove keychain-list \
 	test test-unit test-integration test-smoke test-api \
@@ -87,8 +98,17 @@ docker-run: ## Run the CLI in Docker (interactive)
 docker-run-ollama: ## Run the CLI in Docker with the Ollama profile
 	$(KEYCHAIN_COMPOSE) --service tradingagents-ollama -- --profile ollama run --rm tradingagents-ollama
 
-docker-run-api: ## Run the API server in Docker (foreground, port 8000)
-	$(KEYCHAIN_COMPOSE) --service tradingagents-api -- up tradingagents-api
+# --build: the image must contain the secrets entrypoint (an image built before
+# it would ignore /run/secrets); unchanged layers come from the build cache.
+docker-run-api: ## Run the API server in Docker (foreground, port 8000; keys as secrets)
+	$(KEYCHAIN_COMPOSE) --secrets --service tradingagents-api -- up --build tradingagents-api
+
+# Compose reads the temporary override only while creating the container, so
+# deleting it once `up -d` returns is fine: the secrets stay mounted. Stop it
+# with `docker compose down`. A plain `docker compose up` (without this target)
+# sees a changed config and can recreate the container without the keyring keys.
+docker-run-api-detached: ## Run the API server in Docker in the background (port 8000; keys as secrets)
+	$(KEYCHAIN_COMPOSE) --secrets --service tradingagents-api -- up -d --build tradingagents-api
 
 # ---------------------------------------------------------------------------
 # API server / CLI

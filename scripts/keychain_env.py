@@ -3,8 +3,10 @@
 
   python scripts/keychain_env.py run -- <command> [args...]
       run a command with the stored keys exported
-  python scripts/keychain_env.py compose [--service NAME]... -- <compose args...>
-      run `docker compose` with an override passing those keys into NAME
+  python scripts/keychain_env.py compose [--secrets] [--service NAME]... -- <compose args...>
+      run `docker compose` with an override passing those keys into NAME:
+      as environment variables, or with --secrets as Compose secrets
+      (files under /run/secrets, read by scripts/container_secrets.py)
   python scripts/keychain_env.py add <VAR>       store a key (hidden prompt)
   python scripts/keychain_env.py remove <VAR>    delete a stored key
   python scripts/keychain_env.py list            which keys are stored (no values)
@@ -66,7 +68,7 @@ HINT = (
 )
 USAGE = """\
 usage: keychain_env.py run -- <command> [args...]
-       keychain_env.py compose [--service NAME]... -- <docker compose args...>
+       keychain_env.py compose [--secrets] [--service NAME]... -- <docker compose args...>
        keychain_env.py add <VAR>
        keychain_env.py remove <VAR>
        keychain_env.py list
@@ -312,15 +314,40 @@ def cmd_run(args: list[str]) -> None:
         sys.exit(126)
 
 
-def compose_override(services: list[str], names: list[str]) -> str:
-    """A compose override passing `names` (never values) into each service."""
+def secret_name(var: str) -> str:
+    """The top-level Compose secret name for `var` (validated by the caller)."""
+    return f"tradingagents_{var.lower()}"
+
+
+def compose_override(services: list[str], names: list[str], secrets: bool = False) -> str:
+    """A compose override passing `names` (never values) into each service.
+
+    By default each name is listed under the service's `environment:`, so
+    compose copies the value from its own environment into the container
+    config (visible to `docker inspect`). With `secrets`, each name becomes a
+    top-level secret whose source is that environment variable, mounted in the
+    service as /run/secrets/<NAME>: not in the container config or env. The
+    image must then load those files itself (Dockerfile.api does, through
+    scripts/container_secrets.py).
+
+    Every name and service has been validated (VAR_RE, SERVICE_RE), so plain
+    string formatting is safe YAML here: no quoting or escaping is needed.
+    """
     lines = ["services:"]
     for svc in services:
-        if names:
+        if not names:
+            lines.append(f"  {svc}: {{}}")
+        elif secrets:
+            lines += [f"  {svc}:", "    secrets:"]
+            for name in names:
+                lines += [f"      - source: {secret_name(name)}", f"        target: {name}"]
+        else:
             lines += [f"  {svc}:", "    environment:"]
             lines += [f"      - {name}" for name in names]
-        else:
-            lines.append(f"  {svc}: {{}}")
+    if secrets and names:
+        lines.append("secrets:")
+        for name in names:
+            lines += [f"  {secret_name(name)}:", f"    environment: {name}"]
     return "\n".join(lines) + "\n"
 
 
@@ -352,11 +379,18 @@ def cmd_compose(args: list[str]) -> None:
     $TRADINGAGENTS_KEYCHAIN_EXPORTED) are listed: compose reads their values
     from the environment. Any other key, even one set in the shell, is left out
     so the service's env_file (.env) still supplies it, as without a keyring.
+
+    `--secrets` passes them as Compose secrets instead of environment variables
+    (see compose_override); the image must load /run/secrets itself.
     """
     services: list[str] = []
+    secrets = False
     i = 0
     while i < len(args) and args[i] != "--":
-        if args[i] == "--service" and i + 1 < len(args) and SERVICE_RE.match(args[i + 1]):
+        if args[i] == "--secrets":
+            secrets = True
+            i += 1
+        elif args[i] == "--service" and i + 1 < len(args) and SERVICE_RE.match(args[i + 1]):
             services.append(args[i + 1])
             i += 2
         else:
@@ -372,7 +406,7 @@ def cmd_compose(args: list[str]) -> None:
     fd, path = tempfile.mkstemp(suffix=".yml")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(compose_override(services, names))
+            f.write(compose_override(services, names, secrets))
         argv = ["docker", "compose", "-f", "docker-compose.yml", "-f", path, *compose_args]
         code = wait_child(argv, env, cwd=ROOT)
     finally:
