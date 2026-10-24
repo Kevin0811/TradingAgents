@@ -16,15 +16,19 @@ Usage:
 """
 
 import os
+import re
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 
+from invoke.exceptions import Exit
 from invoke.tasks import task
 
 # Absolute, so `invoke` works from any subdirectory of the repository.
 KEYCHAIN_ENV = Path(__file__).resolve().parent / "scripts" / "keychain_env.py"
+TICKER_RE = re.compile(r"^[A-Za-z0-9.^=\-]{1,32}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +86,21 @@ def env(c, enterprise=False):
 
 
 def quote(arg):
-    """Quote one argument for the shell invoke runs: cmd.exe on Windows."""
+    """Quote one argument for the shell invoke runs: cmd.exe on Windows.
+
+    On Windows every argument is wrapped in double quotes, so cmd.exe takes
+    ``^ & | < >`` literally; a ``"`` inside would end the quoting, so it is
+    refused (it cannot occur in a Windows path). cmd.exe still expands
+    ``%VAR%`` inside quotes: callers validate user input (see ``analyze``).
+    """
+    s = str(arg)
     if os.name == "nt":
-        return subprocess.list2cmdline([str(arg)])
-    return shlex.quote(str(arg))
+        if '"' in s:
+            raise Exit(f"cannot quote {s!r} for cmd.exe: it contains a double quote", code=2)
+        # Backslashes are literal except before the closing quote: double those.
+        trailing = s[len(s.rstrip("\\")) :]
+        return '"' + s + trailing + '"'
+    return shlex.quote(s)
 
 
 def keychain_cmd(*args):
@@ -117,7 +132,8 @@ def with_keys(cmd):
 def api(c, host="0.0.0.0", port=8000, reload=False, r=False):
     """Start the TradingAgents API server."""
     reload_flag = "--reload" if (reload or r) else ""
-    cmd = f"python run_server.py --host {host} --port {port} {reload_flag}".strip()
+    python = quote(sys.executable)
+    cmd = f"{python} run_server.py --host {quote(host)} --port {quote(port)} {reload_flag}".strip()
     print(f"Starting API server: {host}:{port}")
     print(f"Docs: http://localhost:{port}/api/v1/docs")
     c.run(with_keys(cmd))
@@ -131,7 +147,7 @@ def api(c, host="0.0.0.0", port=8000, reload=False, r=False):
 @task
 def cli(c):
     """Launch the interactive CLI."""
-    c.run(with_keys("python -m cli.main"))
+    c.run(with_keys(f"{quote(sys.executable)} -m cli.main"))
 
 
 @task(
@@ -144,6 +160,12 @@ def cli(c):
 )
 def analyze(c, ticker=None, date=None, checkpoint=False, clear_checkpoints=False):
     """Run trading analysis via CLI."""
+    if ticker and not TICKER_RE.match(ticker):
+        raise Exit(
+            f"invalid ticker {ticker!r}: use 1-32 of A-Z a-z 0-9 . ^ = -", code=2
+        )
+    if date and not DATE_RE.match(date):
+        raise Exit(f"invalid date {date!r}: use YYYY-MM-DD", code=2)
     flags = ""
     if checkpoint:
         flags += " --checkpoint"
@@ -158,10 +180,22 @@ def analyze(c, ticker=None, date=None, checkpoint=False, clear_checkpoints=False
     c.run(with_keys(cmd.strip()))
 
 
+def check_var(var):
+    if not VAR_RE.match(var or ""):
+        raise Exit(f"not a variable name: {var!r} (e.g. ANTHROPIC_API_KEY)", code=2)
+    return var
+
+
 @task(help={"var": "Variable name, e.g. ANTHROPIC_API_KEY"})
 def keychain_add(c, var):
     """Store an API key in the OS keyring (hidden prompt)."""
-    c.run(keychain_cmd("add", quote(var)), pty=os.name != "nt")
+    c.run(keychain_cmd("add", quote(check_var(var))), pty=os.name != "nt")
+
+
+@task(help={"var": "Variable name, e.g. ANTHROPIC_API_KEY"})
+def keychain_remove(c, var):
+    """Delete an API key stored in the OS keyring."""
+    c.run(keychain_cmd("remove", quote(check_var(var))))
 
 
 @task
@@ -177,10 +211,15 @@ def keychain_list(c):
 
 @task(help={"ollama": "Use Ollama profile for local models"})
 def docker(c, ollama=False):
-    """Run with Docker."""
-    profile = "--profile ollama" if ollama else ""
+    """Run with Docker, passing in the API keys stored in the OS keyring.
+
+    Goes through ``keychain_env.py compose``: a temporary override (key names
+    only, always deleted) hands the keyring keys to the service; .env supplies
+    the rest, as without a keyring.
+    """
+    profile = ["--profile", "ollama"] if ollama else []
     target = "tradingagents-ollama" if ollama else "tradingagents"
-    c.run(f"docker compose {profile} run --rm {target}")
+    c.run(keychain_cmd("compose", "--service", target, "--", *profile, "run", "--rm", target))
 
 
 # ---------------------------------------------------------------------------

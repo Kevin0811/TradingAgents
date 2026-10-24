@@ -12,7 +12,12 @@
 #   make cli             # launch the interactive CLI
 #   make keychain-add VAR=ANTHROPIC_API_KEY   # keep a key in the OS keyring
 
+# Windows (cmd.exe / Git Bash) ships `python`; elsewhere `python3` is the safe name.
+ifeq ($(OS),Windows_NT)
+PYTHON ?= python
+else
 PYTHON ?= python3
+endif
 IMAGE ?= tradingagents
 IMAGE_API ?= tradingagents-api
 TAG ?= dev
@@ -21,6 +26,10 @@ TAG ?= dev
 # the OS keyring (macOS Keychain, Windows Credential Manager, Linux Secret
 # Service; see `make keychain-add`) and leaves the rest to .env. Without
 # `keyring` or a usable backend it prints a hint and runs the command as is.
+# Environment knobs (see scripts/keychain_env.py):
+#   TRADINGAGENTS_KEYRING_SERVICE=name  keyring service (default tradingagents)
+#   TRADINGAGENTS_KEYCHAIN_VARS="A B"   extra key names to look up
+#   TRADINGAGENTS_KEYCHAIN_QUIET=1      no hint when falling back to .env only
 KEYCHAIN = $(PYTHON) scripts/keychain_env.py
 KEYCHAIN_ENV := $(KEYCHAIN) run --
 # `docker compose` plus a temporary override (names only, deleted afterwards)
