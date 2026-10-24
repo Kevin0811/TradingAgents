@@ -10,6 +10,7 @@ a provider.
 from __future__ import annotations
 
 import copy
+import logging
 import threading
 import time
 import uuid
@@ -63,11 +64,13 @@ class UsageModel(BaseChatModel):
     ``served`` is the model the response names (none when None); ``usage`` is
     its ``usage_metadata`` (none when None). It supports ``bind_tools`` and
     ``with_structured_output`` the way providers do: as bindings of itself.
+    With ``call_tools`` false it answers in text even when offered tools.
     """
 
     served: str | None = None
     usage: dict | None = None
     fail: bool = False
+    call_tools: bool = True
 
     @property
     def _llm_type(self) -> str:
@@ -85,7 +88,7 @@ class UsageModel(BaseChatModel):
     def _generate(self, messages, stop=None, run_manager=None, tools=None, **kwargs):
         if self.fail:
             raise RuntimeError("provider unavailable")
-        calls = [{"name": tools[0], "args": {}, "id": "call-1"}] if tools else []
+        calls = [{"name": tools[0], "args": {}, "id": "call-1"}] if tools and self.call_tools else []
         message = AIMessage(
             content="" if calls else "text",
             tool_calls=calls,
@@ -224,6 +227,34 @@ class TestTokenUsageRecorder:
         assert recorder.summary(partial=False)["tiers"] == []
         assert recorder.summary(partial=False)["totals"]["calls"] == 0
 
+    def _end(self, recorder, *messages):
+        run_id = uuid.uuid4()
+        recorder.on_chat_model_start({}, [[]], run_id=run_id, metadata={TIER_METADATA_KEY: "quick"})
+        recorder.on_llm_end(
+            LLMResult(generations=[[ChatGeneration(message=m) for m in messages]]), run_id=run_id
+        )
+
+    def test_usage_on_a_later_generation_is_found(self):
+        recorder = TokenUsageRecorder(TIERS)
+        self._end(
+            recorder,
+            AIMessage(content="a", response_metadata={"model_name": "qwen3:4b"}),
+            AIMessage(content="b", usage_metadata=OLLAMA_USAGE),
+        )
+        [entry] = recorder.summary(partial=False)["tiers"]
+        assert (entry["model"], entry["calls"], entry["calls_without_usage"]) == ("qwen3:4b", 1, 0)
+        assert entry["input_tokens"] == 300
+
+    def test_one_calls_usage_repeated_on_its_generations_counts_once(self):
+        recorder = TokenUsageRecorder(TIERS)
+        self._end(
+            recorder,
+            AIMessage(content="a", usage_metadata=OLLAMA_USAGE),
+            AIMessage(content="b", usage_metadata=OLLAMA_USAGE),
+        )
+        [entry] = recorder.summary(partial=False)["tiers"]
+        assert (entry["calls"], entry["input_tokens"]) == (1, 300)
+
     def test_concurrent_calls_add_up_exactly(self):
         """The core's analysts call the models from several threads at once.
 
@@ -333,11 +364,13 @@ class TestTierTagging:
 
     def test_the_core_graph_hands_its_tagged_models_to_its_agents(self, tmp_path):
         """A real TradingAgentsGraph (its models faked): the API tags the very
-        objects the core's agents and Reflector call."""
+        objects the core's agents and Reflector call, and a real analyst node
+        and a real deep-tier node of the compiled graph are counted per tier."""
         from tradingagents.graph.trading_graph import TradingAgentsGraph
 
         models = {
-            "quick": UsageModel(served="qwen3", usage=OLLAMA_USAGE),
+            # Text answers: the Market Analyst then writes its report at once.
+            "quick": UsageModel(served="qwen3", usage=OLLAMA_USAGE, call_tools=False),
             "deep": UsageModel(served="qwen3", usage=ANTHROPIC_USAGE),
         }
 
@@ -351,8 +384,33 @@ class TestTierTagging:
         def create_tier_client(config, tier, callbacks=None, **extra):
             return Client(tier, callbacks)
 
+        def calls(recorder):
+            return {t["tier"]: t["calls"] for t in recorder.summary(partial=False)["tiers"]}
+
         def propagate(graph, ticker, trade_date, asset_type="stock"):
+            # The models the core's agents were built with are the tagged ones.
+            assert graph.graph_setup.quick_thinking_llm is graph.quick_thinking_llm
+            assert graph.graph_setup.deep_thinking_llm is graph.deep_thinking_llm
             assert graph.reflector.quick_thinking_llm is graph.quick_thinking_llm
+            recorder = next(c for c in graph.callbacks if isinstance(c, TokenUsageRecorder))
+            state = {
+                "company_of_interest": ticker, "trade_date": trade_date, "asset_type": asset_type,
+                "messages": [("human", ticker)],
+                "investment_debate_state": {"history": "Bull: up. Bear: down.", "count": 2},
+            }
+            nodes = graph.graph.nodes
+            before = calls(recorder)
+            report = nodes["Market Analyst"].bound.invoke(state)
+            assert report == {"market_report": "text"}
+            after = calls(recorder)
+            assert after.get("quick", 0) - before.get("quick", 0) == 1
+            assert after.get("deep", 0) == before.get("deep", 0)
+            before = after
+            assert nodes["Research Manager"].bound.invoke(state)["investment_plan"]
+            after = calls(recorder)
+            assert after["deep"] - before.get("deep", 0) >= 1
+            assert after.get("quick", 0) == before.get("quick", 0)
+            node_calls["deep"] = after["deep"]
             graph.reflector.reflect_on_final_decision("Buy", 0.01, 0.002)
             graph.quick_thinking_llm.bind_tools([Plan]).invoke("analyst turn")
             structured = bind_structured(graph.deep_thinking_llm, Plan, "Portfolio Manager")
@@ -365,6 +423,7 @@ class TestTierTagging:
             results_dir=str(tmp_path / "results"), data_cache_dir=str(tmp_path / "cache"),
             memory_log_path=str(tmp_path / "memory.md"), checkpoint_enabled=False,
         )
+        node_calls = {}
         with (
             patch("tradingagents.graph.trading_graph.create_tier_client", create_tier_client),
             patch.object(TradingAgentsGraph, "propagate", propagate),
@@ -373,9 +432,13 @@ class TestTierTagging:
 
         usage = result.token_usage
         assert usage["partial"] is False
-        assert _entries(usage) == [("quick", "ollama", "qwen3", 2), ("deep", "ollama", "qwen3", 1)]
-        assert usage["totals"]["cache_read_input_tokens"] == 1000
-        assert usage["totals"]["input_tokens"] == 2 * 300 + 1150
+        # quick: the Market Analyst, the Reflector and the tools call; deep: the
+        # Research Manager's call(s) (its structured call may fall back to text),
+        # then the structured Plan call.
+        deep = node_calls["deep"] + 1
+        assert _entries(usage) == [("quick", "ollama", "qwen3", 3), ("deep", "ollama", "qwen3", deep)]
+        assert usage["totals"]["cache_read_input_tokens"] == 1000 * deep
+        assert usage["totals"]["input_tokens"] == 3 * 300 + deep * 1150
 
 
 # ---------------------------------------------------------------------------
@@ -384,11 +447,13 @@ class TestTierTagging:
 
 
 def _graph(script: list, hold: threading.Event | None = None,
-           proceed: threading.Event | None = None):
+           proceed: threading.Event | None = None, wrap_deep=None):
     """A TradingAgentsGraph stand-in whose run calls its two tier models.
 
     ``script`` lists the run's steps: "quick"/"deep" call that tier's model,
     "hold" waits for ``proceed`` (signalling ``hold``), "raise" fails the run.
+    ``wrap_deep(model, callbacks)``, when given, replaces the deep-tier model,
+    as a core wrapping its model would.
     """
 
     class Graph:
@@ -399,6 +464,8 @@ def _graph(script: list, hold: threading.Event | None = None,
             self.deep_thinking_llm = UsageModel(
                 callbacks=callbacks, served=config["deep_think_llm"], usage=ANTHROPIC_USAGE
             )
+            if wrap_deep is not None:
+                self.deep_thinking_llm = wrap_deep(self.deep_thinking_llm, callbacks)
 
         def propagate(self, ticker, trade_date, asset_type="stock"):
             for step in script:
@@ -474,6 +541,67 @@ class TestAnalysisServiceUsage:
         assert out["usage"]["partial"] is True
         # The deep call was refused at its start: not counted.
         assert _entries(out["usage"]) == [("quick", "ollama", "qwen3:4b", 1)]
+
+
+class Untaggable:
+    """A tier "model" that refuses any new attribute, metadata included."""
+
+    __slots__ = ()
+
+    def invoke(self, prompt):
+        return AIMessage(content="text")
+
+
+def _with_fallback(model, callbacks):
+    primary = model.model_copy(update={"fail": True})
+    fallback = model.model_copy(update={"served": "fallback-model"})
+    return primary.with_fallbacks([fallback])
+
+
+@pytest.mark.unit
+class TestWrappedTierModels:
+    """A core that wraps a tier's model must not fail the run; the wrapped
+    model is tagged, so its calls are still attributed to the tier."""
+
+    @pytest.mark.parametrize(
+        "wrap",
+        [
+            pytest.param(lambda model, callbacks: model.with_retry(), id="with_retry"),
+            pytest.param(lambda model, callbacks: model.bind(stop=["\n\n"]), id="bind"),
+            pytest.param(
+                lambda model, callbacks: model.with_fallbacks([model.model_copy()]),
+                id="with_fallbacks",
+            ),
+        ],
+    )
+    def test_a_wrapped_model_is_tagged_and_the_run_completes(self, wrap):
+        with patch(GRAPH, _graph(["quick", "deep"], wrap_deep=wrap)):
+            result = AnalysisService(config=_service_config()).run_analysis("AAPL", "2026-06-01")
+        assert _entries(result.token_usage) == [
+            ("quick", "ollama", "qwen3:4b", 1), ("deep", "anthropic", "claude-opus-5-5", 1),
+        ]
+
+    def test_a_fallback_model_is_tagged_too(self):
+        with patch(GRAPH, _graph(["deep"], wrap_deep=_with_fallback)):
+            result = AnalysisService(config=_service_config()).run_analysis("AAPL", "2026-06-01")
+        # The failing primary call counts without usage; the fallback answers.
+        assert _entries(result.token_usage) == [
+            ("deep", "anthropic", "claude-opus-5-5", 1), ("deep", "anthropic", "fallback-model", 1),
+        ]
+        assert [t["calls_without_usage"] for t in result.token_usage["tiers"]] == [1, 0]
+
+    def test_an_untaggable_model_is_skipped_with_a_warning(self, caplog):
+        with (
+            patch(GRAPH, _graph(["quick", "deep"], wrap_deep=lambda m, c: Untaggable())),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = AnalysisService(config=_service_config()).run_analysis("AAPL", "2026-06-01")
+        assert result.signal == "Buy"
+        # The deep call carries no tier: counted nowhere.
+        assert _entries(result.token_usage) == [("quick", "ollama", "qwen3:4b", 1)]
+        [warning] = [r for r in caplog.records if "Cannot tag the deep-tier model" in r.getMessage()]
+        assert warning.levelno == logging.WARNING
+        assert "Untaggable" in warning.getMessage()
 
 
 @pytest.fixture
@@ -571,6 +699,21 @@ class TestSyncUsage:
         assert resp.status_code == 500
         assert resp.json()["token_usage"]["partial"] is True
         assert resp.json()["token_usage"]["totals"]["calls"] == 1
+        TokenUsage.model_validate(resp.json()["token_usage"])
+
+    def test_a_malformed_usage_report_does_not_break_the_500(self, app, caplog):
+        with (
+            patch(GRAPH, _graph(["quick", "raise"])),
+            patch.object(TokenUsageRecorder, "summary", return_value={"tiers": "garbled"}),
+            caplog.at_level(logging.WARNING),
+        ):
+            resp = TestClient(app, raise_server_exceptions=False).post(ANALYZE, json=BODY)
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body["error"].startswith("Analysis failed for AAPL")
+        assert body["detail"] == "provider unavailable"
+        assert "token_usage" not in body
+        assert any("malformed token usage" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.unit
@@ -594,3 +737,13 @@ class TestSchema:
         assert "lower bound" in tier["calls_without_usage"]["description"]
         assert "lower bound" in usage["totals"]["description"]
         assert all(field.get("description") for field in tier.values())
+        assert "may appear under both" in tier["model"]["description"]
+
+    def test_the_sync_500_body_is_in_the_openapi_schema(self, app):
+        spec = TestClient(app).get("/api/v1/openapi.json").json()
+        error = spec["paths"]["/api/v1/analyze"]["post"]["responses"]["500"]
+        ref = error["content"]["application/json"]["schema"]["$ref"]
+        body = spec["components"]["schemas"][ref.rsplit("/", 1)[-1]]["properties"]
+        assert set(body) == {"error", "detail", "token_usage"}
+        assert {"$ref": "#/components/schemas/TokenUsage"} in body["token_usage"]["anyOf"]
+        assert body["token_usage"]["description"]

@@ -173,8 +173,10 @@ class TokenUsageRecorder(BaseCallbackHandler):
         if tier is None:
             return
         model, usage = None, None
-        # One generation per call in the core; the first with usage answers it
-        # (a provider asked for several choices reports one usage for them all).
+        # One generation per call in the core. Every generation is scanned and
+        # the first one carrying usage answers it, wherever it sits; usages are
+        # never summed (a provider asked for several choices reports the call's
+        # one usage, possibly repeated on each).
         for generation in (g for gens in response.generations for g in gens):
             message = getattr(generation, "message", None)
             meta = getattr(message, "response_metadata", None) or {}

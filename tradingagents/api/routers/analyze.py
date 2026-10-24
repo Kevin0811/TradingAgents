@@ -30,6 +30,7 @@ from tradingagents.api.domain.services.config_overrides import (
     resolve_overrides,
 )
 from tradingagents.api.domain.services.task_service import TaskService
+from tradingagents.api.schemas.error import AnalysisErrorResponse
 from tradingagents.api.schemas.request import AnalyzeRequest
 from tradingagents.api.schemas.response import AnalyzeResponse
 from tradingagents.api.schemas.symbols import TICKER_NOT_SUPPORTED_RESPONSES
@@ -109,7 +110,16 @@ DISCONNECT_POLL_SECONDS = 1.0
         "The ticker is checked against the supported-symbols list first; see the 422 "
         "response (`ticker_not_supported`) and `GET /symbols/check`."
     ),
-    responses=TICKER_NOT_SUPPORTED_RESPONSES,
+    responses={
+        **TICKER_NOT_SUPPORTED_RESPONSES,
+        500: {
+            "model": AnalysisErrorResponse,
+            "description": (
+                "The analysis failed. `token_usage` (`partial: true`) counts the LLM "
+                "calls it made before failing."
+            ),
+        },
+    },
 )
 async def analyze(
     request: AnalyzeRequest,

@@ -149,7 +149,10 @@ Token usage:
     the run failed or was cancelled (a failed sync run's 500 body carries it
     too). The core gives both tiers one callback list, so the API tags each
     tier's model with its tier after building the graph and a callback reads
-    the tag (``TokenUsageRecorder`` in ``infrastructure.llm_callbacks``).
+    the tag (``TokenUsageRecorder`` in ``infrastructure.llm_callbacks``). A
+    tier model wrapped by the core (a retry, binding or fallbacks wrapper) has
+    the model inside tagged; one that cannot be tagged is skipped with a
+    WARNING, and its calls are then counted nowhere.
 
 Local model (Ollama) cache trim:
     Ollama's MLX engine keeps a prompt-cache snapshot per request under a

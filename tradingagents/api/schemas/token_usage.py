@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
+import logging
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+logger = logging.getLogger(__name__)
 
 _INPUT_TOKENS = (
     "All input (prompt) tokens, INCLUDING cache_read_input_tokens and "
@@ -35,8 +38,9 @@ class TierTokenUsage(BaseModel):
     provider: str = Field(description="The tier's LLM provider for this run (e.g. 'anthropic').")
     model: str = Field(
         description=(
-            "The model the provider reported serving the calls, else the tier's "
-            "configured model. Two tiers on one model are two entries."
+            "The model name the provider reported, else the configured one; a tier may "
+            "appear under both (e.g. the configured alias and the dated model a provider "
+            "names in its response). Two tiers on one model are two entries."
         )
     )
     calls: int = Field(
@@ -93,3 +97,18 @@ class TokenUsage(BaseModel):
             "LLM calls made before it stopped."
         )
     )
+
+
+def token_usage_model(usage: dict[str, Any] | None) -> TokenUsage | None:
+    """A run's usage report (``TokenUsageRecorder.summary``) as a :class:`TokenUsage`.
+
+    A report that does not fit is dropped with a warning, never failing the
+    response or the task it describes.
+    """
+    if usage is None:
+        return None
+    try:
+        return TokenUsage.model_validate(usage)
+    except ValidationError:
+        logger.warning("Dropping a malformed token usage report", exc_info=True)
+        return None

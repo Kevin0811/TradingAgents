@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Any
 
+from langchain_core.runnables import Runnable, RunnableBinding, RunnableWithFallbacks
+
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
@@ -177,7 +179,10 @@ class AnalysisService:
                     [m for m in models if m],
                 )
             )
-        # Last, so a call the cancel handler refuses to start is never counted.
+        # After the cancel handler: LangChain re-raises the first handler error
+        # of a call's start, so a call it refuses never reaches the recorder,
+        # which would otherwise keep that call's run_id with no end to pop it.
+        # (Either way the refused call is not counted: calls count at their end.)
         callbacks.append(usage)
         return callbacks
 
@@ -200,6 +205,12 @@ def _tag_tiers(graph: Any) -> None:
     every agent (bound runnables wrap it, they do not copy it), so its metadata,
     set here after construction, reaches the callbacks of each of its calls.
     Existing metadata is kept.
+
+    Tagging never fails the run. A tier attribute that is a wrapper (a binding
+    such as ``with_retry()`` or ``.bind()``, or ``with_fallbacks()``) has the
+    model(s) inside it tagged. A model that cannot take metadata is skipped
+    with a warning: its calls then carry no tier and appear in no usage entry,
+    neither as calls nor as tokens.
     """
     for tier in TIERS:
         llm = getattr(graph, f"{tier}_thinking_llm", None)
@@ -208,6 +219,32 @@ def _tag_tiers(graph: Any) -> None:
             # caught by test_api_token_usage, which builds the real graph.
             logger.debug("No %s-tier model on the graph; its token usage is not counted", tier)
             continue
+        for untagged in _tag_model(llm, tier):
+            logger.warning(
+                "Cannot tag the %s-tier model (%s) with its tier; its LLM calls are "
+                "left out of the run's token usage",
+                tier,
+                type(untagged).__name__,
+            )
+
+
+def _tag_model(llm: Any, tier: str) -> list[Any]:
+    """Tag ``llm``, or the model(s) a wrapper holds, with ``tier``; return what could not be."""
+    if isinstance(llm, RunnableWithFallbacks):
+        untagged = _tag_model(llm.runnable, tier)
+        for fallback in llm.fallbacks:
+            untagged += _tag_model(fallback, tier)
+        return untagged
+    bound = getattr(llm, "bound", None)
+    if isinstance(llm, RunnableBinding) or isinstance(bound, Runnable):
+        # RunnableBinding and its subclasses (RunnableRetry, a provider's own
+        # binding): the calls are the bound model's, with its metadata.
+        return _tag_model(bound, tier)
+    try:
         metadata = getattr(llm, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}
         llm.metadata = {**metadata, TIER_METADATA_KEY: tier}
+    except Exception:  # noqa: BLE001 - a usage tag must never fail the run
+        logger.debug("Setting metadata on %r failed", llm, exc_info=True)
+        return [llm]
+    return []

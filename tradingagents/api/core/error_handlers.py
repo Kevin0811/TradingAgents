@@ -15,6 +15,7 @@ from tradingagents.api.core.exceptions import (
     InvalidRequestError,
     TradingAgentsAPIError,
 )
+from tradingagents.api.schemas.token_usage import token_usage_model
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -43,9 +44,12 @@ async def trading_agents_api_error_handler(
     )
 
     content = {"error": exc.message, "detail": exc.detail}
-    if isinstance(exc, AnalysisError) and exc.token_usage is not None:
-        # A failed sync run's usage so far (partial: true), as the field reports it.
-        content["token_usage"] = exc.token_usage
+    if isinstance(exc, AnalysisError):
+        # A failed sync run's usage so far (partial: true), serialised as the
+        # task field is; a malformed report is dropped (logged), never the 500.
+        usage = token_usage_model(exc.token_usage)
+        if usage is not None:
+            content["token_usage"] = usage.model_dump(mode="json")
     return JSONResponse(status_code=status_code, content=content)
 
 

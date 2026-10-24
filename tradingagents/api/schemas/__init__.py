@@ -1,7 +1,7 @@
 """Pydantic schemas for API request/response models."""
 
 from tradingagents.api.schemas.enums import AnalystType, AssetType
-from tradingagents.api.schemas.error import ErrorResponse
+from tradingagents.api.schemas.error import AnalysisErrorResponse, ErrorResponse
 from tradingagents.api.schemas.request import (
     AnalyzeRequest,
     FundamentalsRequest,
@@ -71,4 +71,5 @@ __all__ = [
     "AnalystType",
     # Error
     "ErrorResponse",
+    "AnalysisErrorResponse",
 ]

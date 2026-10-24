@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from pydantic import ValidationError
-
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.core.task_manager import (
     CANCELLED_WHILE_RUNNING,
@@ -16,7 +14,7 @@ from tradingagents.api.core.task_manager import (
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.config_overrides import resolve_overrides
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
-from tradingagents.api.schemas.token_usage import TokenUsage
+from tradingagents.api.schemas.token_usage import token_usage_model
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +98,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.COMPLETED,
                 result=result.to_dict(),
-                token_usage=_token_usage(result.token_usage),
+                token_usage=token_usage_model(result.token_usage),
             )
             logger.info("Task %s completed successfully", task_id)
 
@@ -111,7 +109,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.CANCELLED,
                 message=CANCELLED_WHILE_RUNNING,
-                token_usage=_token_usage(e.token_usage),
+                token_usage=token_usage_model(e.token_usage),
             )
 
         except AnalysisError as e:
@@ -120,7 +118,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.FAILED,
                 error=str(e.detail) if e.detail else str(e),
-                token_usage=_token_usage(e.token_usage),
+                token_usage=token_usage_model(e.token_usage),
             )
 
         except Exception as e:
@@ -173,16 +171,3 @@ class TaskService:
         """
         return self._task_manager.delete_task(task_id)
 
-
-def _token_usage(usage: dict[str, Any] | None) -> TokenUsage | None:
-    """The task field's model of a run's usage (``update_task`` sets fields as given).
-
-    A usage report that does not fit is dropped, never failing the run it describes.
-    """
-    if usage is None:
-        return None
-    try:
-        return TokenUsage.model_validate(usage)
-    except ValidationError:
-        logger.warning("Dropping a malformed token usage report", exc_info=True)
-        return None
