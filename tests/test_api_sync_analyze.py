@@ -143,31 +143,12 @@ class TestSyncRunCancel:
         script = Script(hold="MSFT")
         with patch(GRAPH, script.graph):
             app = _app(llm_provider="ollama")
-            runs = app.state.sync_runs
-
-            def release_once_cancelled():
-                # The held run resumes only once the shutdown has cancelled it.
-                _wait_for(lambda: any(e.is_set() for e in list(runs._events)))
-                script.proceed.set()
-
-            with TestClient(app) as client:
-                running, out_running = _post_in_thread(
-                    client, ANALYZE, {"ticker": "MSFT", "trade_date": "2026-06-01"}
-                )
-                assert script.held.wait(5)
-                queued, out_queued = _post_in_thread(
-                    client, ANALYZE, {"ticker": "NVDA", "trade_date": "2026-06-01"}
-                )
-                _wait_for(lambda: runs.active_count == 2)
-                releaser = threading.Thread(target=release_once_cancelled)
-                releaser.start()
-                # Leaving the block runs the lifespan's shutdown.
-            for thread in (running, queued, releaser):
-                thread.join(5)
+            running, queued = asyncio.run(_shut_down_during_two_runs(app, script))
             app.state.task_worker.shutdown(wait=True)
-        assert out_running["resp"].status_code == 503
-        assert out_queued["resp"].status_code == 503
+        assert running[0]["status"] == 503
+        assert queued[0]["status"] == 503
         assert script.log == ["MSFT start"]  # stopped at its next call; NVDA never ran
+        assert app.state.sync_runs.active_count == 0
 
     def test_a_client_disconnect_cancels_the_run(self, monkeypatch):
         monkeypatch.setattr(analyze_module, "DISCONNECT_POLL_SECONDS", 0.01)
@@ -194,11 +175,22 @@ class TestSyncRunCancel:
         assert script.log == ["AAPL start", "AAPL end"]
 
 
-async def _post_then_disconnect(app, script, wait_held=True):
-    """POST /analyze for MSFT straight to the ASGI app, then drop the client."""
-    body = json.dumps({"ticker": "MSFT", "trade_date": "2026-06-01"}).encode()
+async def _until(condition):
+    for _ in range(500):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("timed out")
+
+
+def _call_analyze(app, ticker, gone):
+    """POST /analyze for ``ticker`` straight to the ASGI app.
+
+    Returns the app call's task and the messages it sent; the client
+    disconnects once ``gone`` is set.
+    """
+    body = json.dumps({"ticker": ticker, "trade_date": "2026-06-01"}).encode()
     messages = [{"type": "http.request", "body": body, "more_body": False}]
-    gone = asyncio.Event()
 
     async def receive():
         if messages:
@@ -229,21 +221,55 @@ async def _post_then_disconnect(app, script, wait_held=True):
         "client": ("testclient", 50000),
         "server": ("testserver", 80),
     }
-    call = asyncio.create_task(app(scope, receive, send))
+    return asyncio.create_task(app(scope, receive, send)), sent
+
+
+async def _post_then_disconnect(app, script, wait_held=True):
+    """POST /analyze for MSFT straight to the ASGI app, then drop the client."""
+    gone = asyncio.Event()
+    call, sent = _call_analyze(app, "MSFT", gone)
     runs = app.state.sync_runs
-
-    async def until(condition):
-        for _ in range(500):
-            if condition():
-                return
-            await asyncio.sleep(0.01)
-        raise AssertionError("timed out")
-
-    await until(lambda: runs.active_count == 1)
+    await _until(lambda: runs.active_count == 1)
     if wait_held:
-        await until(script.held.is_set)
+        await _until(script.held.is_set)
     gone.set()
-    await until(lambda: runs.active_count == 0 or any(e.is_set() for e in runs._events))
+    await _until(lambda: runs.active_count == 0 or any(e.is_set() for e in runs._events))
     script.proceed.set()
     await asyncio.wait_for(call, 5)
     return sent
+
+
+async def _shut_down_during_two_runs(app, script):
+    """Run the app's lifespan shutdown while MSFT runs and NVDA is queued.
+
+    Driven over raw ASGI on one loop rather than by leaving a ``TestClient``
+    block: the client stops its portal right after the shutdown, before the
+    in-flight responses can be read, which hangs the test. (Real servers drain
+    requests before the shutdown; the lifespan's cancel is for whatever
+    outlives that, e.g. requests cancelled at a graceful-shutdown timeout.)
+    """
+    lifespan_in: asyncio.Queue = asyncio.Queue()
+    lifespan_out: asyncio.Queue = asyncio.Queue()
+    lifespan = asyncio.create_task(
+        app(
+            {"type": "lifespan", "asgi": {"version": "3.0"}, "state": {}},
+            lifespan_in.get,
+            lifespan_out.put,
+        )
+    )
+    await lifespan_in.put({"type": "lifespan.startup"})
+    assert (await asyncio.wait_for(lifespan_out.get(), 5))["type"] == "lifespan.startup.complete"
+
+    never = asyncio.Event()  # the clients stay connected
+    running, running_sent = _call_analyze(app, "MSFT", never)
+    await _until(script.held.is_set)
+    queued, queued_sent = _call_analyze(app, "NVDA", never)
+    runs = app.state.sync_runs
+    await _until(lambda: runs.active_count == 2)
+
+    await lifespan_in.put({"type": "lifespan.shutdown"})
+    assert (await asyncio.wait_for(lifespan_out.get(), 5))["type"] == "lifespan.shutdown.complete"
+    await asyncio.wait_for(lifespan, 5)
+    script.proceed.set()  # the held run resumes, already cancelled
+    await asyncio.wait_for(asyncio.gather(running, queued), 5)
+    return running_sent, queued_sent
