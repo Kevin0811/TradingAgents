@@ -9,6 +9,7 @@ from typing import Any
 from langchain_core.runnables import Runnable, RunnableBinding, RunnableWithFallbacks
 
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
+from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
 from tradingagents.api.domain.services.config_overrides import CLEARED_KEYS
@@ -148,10 +149,15 @@ class AnalysisService:
                 # The caller logs the one INFO line per cancelled run.
                 logger.debug("Analysis of %s on %s cancelled", ticker, trade_date)
                 raise AnalysisCancelled("analysis cancelled", token_usage=token_usage) from e
-            logger.exception("Analysis failed for %s on %s", ticker, trade_date)
+            # error_text: an LLM client's pydantic error would otherwise carry
+            # its arguments, API key included, to the task status and the log.
+            logger.error(
+                "Analysis failed for %s on %s: %s", ticker, trade_date, error_text(e),
+                exc_info=traceback_is_safe(e),
+            )
             raise AnalysisError(
                 message=f"Analysis failed for {ticker} on {trade_date}",
-                detail=str(e),
+                detail=error_text(e),
                 token_usage=token_usage,
             ) from e
 

@@ -16,6 +16,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 
+from tradingagents.api.core.safe_errors import error_text
 from tradingagents.api.infrastructure.secret_keys import create_tier_client
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.factory import tier_provider
@@ -42,6 +43,10 @@ def check_llm_config(config: dict[str, Any]) -> None:
     Sonnet 5.5 and Fable 5.1 reject any non-default value). Which models refuse
     it is left to ``langchain-anthropic``, by building one request payload
     offline; nothing is sent.
+
+    The message goes to clients (a 400) and the log, so a pydantic error in it
+    is rendered without its input values, which hold the client's API key
+    (see ``tradingagents.api.core.safe_errors``).
     """
     config = _full_config(config)
     temperature = config.get("temperature")
@@ -54,7 +59,7 @@ def check_llm_config(config: dict[str, Any]) -> None:
         # TypeError/AttributeError: a value of the wrong type (e.g. a None provider
         # or a list temperature); pydantic's ValidationError is a ValueError.
         except (ValueError, TypeError, AttributeError) as exc:
-            raise ValueError(f"{tier}-thinking tier: {exc}") from exc
+            raise ValueError(f"{tier}-thinking tier: {error_text(exc)}") from exc
         build_payload = getattr(llm, "_get_request_payload", None)
         if build_payload is None:
             continue
@@ -63,7 +68,7 @@ def check_llm_config(config: dict[str, Any]) -> None:
         except ValueError as exc:
             raise ValueError(
                 f"{tier}-thinking model {config[f'{tier}_think_llm']!r} rejects the server's "
-                f"temperature setting ({exc}). Choose a model that accepts it, or unset "
+                f"temperature setting ({error_text(exc)}). Choose a model that accepts it, or unset "
                 "TRADINGAGENTS_TEMPERATURE on the server."
             ) from exc
 

@@ -15,6 +15,7 @@ from tradingagents.api.core.exceptions import (
     InvalidRequestError,
     TradingAgentsAPIError,
 )
+from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.schemas.token_usage import token_usage_model
 
 if TYPE_CHECKING:
@@ -55,10 +56,14 @@ async def trading_agents_api_error_handler(
 
 async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle uncaught exceptions."""
-    logger.exception("Uncaught exception on %s %s: %s", request.method, request.url.path, exc)
+    text = error_text(exc)  # a pydantic error without its input values
+    logger.error(
+        "Uncaught exception on %s %s: %s", request.method, request.url.path, text,
+        exc_info=exc if traceback_is_safe(exc) else None,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"error": "Internal server error", "detail": str(exc)},
+        content={"error": "Internal server error", "detail": text},
     )
 
 
