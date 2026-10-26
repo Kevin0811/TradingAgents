@@ -5,7 +5,9 @@ which applies TRADINGAGENTS_* environment variable overrides.
 
 Clients are built by the core's ``create_tier_client`` so the API follows the
 core's provider handling (per-tier providers and endpoints, thinking/effort
-settings, ``max_tokens``, ``llm_max_retries``) instead of keeping its own copy.
+settings, ``max_tokens``, ``llm_max_retries``) instead of keeping its own copy,
+through ``secret_keys.create_tier_client``, which adds the tier's API key from
+its Docker secret file when there is one (see ``secret_keys``).
 """
 
 from __future__ import annotations
@@ -14,8 +16,9 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage
 
+from tradingagents.api.infrastructure.secret_keys import create_tier_client
 from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.llm_clients.factory import create_tier_client, tier_provider
+from tradingagents.llm_clients.factory import tier_provider
 
 TIERS: tuple[str, ...] = ("quick", "deep")
 
@@ -71,7 +74,9 @@ class LLMProviderFactory:
     Configuration is read from DEFAULT_CONFIG which includes:
     - Default values from default_config.py
     - Overrides from .env file (TRADINGAGENTS_* variables)
-    - API keys from environment (OPENAI_API_KEY, etc.)
+    - API keys: the anthropic/google key from its Docker secret file when
+      there is one (see ``secret_keys``), else from the environment
+      (OPENAI_API_KEY, etc.)
 
     A partial ``config`` is completed from DEFAULT_CONFIG (env and .env
     included), not from hard-coded OpenAI defaults; see ``_full_config``.
