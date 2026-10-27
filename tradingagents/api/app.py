@@ -31,6 +31,7 @@ from tradingagents.api.infrastructure.ollama_cache_trimmer import OllamaCacheTri
 from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository import (
     FileSymbolCacheRepository,
 )
+from tradingagents.api.infrastructure.secret_keys import install as install_secret_keys
 from tradingagents.api.infrastructure.yahoo_symbol_source import YahooSymbolSource
 
 logger = logging.getLogger(__name__)
@@ -122,6 +123,10 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     """
     config = ApiConfig(overrides)
     set_config(config)
+    # The analysis graphs (built on the task worker's threads and the request
+    # threadpool, all in this process) take the anthropic/google keys from
+    # their Docker secret files when built; idempotent across apps.
+    install_secret_keys()
     try:
         check_llm_config(config.config)
     except ValueError as exc:

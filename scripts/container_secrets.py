@@ -6,10 +6,19 @@
 `make docker-run-api` passes the API keys taken from the OS keyring as Compose
 secrets (`keychain_env.py compose --secrets`): each key is a file
 /run/secrets/<VAR> rather than an environment variable, so its value is not in
-the container config that `docker inspect` shows. The API reads its keys from
-the environment, so this entrypoint (Dockerfile.api's ENTRYPOINT) copies each
-file into os.environ and then replaces itself with the command (the image's
-CMD, or whatever `docker run <image> <command>` gives).
+the container config that `docker inspect` shows. This entrypoint
+(Dockerfile.api's ENTRYPOINT) copies the files the server needs in its
+environment into os.environ and then replaces itself with the command (the
+image's CMD, or whatever `docker run <image> <command>` gives).
+
+Not loaded: the keys the API reads from their file itself when it builds an LLM
+client (ON_DEMAND_NAMES: ANTHROPIC_API_KEY, GOOGLE_API_KEY; see
+tradingagents/api/infrastructure/secret_keys.py). They stay out of the server's
+environment, so they are not in /proc/<pid>/environ or `docker exec ... env`
+and child processes do not inherit them. The other keys are still loaded here:
+the core's OpenAI-compatible clients refuse to start without their env var
+even when given the key, and the data vendors (FRED, Alpha Vantage) read the
+environment.
 
 Which files are loaded:
   - only regular files: a symlink is never followed (it is skipped even when it
@@ -30,7 +39,9 @@ supplies that variable.
 A secret OVERRIDES a value already in the environment. The service's env_file
 (.env) has already set its variables when this runs, and a key in the keyring
 must win over .env inside the container, as it does in the env-var mode where
-compose's `environment:` overrides `env_file:`. Only keys exported from the
+compose's `environment:` overrides `env_file:`. The API gives ON_DEMAND_NAMES
+the same precedence: a usable file wins over the env var (a .env value is left
+in the environment and used only when there is no usable file). Only keys exported from the
 keyring become secrets, so a key that is only in .env is left alone (and a copy
 of it left in .env is still in the container config: remove it from .env once
 it is in the keyring; `keychain_env.py compose` warns about it).
@@ -49,8 +60,14 @@ Limits, i.e. where the values still are:
     (`docker compose down` or `rm`), not when it stops.
   - The files are mode 0444, so any user inside the container can read them,
     not only the server's user; so can anyone who can `docker exec` into it,
-    and the process environment (/proc/<pid>/environ) as well. Docker access
-    on the host is effectively root.
+    and the process environment (/proc/<pid>/environ) as well for the keys
+    loaded here. Docker access on the host is effectively root.
+  - A key read on demand still lives in the LLM client object (in the server's
+    memory) for the run that built it.
+  - Rotation still needs `docker compose up --force-recreate` (the Makefile
+    targets do it): Compose fixes the file's content when it creates the
+    container. The API re-reads ON_DEMAND_NAMES for every client, so only a
+    file replaced in place would be picked up without it.
   - The secrets directory itself is trusted: only its entries are checked for
     symlinks, so a directory that is itself a symlink is followed. Replacing
     /run/secrets needs root inside the container already.
@@ -85,6 +102,11 @@ RESERVED_NAMES = frozenset({
     "SSLKEYLOGFILE",
 })
 RESERVED_PREFIXES = ("LD_", "DYLD_", "PYTHON", "SSL_CERT_")
+# Read by the API from /run/secrets when it builds a client, never loaded here.
+# Keep in sync with ON_DEMAND_KEY_NAMES in
+# tradingagents/api/infrastructure/secret_keys.py (this script cannot import it;
+# tests/test_api_container_secrets.py checks they match).
+ON_DEMAND_NAMES = frozenset({"ANTHROPIC_API_KEY", "GOOGLE_API_KEY"})
 # O_NOFOLLOW: a symlink swapped in after the scan fails to open (ELOOP).
 # O_NONBLOCK: a FIFO swapped in does not block the open; fstat rejects it.
 OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -151,7 +173,7 @@ def read_secret(path: str, name: str) -> str | None:
 
 
 def load_secrets(directory: str) -> None:
-    """Set os.environ[NAME] from each usable file in `directory`."""
+    """Set os.environ[NAME] from each usable file in `directory` (not ON_DEMAND_NAMES)."""
     try:
         entries = sorted(os.scandir(directory), key=lambda e: e.name)
     except FileNotFoundError:
@@ -165,6 +187,8 @@ def load_secrets(directory: str) -> None:
         if problem:
             note(f"skipping {name!r}: {problem}")
             continue
+        if name in ON_DEMAND_NAMES:
+            continue  # the API reads this file itself (see the docstring)
         try:
             regular = entry.is_file(follow_symlinks=False)  # symlinks: not regular
         except OSError:

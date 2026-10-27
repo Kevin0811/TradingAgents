@@ -38,9 +38,12 @@ KEYCHAIN_ENV := $(KEYCHAIN) run --
 #   $(KEYCHAIN_COMPOSE) [--secrets] --service <svc> -- <docker compose args...>
 # Where the values end up:
 #   - API (docker-run-api*): with --secrets, as Compose secrets, i.e. files
-#     /run/secrets/<VAR> that Dockerfile.api's entrypoint
-#     (scripts/container_secrets.py) loads into the server's environment. They
-#     are not in the container config, so `docker inspect` does not show them.
+#     /run/secrets/<VAR>. The API reads ANTHROPIC_API_KEY and GOOGLE_API_KEY
+#     from their file whenever it builds an LLM client (not put in its
+#     environment, unless .env still sets it); Dockerfile.api's entrypoint
+#     (scripts/container_secrets.py) loads the others into the server's
+#     environment. They are not in the container config, so `docker inspect`
+#     does not show them.
 #   - CLI (docker-run, docker-run-ollama): as environment variables, since they
 #     run upstream's Dockerfile, which has no such entrypoint; `docker inspect`
 #     shows those values (Config.Env).
