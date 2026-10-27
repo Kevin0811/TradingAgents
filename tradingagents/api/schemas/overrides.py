@@ -83,7 +83,8 @@ class RunOverridesMixin(BaseModel):
         default=None,
         description=(
             "Effort for Anthropic models that support it (Claude Opus 4.5+, "
-            "Sonnet 4.6+, the Claude 5 family); ignored for others. Higher "
+            "Sonnet 4.6+, Haiku 5.5+, the Claude 5 family); ignored for others "
+            "(e.g. Haiku 4.5, Sonnet 4.5). Higher "
             "effort thinks longer and costs more tokens."
         ),
     )

@@ -25,6 +25,7 @@ from tradingagents.api.domain.services.symbol_settings import (
     SymbolSettings,
     validate_setting,
 )
+from tradingagents.api.infrastructure.anthropic_effort import install as install_anthropic_effort
 from tradingagents.api.infrastructure.llm_provider import check_llm_config
 from tradingagents.api.infrastructure.log_filters import install_cancel_log_filter
 from tradingagents.api.infrastructure.ollama_cache_trimmer import OllamaCacheTrimmer
@@ -127,6 +128,9 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     # threadpool, all in this process) take the anthropic/google keys from
     # their Docker secret files when built; idempotent across apps.
     install_secret_keys()
+    # anthropic_effort reaches Claude Haiku 5.5+ too (the core sends it to
+    # Opus/Sonnet/Fable only); process-wide and idempotent like the above.
+    install_anthropic_effort()
     try:
         check_llm_config(config.config)
     except ValueError as exc:
