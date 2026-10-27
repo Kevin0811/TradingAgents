@@ -86,7 +86,9 @@ def test_api_anthropic_effort_haiku_5_5_and_later_supported(model):
     ["claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-haiku-5", "claude-haiku-5-0",
      "claude-haiku-5-4", "claude-haiku-5-20261001", "claude-3-5-haiku-20241022",
      "claude-3-haiku-20240307", "claude-haiku-4-7-preview", "claude-haiku-5-5-preview",
-     "claude-haiku-latest", "claude-haiku-5-5-2026", "", "haiku-5-5"],
+     "claude-haiku-latest", "claude-haiku-5-5-2026", "", "haiku-5-5",
+     # A trailing newline is not supported (fullmatch, not match with "$").
+     "claude-haiku-5-5\n", "claude-haiku-5-5-20261001\n"],
 )
 def test_api_anthropic_effort_older_or_odd_haiku_not_supported(model):
     assert not anthropic_effort.haiku_supports_effort(model)

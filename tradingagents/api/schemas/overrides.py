@@ -84,7 +84,7 @@ class RunOverridesMixin(BaseModel):
         description=(
             "Effort for Anthropic models that support it (Claude Opus 4.5+, "
             "Sonnet 4.6+, Haiku 5.5+, the Claude 5 family); ignored for others "
-            "(Haiku 4.5 and older). Higher "
+            "(e.g. Haiku 4.5, Sonnet 4.5). Higher "
             "effort thinks longer and costs more tokens."
         ),
     )

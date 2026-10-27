@@ -12,11 +12,19 @@ the thinking counted against ``max_tokens``.
 ``install()`` (called by ``create_app``) rebinds that module-level predicate to
 a wrapper that also accepts ``claude-haiku-<major>-<minor>`` at version 5.5 or
 later, optionally with a dated snapshot suffix (``claude-haiku-5-5-20261001``).
+No dated Haiku 5.5 ID exists today; the dated form is accepted only to mirror
+the shape of Anthropic's dated IDs (``claude-haiku-4-5-20251001``). The core's
+own predicate accepts no dated form for any family.
 ``get_llm`` looks the name up in its module's globals on every call, so the
 rebinding reaches every ``AnthropicClient``: the analysis graph's
 (``TradingAgentsGraph``) and the API's own (``llm_provider``). Haiku 4.5, 5.0
 and older Haiku names (``claude-3-5-haiku-...``) stay excluded. No default
 changes: with ``anthropic_effort`` unset the core passes no ``effort`` at all.
+``anthropic_effort`` is shared by both tiers, so an effort set for an Opus or
+Sonnet tier now also applies to a Haiku 5.5 tier.
+
+This applies only to the API process: the CLI never calls ``create_app``, so it
+still drops effort for Haiku 5.5.
 
 Why the predicate rather than the ``create_tier_client`` wrapper of
 ``secret_keys``: that wrapper returns the core's client before ``get_llm``
@@ -35,9 +43,10 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-# Same name shape as the core's other families: a single-number or dotted
-# version, then an optional date snapshot.
-_HAIKU_MODEL = re.compile(r"^claude-haiku-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?$")
+# Version shape as in the core's predicate (a single-number or dotted
+# version), plus an optional date snapshot (see the module docstring). Used
+# with fullmatch (not match with "$", which also accepts a trailing newline).
+_HAIKU_MODEL = re.compile(r"claude-haiku-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?")
 HAIKU_EFFORT_MIN_VERSION: tuple[int, int] = (5, 5)
 
 # A wrapper made by this module has _WRAPPED_ATTR set to _MARK (so install() is
@@ -54,7 +63,7 @@ def haiku_supports_effort(model: str) -> bool:
     """Whether ``model`` is a Claude Haiku at version 5.5 or later."""
     if not isinstance(model, str):
         return False
-    match = _HAIKU_MODEL.match(model.lower())
+    match = _HAIKU_MODEL.fullmatch(model.lower())
     if not match:
         return False
     major = int(match.group(1))
