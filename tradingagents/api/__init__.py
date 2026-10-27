@@ -184,6 +184,9 @@ API keys:
     ``api_key=``, and the file wins over the env var; the key is never put in
     the environment. ``create_app`` installs this for the core's
     ``TradingAgentsGraph`` too. See ``infrastructure/secret_keys.py``.
+    ``create_app`` also extends the core's Anthropic effort predicate
+    process-wide so ``anthropic_effort`` reaches Claude Haiku 5.5+ (see
+    ``infrastructure/anthropic_effort.py``).
 
 Architecture:
     The API follows Clean Architecture principles with the following layers:
