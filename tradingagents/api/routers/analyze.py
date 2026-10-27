@@ -78,7 +78,7 @@ DISCONNECT_POLL_SECONDS = 1.0
         "- `deep_think_provider`, `quick_think_provider`: run a tier on another "
         "provider (e.g. 'anthropic' with `deep_think_llm` 'claude-opus-5-5')\n"
         "- `anthropic_effort`: 'low'/'medium'/'high'/'xhigh'/'max' for Claude models "
-        "that support it\n"
+        "that support it (Opus 4.5+, Sonnet 4.6+, Haiku 5.5+, the Claude 5 family)\n"
         "- `max_tokens`, `llm_max_retries`: cap output tokens / retry attempts for "
         "this run\n\n"
         "A configuration that would fail every LLM call (an unknown provider, or a "
