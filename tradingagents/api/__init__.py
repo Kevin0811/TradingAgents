@@ -176,6 +176,15 @@ Local model (Ollama) cache trim:
       (1024; 0 = off). A ``create_app(overrides=...)`` value wins over the
       env var; an empty env value counts as unset.
 
+API keys:
+    LLM clients and data vendors read their keys from the environment, except
+    ``ANTHROPIC_API_KEY`` and ``GOOGLE_API_KEY`` when a Docker/Compose secret
+    file ``/run/secrets/<VAR>`` holds them (``make docker-run-api``): the API
+    then reads the file each time it builds a client and passes the key as
+    ``api_key=``, and the file wins over the env var; the key is never put in
+    the environment. ``create_app`` installs this for the core's
+    ``TradingAgentsGraph`` too. See ``infrastructure/secret_keys.py``.
+
 Architecture:
     The API follows Clean Architecture principles with the following layers:
     - Core: Global exceptions, error handlers, middlewares

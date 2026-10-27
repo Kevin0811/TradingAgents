@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
+from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.core.task_manager import (
     CANCELLED_WHILE_RUNNING,
     CancelOutcome,
@@ -122,11 +123,14 @@ class TaskService:
             )
 
         except Exception as e:
-            logger.exception("Task %s failed with unexpected error", task_id)
+            logger.error(
+                "Task %s failed with unexpected error: %s", task_id, error_text(e),
+                exc_info=traceback_is_safe(e),
+            )
             self._task_manager.update_task(
                 task_id,
                 status=TaskStatus.FAILED,
-                error=str(e),
+                error=error_text(e),
             )
 
     def get_task(self, task_id: str) -> Any:

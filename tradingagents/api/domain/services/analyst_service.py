@@ -20,6 +20,7 @@ from tradingagents.agents.context import (
     resolve_instrument_identity,
 )
 from tradingagents.api.core.exceptions import AnalysisError
+from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalystReport
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -92,13 +93,15 @@ class AnalystService:
         except AnalysisError:
             raise
         except Exception as e:
-            logger.exception(
-                "%s analyst failed for %s on %s",
-                analyst_type, ticker, trade_date,
+            # error_text: see AnalysisService.run_analysis.
+            logger.error(
+                "%s analyst failed for %s on %s: %s",
+                analyst_type, ticker, trade_date, error_text(e),
+                exc_info=traceback_is_safe(e),
             )
             raise AnalysisError(
                 message=f"{analyst_type} analyst failed for {ticker} on {trade_date}",
-                detail=str(e),
+                detail=error_text(e),
             ) from e
 
     def _run_market_analyst(

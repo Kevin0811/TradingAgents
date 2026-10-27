@@ -67,7 +67,7 @@ class RunOverridesMixin(BaseModel):
             "Run the deep-thinking model on another provider for this run (e.g. "
             "'anthropic' with deep_think_llm 'claude-opus-5-5'), using that "
             "provider's default endpoint and its API key from the server "
-            "environment. Set deep_think_llm with it. Default: the server's "
+            "(its Docker secret file or environment). Set deep_think_llm with it. Default: the server's "
             "llm_provider."
         ),
     )

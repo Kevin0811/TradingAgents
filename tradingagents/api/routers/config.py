@@ -29,9 +29,10 @@ router = APIRouter(
         "Use this to see what a request will get if it does not override a "
         "field -- most of these are only otherwise settable via server-side "
         "environment variables.\n\n"
-        "Never includes API keys or secrets: those are read directly from the "
-        "environment by LLM clients and data vendors and are never part of this "
-        "config."
+        "Never includes API keys or secrets: those are read by LLM clients and "
+        "data vendors from the environment, or (Anthropic and Google keys) from "
+        "their Docker secret file when a client is built, and are never part of "
+        "this config."
     ),
 )
 def get_current_config(config: ApiConfig = Depends(get_config)) -> ConfigResponse:

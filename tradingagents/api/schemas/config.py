@@ -11,8 +11,9 @@ class ConfigResponse(BaseModel):
     settings.
 
     Deliberately excludes server-internal paths (project_dir, results_dir,
-    data_cache_dir, ...) and never carries API keys/secrets -- those are read
-    directly from the environment by LLM clients and data vendors and are never
+    data_cache_dir, ...) and never carries API keys/secrets -- those are read by
+    LLM clients and data vendors from the environment, or (anthropic and google
+    keys) from their Docker secret file when a client is built, and are never
     stored in this config dict.
     """
 

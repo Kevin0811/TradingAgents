@@ -23,7 +23,8 @@ pytestmark = pytest.mark.unit
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "container_secrets.py"
 DIR_VAR = "TRADINGAGENTS_SECRETS_DIR"
-VARS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OTHER_KEY", "BIG_KEY", "BAD_UTF8_KEY")
+VARS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OTHER_KEY", "BIG_KEY",
+        "BAD_UTF8_KEY")
 
 
 def load_script():
@@ -91,12 +92,41 @@ def test_api_secrets_valid_file_sets_env_and_overrides(h, monkeypatch):
     # env_file (.env) already set it: the keyring value in the secret wins.
     monkeypatch.setenv("OPENAI_API_KEY", "from-dotenv")
     h.put("OPENAI_API_KEY", "sk-from-keyring")
-    h.put("ANTHROPIC_API_KEY", "sk-ant-keyring")
+    h.put("OTHER_KEY", "sk-other-keyring")
     child, code, cap = h.main("python", "run_server.py")
     assert code is None
     assert child.env["OPENAI_API_KEY"] == "sk-from-keyring"
-    assert child.env["ANTHROPIC_API_KEY"] == "sk-ant-keyring"
+    assert child.env["OTHER_KEY"] == "sk-other-keyring"
     assert cap.out == cap.err == ""
+
+
+@pytest.mark.parametrize("name", ["ANTHROPIC_API_KEY", "GOOGLE_API_KEY"])
+def test_api_secrets_on_demand_keys_not_loaded(h, name):
+    # The API reads these from their file when it builds a client
+    # (tradingagents/api/infrastructure/secret_keys.py): never in the environment.
+    h.put(name, "sk-on-demand-value")
+    h.put("OPENAI_API_KEY", "sk-openai-keyring")
+    child, code, cap = h.main("python", "run_server.py")
+    assert code is None
+    assert name not in child.env
+    assert "sk-on-demand-value" not in child.env.values()
+    assert child.env["OPENAI_API_KEY"] == "sk-openai-keyring"
+    assert cap.out == cap.err == ""
+
+
+def test_api_secrets_on_demand_key_leaves_env_file_value_alone(h, monkeypatch):
+    # A .env value is neither overwritten nor removed; the API prefers the file.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "from-dotenv")
+    h.put("ANTHROPIC_API_KEY", "sk-ant-keyring")
+    child, _, _ = h.main("true")
+    assert child.env["ANTHROPIC_API_KEY"] == "from-dotenv"
+
+
+def test_api_secrets_on_demand_names_match_the_api():
+    # The script cannot import tradingagents, so it keeps its own copy.
+    from tradingagents.api.infrastructure.secret_keys import ON_DEMAND_KEY_NAMES
+
+    assert load_script().ON_DEMAND_NAMES == ON_DEMAND_KEY_NAMES
 
 
 @pytest.mark.parametrize("content", ["sk-line\n", "sk-line\r\n", "sk-line\n\n\r\n"])
@@ -243,15 +273,17 @@ def test_api_secrets_real_exec(tmp_path):
     secrets = tmp_path / "secrets"
     secrets.mkdir()
     (secrets / "OPENAI_API_KEY").write_text("sk-real-exec\n")
+    (secrets / "ANTHROPIC_API_KEY").write_text("sk-ant-real-exec\n")
     env = {k: v for k, v in os.environ.items() if "KEY" not in k}
     env.update({DIR_VAR: str(secrets), "OPENAI_API_KEY": "from-dotenv"})
     res = subprocess.run(
         [sys.executable, str(SCRIPT), sys.executable, "-c",
-         "import os,sys; print(os.environ['OPENAI_API_KEY']=='sk-real-exec'); sys.exit(7)"],
+         "import os,sys; print(os.environ['OPENAI_API_KEY']=='sk-real-exec',"
+         " 'ANTHROPIC_API_KEY' in os.environ); sys.exit(7)"],
         env=env, capture_output=True, text=True, timeout=30,
     )
     assert res.returncode == 7
-    assert res.stdout == "True\n"
+    assert res.stdout == "True False\n"
     assert "sk-real-exec" not in res.stderr
 
 
@@ -285,10 +317,10 @@ def test_api_secrets_symlink_to_outside_file_skipped(h, tmp_path, monkeypatch):
     h.values.append("dummy-outside-value")
     monkeypatch.setenv("OPENAI_API_KEY", "from-dotenv")
     (h.dir / "OPENAI_API_KEY").symlink_to(outside)
-    h.put("ANTHROPIC_API_KEY", "dummy-regular")
+    h.put("OTHER_KEY", "dummy-regular")
     child, _, cap = h.main("true")
     assert child.env["OPENAI_API_KEY"] == "from-dotenv"
-    assert child.env["ANTHROPIC_API_KEY"] == "dummy-regular"
+    assert child.env["OTHER_KEY"] == "dummy-regular"
     assert cap.err == "container-secrets: skipping OPENAI_API_KEY: not a regular file\n"
 
 
