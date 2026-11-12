@@ -24,8 +24,8 @@ What is read, and what never is:
   run's ``checkpoint_ns`` (the analyst whose subgraph called it);
 * inputs, prompts, tool arguments and tool outputs are never read.
 
-Callbacks come from several threads at once: each takes one lock, does O(1)
-work with no I/O, and never raises.
+Callbacks come from several threads at once: each takes the emitter's lock
+(then the log's), does O(1) work with no I/O, and never raises.
 """
 
 from __future__ import annotations

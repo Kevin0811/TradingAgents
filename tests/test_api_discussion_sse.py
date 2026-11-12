@@ -178,7 +178,7 @@ class TestEventStream:
         assert events[-1]["data"] == {"status": "completed"}
 
     def test_a_stream_ends_at_its_max_lifetime_and_resumes(self, app, monkeypatch):
-        monkeypatch.setattr(discussion, "MAX_STREAM_SECONDS", 0.3)
+        monkeypatch.setattr(discussion, "MAX_STREAM_SECONDS", 1.0)
         release = threading.Event()
         model = install_offline(monkeypatch)
         model.hook = lambda n: release.wait(10)

@@ -317,8 +317,13 @@ class DiscussionStore:
             log.finish(status)
 
     def drop(self, task_id: str) -> None:
+        """Forget a task's log. A log not yet finished (a queued task deleted
+        before it ran) is first finished as cancelled, so an open stream on it
+        still receives a terminal ``task_status`` instead of hanging."""
         with self._lock:
-            self._logs.pop(task_id, None)
+            log = self._logs.pop(task_id, None)
+        if log is not None:
+            log.finish("cancelled")
 
     def __len__(self) -> int:
         with self._lock:
