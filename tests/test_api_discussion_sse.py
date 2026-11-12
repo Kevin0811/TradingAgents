@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from tests.discussion_fakes import TICKER, TRADE_DATE, install_offline
 from tradingagents.api import config as api_config
 from tradingagents.api.app import create_app
-from tradingagents.api.core.discussion_log import MAX_EVENTS, DiscussionLog
+from tradingagents.api.core.discussion_log import MAX_EVENTS, DiscussionLog, DiscussionStore
 from tradingagents.api.routers import discussion
 from tradingagents.api.schemas.task import TaskCreateRequest
 
@@ -138,12 +138,103 @@ class TestEventStream:
         # A task that never reaches the worker: its log stays silent until cancelled.
         task, _ = app.state.task_manager.create_task(
             TaskCreateRequest(ticker=TICKER, trade_date=TRADE_DATE))
-        timer = threading.Timer(0.4, app.state.task_manager.cancel_task, args=(task.task_id,))
-        timer.start()
-        events, comments = _read(client, task.task_id)
-        timer.join()
-        assert comments.count(": ping") >= 3
-        assert [e["data"] for e in events] == [{"status": "cancelled"}]
+        pings, data = 0, []
+        with client.stream("GET", f"{TASKS}/{task.task_id}/events") as resp:
+            for line in resp.iter_lines():
+                if line == ": ping":
+                    pings += 1
+                    if pings == 3:   # the reader cancels once it has seen three
+                        app.state.task_manager.cancel_task(task.task_id)
+                elif line.startswith("data: "):
+                    data.append(json.loads(line[len("data: "):])["data"])
+        assert pings >= 3
+        assert data == [{"status": "cancelled"}]
+
+    def test_a_cursor_past_the_end_still_gets_the_rest_of_the_run(self, app, monkeypatch):
+        release = threading.Event()
+        model = install_offline(monkeypatch)
+        model.hook = lambda n: release.wait(10)   # every analyst holds at its first call
+        client = TestClient(app)
+        task_id = _start(client)
+        log = app.state.discussions.get(task_id)
+        deadline = time.monotonic() + 10
+        while len(model.calls) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(model.calls) == 4   # the log is still until release
+        last = log.last_id
+        out: list = []
+        reader = threading.Thread(
+            target=lambda: out.append(_read(client, task_id, params={"after": last + 5})[0]))
+        reader.start()
+        deadline = time.monotonic() + 10
+        while log.waiter_count < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        release.set()
+        reader.join(15)
+        app.state.task_worker.shutdown(wait=True)
+        (events,) = out
+        assert [e["id"] for e in events] == list(range(last + 1, log.last_id + 1))
+        assert events[-1]["type"] == "task_status"
+        assert events[-1]["data"] == {"status": "completed"}
+
+    def test_a_stream_ends_at_its_max_lifetime_and_resumes(self, app, monkeypatch):
+        monkeypatch.setattr(discussion, "MAX_STREAM_SECONDS", 0.3)
+        release = threading.Event()
+        model = install_offline(monkeypatch)
+        model.hook = lambda n: release.wait(10)
+        client = TestClient(app)
+        task_id = _start(client)
+        log = app.state.discussions.get(task_id)
+        started = time.monotonic()
+        first, _ = _read(client, task_id)   # a clean EOF while the run is held
+        assert time.monotonic() - started < 5
+        assert first and not log.finished
+        assert {"completed"}.isdisjoint(e["data"].get("status") for e in first)
+        release.set()
+        app.state.task_worker.shutdown(wait=True)
+        rest, _ = _read(client, task_id, headers={"Last-Event-ID": str(first[-1]["id"])})
+        assert first + rest == log.read()
+        assert rest[-1]["data"] == {"status": "completed"}
+
+    def test_closing_the_store_ends_open_streams_at_once(self, app):
+        with TestClient(app):
+            assert not app.state.discussions.closing.is_set()
+        assert app.state.discussions.closing.is_set()   # the lifespan shutdown sets it
+
+    async def test_a_waiting_stream_ends_when_the_store_closes(self):
+        store = DiscussionStore()
+        log = store.create("t")
+        log.append("task_status", {"status": "running"})
+        stream = discussion.stream_events(log, 0, store.closing)
+        assert '"id":1' in await anext(stream)
+        waiting = asyncio.ensure_future(anext(stream))
+        deadline = time.monotonic() + 5
+        while log.waiter_count < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert log.waiter_count == 1
+        store.close()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(waiting, 2)   # long before the 15 s ping
+        assert log.waiter_count == 0
+        # A stream opened after the close ends once it has caught up.
+        assert [c async for c in discussion.stream_events(log, 0, store.closing)] != []
+
+    def test_line_separators_stay_inside_one_data_line(self, app):
+        client = TestClient(app)
+        task, _ = app.state.task_manager.create_task(
+            TaskCreateRequest(ticker=TICKER, trade_date=TRADE_DATE))
+        text = "a\u2028b\u2029c\x85d"
+        log = app.state.discussions.get(task.task_id)
+        log.append("turn_completed", {"turn": 1, "agent_id": "market", "content": text,
+                                      "truncated": False})
+        app.state.task_manager.cancel_task(task.task_id)
+        raw = client.get(f"{TASKS}/{task.task_id}/events").text
+        # Even a reader that breaks lines on U+2028/U+2029/U+0085 sees one data: line.
+        lines = raw.splitlines()
+        data = [json.loads(line[len("data: "):]) for line in lines if line.startswith("data: ")]
+        assert len(data) == 2 and len([ln for ln in lines if ln]) == 4
+        assert data[0]["data"]["content"] == text
+        assert data == log.read()
 
     def test_a_cancelled_run_ends_with_aborted_turns_and_cancelled(self, app, monkeypatch):
         reached, release = threading.Event(), threading.Event()
@@ -191,12 +282,12 @@ class TestSubscriberMemory:
         for _ in range(MAX_EVENTS + 500):
             log.append("phase_changed", {"phase": "analysis"})
         # The log stays bounded and is shared, never copied per subscriber.
-        assert log.last_id == MAX_EVENTS
+        assert log.last_id == MAX_EVENTS + 1   # the kept events and the gap marker
         assert all(a is b for a, b in zip(log.read(), log.read(), strict=True))
         assert log.waiter_count == 0   # a subscriber that is not waiting holds no waiter
-        reader = discussion.stream_events(log, MAX_EVENTS - 1)
+        reader = discussion.stream_events(log, MAX_EVENTS)
         chunk = await anext(reader)
-        assert chunk.count("id: ") == 1
+        assert chunk.count("id: ") == 1 and '"type":"gap"' in chunk
         waiting = asyncio.ensure_future(anext(reader))
         await asyncio.sleep(0.05)
         assert log.waiter_count == 1

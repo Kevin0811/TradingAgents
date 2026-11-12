@@ -110,8 +110,12 @@ UNKNOWN_SEAT = Seat("unknown", "unknown", None, None)
 
 # A turn's text is capped at 32 KiB of UTF-8 (cut on a character boundary).
 MAX_TURN_CONTENT_BYTES = 32 * 1024
-# One task's turn text in all: 32 turns (the longest run allowed) at the cap.
-MAX_TASK_CONTENT_BYTES = 1024 * 1024
+# One task's turn text in all: max(1 MiB, expected_turns x 32 KiB), at most
+# 4 MiB (see task_content_budget). The final decision's 32 KiB is reserved
+# within it, so it is never cut short by the turns before it.
+MIN_TASK_CONTENT_BYTES = 1024 * 1024
+MAX_TASK_CONTENT_BYTES = 4 * 1024 * 1024
+FINAL_AGENT_ID = "portfolio_manager"
 # Tool calls kept per task; each has one tool_call and one tool_result event,
 # so at most 300 tool events. Later calls are counted in the terminal
 # task_status (and the transcript) as ``tools_dropped``.
@@ -147,16 +151,28 @@ def analyst_agent_ids(core_keys: Iterable[str]) -> list[str]:
     return [ANALYST_AGENT_IDS.get(k, k) for k in core_keys]
 
 
+def task_content_budget(turns: int | None) -> int:
+    """A task's turn-text budget: max(1 MiB, turns x 32 KiB), at most 4 MiB.
+
+    ``turns`` is the run's ``expected_turns`` (None when unknown: 1 MiB).
+    """
+    wanted = (turns or 0) * MAX_TURN_CONTENT_BYTES
+    return min(MAX_TASK_CONTENT_BYTES, max(MIN_TASK_CONTENT_BYTES, wanted))
+
+
 def unmapped_nodes(node_names: Iterable[str]) -> set[str]:
     """Graph nodes neither mapped to a seat nor explicitly ignored."""
     return {n for n in node_names if n not in MAPPING and n not in IGNORED_NODES}
 
 
 def cap_utf8(text: str, limit: int) -> tuple[str, bool]:
-    """``text`` cut to at most ``limit`` UTF-8 bytes on a character boundary."""
-    raw = text.encode("utf-8")
+    """``text`` cut to at most ``limit`` UTF-8 bytes on a character boundary.
+
+    A character UTF-8 cannot encode (a lone surrogate) becomes ``?``.
+    """
+    raw = text.encode("utf-8", "replace")
     if len(raw) <= limit:
-        return text, False
+        return raw.decode("utf-8"), False
     return raw[: max(0, limit)].decode("utf-8", "ignore"), True
 
 
@@ -203,6 +219,8 @@ class TaskEventEmitter(BaseCallbackHandler):
         self._tool_calls = 0
         self._tools_dropped = 0
         self._content_bytes = 0
+        self._content_budget = task_content_budget(None)
+        self._final_done = False
 
     @property
     def log(self) -> DiscussionLog:
@@ -222,7 +240,9 @@ class TaskEventEmitter(BaseCallbackHandler):
     ) -> None:
         """Emit ``run_started`` and ``task_status: running``."""
         analysts = list(analysts)
+        turns = expected_turns(len(analysts), debate_rounds, risk_rounds, checkpoint_enabled)
         with self._lock:
+            self._content_budget = task_content_budget(turns)
             self._log.start_clock()
             self._log.append(RUN_STARTED, {
                 "ticker": ticker,
@@ -230,8 +250,7 @@ class TaskEventEmitter(BaseCallbackHandler):
                 "analysts": analysts,
                 "debate_rounds": debate_rounds,
                 "risk_rounds": risk_rounds,
-                "expected_turns": expected_turns(
-                    len(analysts), debate_rounds, risk_rounds, checkpoint_enabled),
+                "expected_turns": turns,
                 "mapping_version": MAPPING_VERSION,
             })
             self._log.append(TASK_STATUS, {"status": STATUS_RUNNING})
@@ -300,9 +319,13 @@ class TaskEventEmitter(BaseCallbackHandler):
                 if seat.content_path is not None:
                     value = _dig(outputs, seat.content_path)
                     text = value if isinstance(value, str) else ""
-                    budget = max(0, MAX_TASK_CONTENT_BYTES - self._content_bytes)
+                    final = seat.agent_id == FINAL_AGENT_ID
+                    # Every turn before the final decision leaves its 32 KiB free.
+                    reserve = 0 if final or self._final_done else MAX_TURN_CONTENT_BYTES
+                    budget = max(0, self._content_budget - reserve - self._content_bytes)
                     content, truncated = cap_utf8(text, min(MAX_TURN_CONTENT_BYTES, budget))
                     self._content_bytes += len(content.encode("utf-8"))
+                    self._final_done = self._final_done or final
                 self._log.append(TURN_COMPLETED, {
                     "turn": turn, "agent_id": seat.agent_id,
                     "content": content, "truncated": truncated,

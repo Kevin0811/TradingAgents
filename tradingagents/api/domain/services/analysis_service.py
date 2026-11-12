@@ -187,8 +187,10 @@ class AnalysisService:
             ) from e
         finally:
             if emitter is not None:
-                emitter.close()
-                DISCUSSION_EMITTER.reset(emitter_token)
+                try:
+                    emitter.close()
+                finally:
+                    DISCUSSION_EMITTER.reset(emitter_token)
 
     def _callbacks(
         self,

@@ -150,16 +150,21 @@ class TaskService:
         """Write a finished run's transcript next to its results.
 
         Skipped for a task deleted meanwhile (its log is gone from the store)
-        and for one whose run never started.
+        and for one whose run never started. Never raises: the task's own
+        outcome is already recorded, and a transcript failure is only logged.
         """
         if log is None or self._transcripts is None or self._discussions is None:
             return
-        if self._discussions.get(task_id) is not log or not log.finished:
-            return
-        transcript = log.transcript()
-        if transcript["run_started"] is None:
-            return
-        self._transcripts.write(ticker, transcript)
+        try:
+            if self._discussions.get(task_id) is not log or not log.finished:
+                return
+            transcript = log.transcript()
+            if transcript["run_started"] is None:
+                return
+            self._transcripts.write(ticker, transcript)
+        except Exception:  # noqa: BLE001 - the worker must never see this
+            # The task id only: the error could quote the transcript's content.
+            logger.warning("Could not save the discussion transcript of task %s", task_id)
 
     def get_task(self, task_id: str) -> Any:
         """Get task by ID.

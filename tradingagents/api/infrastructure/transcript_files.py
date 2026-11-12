@@ -4,6 +4,10 @@ A transcript is written once, when its task ends, next to the run's other
 results: ``<results_dir>/<TICKER>/TradingAgentsStrategy_logs/discussion_<task_id>.json``
 (the core keeps ``full_states_log_<date>.json`` in the same folder). The write
 is atomic: a temporary file in the same folder, then ``os.replace``.
+
+``<TICKER>`` is the ticker the analysis request named. Transcripts are
+durable, like the core's ``full_states_log``: deleting the task (``DELETE``)
+or its expiry drops only the in-memory log, never the file.
 """
 
 from __future__ import annotations
@@ -55,9 +59,10 @@ class TranscriptFiles:
         task_id = _canonical_task_id(str(transcript.get("task_id", "")))
         if task_id is None:
             return None
-        path = self.path_for(ticker, task_id)
         tmp_name: str | None = None
         try:
+            # Inside the try: an unsafe ticker raises ValueError here.
+            path = self.path_for(ticker, task_id)
             path.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 "w", encoding="utf-8", dir=path.parent, prefix=".discussion-",

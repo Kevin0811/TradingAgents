@@ -16,10 +16,14 @@ cursor): the log is never copied per subscriber and a client that stops
 reading costs nothing but that integer. ``ms`` counts from the start of the
 run (0 before it).
 
-Bounds: at most :data:`MAX_EVENTS` events per log, the terminal
-``task_status`` always fits; past that, events are counted in ``dropped`` and
-reported in the terminal ``task_status``. Turn text is capped by the emitter
-(see ``infrastructure/discussion_capture.py``).
+Bounds: at most :data:`MAX_EVENTS` events per log. The first event past that
+is replaced by one ``gap`` event, ``{"dropped_from_id": N}`` (N is the gap's
+own id: nothing from there on but the terminal event is kept), so a resuming
+client sees the loss; later events are only counted, and the count is
+reported in the terminal ``task_status`` as ``events_dropped``. The gap and
+the terminal ``task_status`` always fit, so a log holds at most
+``MAX_EVENTS + 2`` events. Turn text is capped by the emitter (see
+``infrastructure/discussion_capture.py``).
 """
 
 from __future__ import annotations
@@ -42,17 +46,20 @@ TOOL_RESULT = "tool_result"
 TURN_COMPLETED = "turn_completed"
 TURN_ABORTED = "turn_aborted"
 TASK_STATUS = "task_status"
+# Sent once, in the log, when the log is full (see the module docstring).
+GAP = "gap"
 PERSISTED_TYPES = frozenset({
     RUN_STARTED, PHASE_CHANGED, TURN_STARTED, TOOL_CALL, TOOL_RESULT,
-    TURN_COMPLETED, TURN_ABORTED, TASK_STATUS,
+    TURN_COMPLETED, TURN_ABORTED, TASK_STATUS, GAP,
 })
 # Live-only types: part of schema v1, never stored and not emitted yet
 # (token streaming is off and unimplemented).
 TOKEN = "token"
-GAP = "gap"
-LIVE_ONLY_TYPES = frozenset({TOKEN, GAP})
+LIVE_ONLY_TYPES = frozenset({TOKEN})
 
 # task_status values. "running" is sent when the run starts; the others end the log.
+# A log whose run has not started reports "queued" in its transcript.
+STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
@@ -80,7 +87,7 @@ class DiscussionLog:
         self._events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._t0: float | None = None
-        self._status: str = "pending"
+        self._status: str = STATUS_QUEUED
         self._finished = False
         self._dropped = 0
         self._notes: dict[str, Any] = {}
@@ -100,6 +107,8 @@ class DiscussionLog:
             if self._finished:
                 return None
             if len(self._events) >= MAX_EVENTS:
+                if not self._dropped:   # the first loss: one marker, past the cap
+                    self._append_locked(GAP, {"dropped_from_id": len(self._events) + 1})
                 self._dropped += 1
                 return None
             if type_ == TASK_STATUS:
@@ -134,10 +143,18 @@ class DiscussionLog:
             "data": data,
         }
         self._events.append(event)
+        self._wake_locked()
+        return event
+
+    def _wake_locked(self) -> None:
         for loop, waiter in self._waiters:
             with contextlib.suppress(RuntimeError):  # the subscriber's loop has closed
                 loop.call_soon_threadsafe(waiter.set)
-        return event
+
+    def wake(self) -> None:
+        """Wake every waiting subscriber (e.g. so it sees the server is closing)."""
+        with self._lock:
+            self._wake_locked()
 
     # -- reading ---------------------------------------------------------------
 
@@ -168,17 +185,20 @@ class DiscussionLog:
             end = len(self._events) if limit is None else min(len(self._events), start + limit)
             return self._events[start:end]
 
-    async def wait(self, after: int, timeout: float) -> bool:
-        """Wait until there is an event past ``after`` or the log has finished.
+    async def wait(
+        self, after: int, timeout: float, stop: threading.Event | None = None
+    ) -> bool:
+        """Wait until there is an event past ``after``, the log has finished or ``stop`` is set.
 
-        Returns True if there is something to read (or the log has finished),
-        False on timeout.
+        Returns True if there is something to read (or the log has finished,
+        or ``stop`` is set), False on timeout. ``stop`` is checked under the
+        log's lock, so a setter that then calls :meth:`wake` is never missed.
         """
         loop = asyncio.get_running_loop()
         waiter = asyncio.Event()
         key = (loop, waiter)
         with self._lock:
-            if len(self._events) > after or self._finished:
+            if len(self._events) > after or self._finished or (stop is not None and stop.is_set()):
                 return True
             self._waiters.add(key)
         try:
@@ -269,6 +289,16 @@ class DiscussionStore:
     def __init__(self) -> None:
         self._logs: dict[str, DiscussionLog] = {}
         self._lock = threading.Lock()
+        # Set when the server shuts down: open event streams end at once.
+        self.closing = threading.Event()
+
+    def close(self) -> None:
+        """Mark the store closing and wake every waiting subscriber so its stream ends."""
+        self.closing.set()
+        with self._lock:
+            logs = list(self._logs.values())
+        for log in logs:
+            log.wake()
 
     def create(self, task_id: str) -> DiscussionLog:
         with self._lock:

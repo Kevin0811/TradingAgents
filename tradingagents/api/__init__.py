@@ -142,6 +142,43 @@ Analysis tasks:
     LangChain's and the core's warnings about the cancel exception are
     filtered out; each cancelled task logs one INFO line.
 
+Discussion events (Plan 08, event schema v1):
+    An async task records its run's discussion as it happens: who speaks, in
+    which phase, the names of the tools each analyst calls, and each turn's
+    final text (the state field the node returns, capped at 32 KiB of UTF-8;
+    a task's turn text in all at max(1 MiB, expected_turns x 32 KiB), at most
+    4 MiB, with 32 KiB always kept for the portfolio manager's decision).
+    Prompts, tool arguments and tool outputs are never recorded. The sync
+    ``POST /analyze`` records none.
+
+    - ``GET /analyze/tasks/{task_id}/events`` server-sent events, one JSON
+      envelope ``{id, v, type, ms, at, data}`` per ``data:`` line, ``id``
+      counting from 1 per task with no gaps. Resume with ``Last-Event-ID``
+      (or ``?after=N``); a cursor past the end is taken as the end. A ``:
+      ping`` comment every 15 s. The stream ends after the terminal
+      ``task_status``, and also, between two events, after 300 s or when the
+      server shuts down: reconnect with ``Last-Event-ID``. U+2028, U+2029 and
+      U+0085 are sent JSON-escaped, so a ``data:`` line never holds a
+      character some readers take for a line break.
+    - ``GET /analyze/tasks/{task_id}/transcript`` the turns as JSON; its
+      ``status`` is ``queued`` until the run starts.
+
+    A task keeps at most 1000 events and 150 tool calls. At the first event
+    past 1000 one ``gap`` event ``{dropped_from_id}`` is sent; after it only
+    the terminal ``task_status`` (with ``events_dropped``) is. Calls past 150
+    are counted in ``tools_dropped``. The log lives as long as its task (the
+    TTL; ``/events`` is 404 after it). When a run ends, its transcript is
+    written to ``<results_dir>/<ticker>/TradingAgentsStrategy_logs/
+    discussion_<task_id>.json`` (``<ticker>``: the request's ticker), and
+    ``/transcript`` serves that file once the task is gone. The file is
+    durable, like the core's ``full_states_log``: ``DELETE`` keeps it.
+
+    Shutdown: ``uvicorn`` waits on open responses before it runs the app's
+    shutdown, so start it with ``--timeout-graceful-shutdown 5`` (as
+    ``run_server.py`` does); otherwise an open event stream holds up
+    shutdown for up to 300 s. The app's shutdown then ends any stream still
+    open.
+
 Token usage:
     A task, once its run has ended, and the sync ``POST /analyze`` response
     carry ``token_usage``: the run's LLM calls and input, output and prompt-

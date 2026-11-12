@@ -47,7 +47,8 @@ async def lifespan(app: FastAPI):
     Ensures required directories exist, loads the supported-symbols cache
     (queueing a background refresh for missing/stale markets; startup never
     waits on the network), and on exit cancels the synchronous analyses in
-    flight and tears down the task worker.
+    flight, ends the open discussion event streams and tears down the task
+    worker.
     """
     config: ApiConfig = app.state.api_config
     config.ensure_directories()
@@ -61,6 +62,10 @@ async def lifespan(app: FastAPI):
         # Sync POST /analyze runs stop at their next LLM call; queued ones are
         # dropped with the worker's queue below.
         app.state.sync_runs.cancel_all()
+        # Open discussion event streams end now; clients resume with
+        # Last-Event-ID. (uvicorn drains connections before it runs this, so
+        # run_server.py also bounds that wait: timeout_graceful_shutdown.)
+        app.state.discussions.close()
         # Don't wait: an in-flight analysis can take minutes and would
         # otherwise hold up shutdown.
         app.state.task_worker.shutdown(wait=False)

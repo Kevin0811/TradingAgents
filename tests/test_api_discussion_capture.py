@@ -20,9 +20,16 @@ from tests.discussion_fakes import (
     install_offline,
     run_config,
 )
-from tradingagents.api.core.discussion_log import MAX_EVENTS, DiscussionLog, build_transcript
+from tradingagents.api.core.discussion_log import (
+    MAX_EVENTS,
+    DiscussionLog,
+    DiscussionStore,
+    build_transcript,
+)
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
+from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.domain.services.analysis_service import AnalysisService
+from tradingagents.api.domain.services.task_service import TaskService
 from tradingagents.api.infrastructure import discussion_capture as capture
 from tradingagents.api.infrastructure.discussion_capture import (
     IGNORED_NODES,
@@ -30,8 +37,11 @@ from tradingagents.api.infrastructure.discussion_capture import (
     MAX_TOOL_CALLS,
     MAX_TURN_CONTENT_BYTES,
     TaskEventEmitter,
+    cap_utf8,
     unmapped_nodes,
 )
+from tradingagents.api.infrastructure.transcript_files import TranscriptFiles
+from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
 from tradingagents.graph import setup as graph_setup, trading_graph
 
 FOUR = ("market", "sentiment", "news", "fundamentals")
@@ -122,7 +132,15 @@ def _max_open(log, phase):
 @pytest.mark.unit
 class TestEventStream:
     def test_a_default_run_streams_twelve_turns_in_order(self, tmp_path, monkeypatch):
-        install_offline(monkeypatch).hook = lambda n: time.sleep(0.02)
+        model = install_offline(monkeypatch)
+
+        def hook(n):
+            # The first analyst's LLM call waits (up to 10 s) until another
+            # analyst has made one: their turns overlap however threads run.
+            deadline = time.monotonic() + 10
+            while n == 1 and len(model.calls) < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+        model.hook = hook
         log = _run(tmp_path)
         started, _ = _check_stream(log, FOUR, 1, 1)
         assert len(started) == 12
@@ -169,9 +187,17 @@ class TestEventStream:
     def test_no_events_without_a_log_or_outside_the_run(self, tmp_path, monkeypatch):
         install_offline(monkeypatch)
         service = AnalysisService(config=run_config(tmp_path))
+        log = DiscussionLog("t")
+        # One worker thread: the later jobs run where the run set the emitter.
         with ThreadPoolExecutor(1, thread_name_prefix="ta-task") as pool:
+            pool.submit(service.run_analysis, ticker=TICKER, trade_date=TRADE_DATE,
+                        events=log).result()
+            assert _of(log, "turn_completed")   # the emitter was set on this thread
+            assert pool.submit(capture.DISCUSSION_EMITTER.get).result() is None
+            count = log.last_id
             pool.submit(service.run_analysis, ticker=TICKER, trade_date=TRADE_DATE).result()
-        assert capture.DISCUSSION_EMITTER.get() is None
+            assert pool.submit(capture.DISCUSSION_EMITTER.get).result() is None
+        assert log.last_id == count   # a run without a log records nothing in another's
 
 
 @pytest.mark.unit
@@ -227,6 +253,61 @@ class TestContent:
         transcript = log.transcript()
         assert [t["truncated"] for t in transcript["turns"]] == [True, False]
 
+    def test_a_lone_surrogate_is_replaced_not_raised(self):
+        assert cap_utf8("a\ud800b", 100) == ("a?b", False)
+        assert cap_utf8("\ud800" * 10, 4) == ("????", True)
+        log = DiscussionLog("t")
+        emitter = TaskEventEmitter(log)
+        md = {"langgraph_node": "Market Analyst", "checkpoint_ns": ""}
+        emitter.on_chain_start({}, {}, run_id=1, metadata=md, name="Market Analyst")
+        emitter.on_chain_end({"market_report": "x\udfffy"}, run_id=1)
+        (done,) = _of(log, "turn_completed")
+        assert done["data"]["content"] == "x?y"
+        json.dumps(done).encode("utf-8")   # the stream can encode it
+
+    @staticmethod
+    def _speak(emitter, run_id, node, path, text):
+        md = {"langgraph_node": node, "checkpoint_ns": ""}
+        emitter.on_chain_start({}, {}, run_id=run_id, metadata=md, name=node)
+        out: dict = {}
+        cur = out
+        *heads, last = path.split(".")
+        for h in heads:
+            cur = cur.setdefault(h, {})
+        cur[last] = text
+        emitter.on_chain_end(out, run_id=run_id)
+
+    def test_long_rounds_never_blank_the_final_decision(self, monkeypatch):
+        long = "x" * (MAX_TURN_CONTENT_BYTES + 5000)
+        decision = "FINAL: " + "d" * 9000
+        seats = [(n, s) for n, s in MAPPING.items() if s.agent_id != "portfolio_manager"]
+        pm_node = next(n for n, s in MAPPING.items() if s.agent_id == "portfolio_manager")
+
+        def run(n_turns, debate=10, risk=10):
+            log = DiscussionLog("t")
+            emitter = TaskEventEmitter(log)
+            emitter.start(ticker=TICKER, trade_date=TRADE_DATE, analysts=list(FOUR),
+                          debate_rounds=debate, risk_rounds=risk)
+            for i in range(n_turns):
+                node, seat = seats[i % len(seats)]
+                self._speak(emitter, i, node, seat.content_path, long)
+            self._speak(emitter, "pm", pm_node, "final_trade_decision", decision)
+            return [e["data"] for e in _of(log, "turn_completed")]
+
+        # Rounds 10/10: 57 turns, 56 of them over the cap before the decision.
+        assert capture.expected_turns(4, 10, 10) == 57
+        turns = run(56)
+        assert turns[-1]["content"] == decision and not turns[-1]["truncated"]
+        assert all(len(t["content"]) == MAX_TURN_CONTENT_BYTES for t in turns[:-1])
+        # More text than even the 4 MiB ceiling: the decision's 32 KiB stays reserved.
+        assert capture.task_content_budget(57) == 57 * MAX_TURN_CONTENT_BYTES
+        assert capture.task_content_budget(1000) == capture.MAX_TASK_CONTENT_BYTES
+        assert capture.task_content_budget(None) == capture.MIN_TASK_CONTENT_BYTES
+        turns = run(200)
+        assert turns[-1]["content"] == decision and not turns[-1]["truncated"]
+        used = sum(len(t["content"].encode("utf-8")) for t in turns)
+        assert used <= capture.MAX_TASK_CONTENT_BYTES
+
 
 @pytest.mark.unit
 class TestBounds:
@@ -256,9 +337,15 @@ class TestBounds:
             log.append("phase_changed", {"phase": "analysis"})
         log.finish("completed")
         events = log.read()
-        assert len(events) == MAX_EVENTS + 1
+        assert len(events) == MAX_EVENTS + 2
+        assert [e["id"] for e in events] == list(range(1, MAX_EVENTS + 3))
+        # One marker at the first loss, past the cap, then only the terminal event.
+        assert events[MAX_EVENTS]["type"] == "gap"
+        assert events[MAX_EVENTS]["data"] == {"dropped_from_id": MAX_EVENTS + 1}
+        assert [e["type"] for e in events].count("gap") == 1
         assert events[-1]["data"] == {"status": "completed", "events_dropped": 25}
         assert log.append("phase_changed", {"phase": "analysis"}) is None   # closed
+        assert log.transcript()["events_dropped"] == 25
 
 
 @pytest.mark.unit
@@ -361,6 +448,59 @@ class TestEndings:
                  if e["type"] in ("turn_completed", "turn_aborted")}
         assert started == ended
         assert log.read()[-1]["data"]["status"] == "failed"
+
+
+@pytest.mark.unit
+class TestTranscriptSave:
+    class _FailingAnalysis:
+        """Starts the run's log, then fails: the run reached the transcript step."""
+
+        def run_analysis(self, *, events=None, **kwargs):
+            TaskEventEmitter(events).start(
+                ticker="../escape", trade_date=TRADE_DATE, analysts=["market"],
+                debate_rounds=1, risk_rounds=1)
+            raise AnalysisError("provider unavailable")
+
+    def test_an_unsafe_ticker_never_raises_into_the_worker(self, tmp_path, caplog):
+        store = DiscussionStore()
+        manager = TaskManager(discussions=store)
+        results = tmp_path / "results"
+        service = TaskService(manager, self._FailingAnalysis(), discussions=store,
+                              transcripts=TranscriptFiles(results))
+        task, _ = manager.create_task(TaskCreateRequest(ticker=TICKER, trade_date=TRADE_DATE))
+        assert store.get(task.task_id).transcript()["status"] == "queued"
+        # The ticker the transcript folder is named after fails the path check.
+        unsafe = TaskCreateRequest.model_construct(
+            ticker="../escape", trade_date=TRADE_DATE, asset_type="stock",
+            selected_analysts=["market"])
+        service.execute_analysis(task.task_id, unsafe)   # no exception escapes
+        assert manager.get_task(task.task_id).status == TaskStatus.FAILED
+        assert store.get(task.task_id).transcript()["status"] == "failed"
+        # The file writer itself returns None for it rather than raising.
+        transcript = store.get(task.task_id).transcript()
+        assert TranscriptFiles(results).write("../escape", transcript) is None
+        assert not list(tmp_path.rglob("discussion_*.json"))
+        assert not list(tmp_path.rglob(".discussion-*"))
+        assert any(task.task_id in r.getMessage() for r in caplog.records
+                   if r.levelname == "WARNING")
+
+    def test_a_broken_transcript_is_logged_not_raised(self, tmp_path, monkeypatch, caplog):
+        store = DiscussionStore()
+        manager = TaskManager(discussions=store)
+        service = TaskService(manager, self._FailingAnalysis(), discussions=store,
+                              transcripts=TranscriptFiles(tmp_path))
+        task, _ = manager.create_task(TaskCreateRequest(ticker=TICKER, trade_date=TRADE_DATE))
+
+        def boom(self, mapping_version=None):
+            raise RuntimeError("secret turn text")
+        monkeypatch.setattr(DiscussionLog, "transcript", boom)
+        service.execute_analysis(task.task_id, TaskCreateRequest.model_construct(
+            ticker=TICKER, trade_date=TRADE_DATE, asset_type="stock",
+            selected_analysts=["market"]))
+        assert manager.get_task(task.task_id).status == TaskStatus.FAILED
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(task.task_id in w for w in warnings)
+        assert not any("secret" in w for w in warnings)
 
 
 def test_transcript_folds_events_into_turns():
