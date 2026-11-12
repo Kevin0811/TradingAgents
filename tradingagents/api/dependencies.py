@@ -14,6 +14,7 @@ from __future__ import annotations
 from fastapi import Depends, Request
 
 from tradingagents.api.config import ApiConfig, get_config
+from tradingagents.api.core.discussion_log import DiscussionStore
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.core.task_worker import TaskWorker
 from tradingagents.api.domain.repositories import StateRepository
@@ -25,6 +26,7 @@ from tradingagents.api.domain.services.symbol_catalog import SymbolCatalog
 from tradingagents.api.domain.services.task_service import TaskService
 from tradingagents.api.infrastructure.llm_provider import LLMProviderFactory
 from tradingagents.api.infrastructure.repositories.file_state_repository import FileStateRepository
+from tradingagents.api.infrastructure.transcript_files import TranscriptFiles
 
 # ---------------------------------------------------------------------------
 # Infrastructure dependencies
@@ -117,6 +119,7 @@ async def get_task_worker(request: Request) -> TaskWorker:
 
 
 async def get_task_service(
+    request: Request,
     task_manager: TaskManager = Depends(get_task_manager),
     analysis_service: AnalysisService = Depends(get_analysis_service),
 ) -> TaskService:
@@ -124,7 +127,19 @@ async def get_task_service(
     return TaskService(
         task_manager=task_manager,
         analysis_service=analysis_service,
+        discussions=getattr(request.app.state, "discussions", None),
+        transcripts=getattr(request.app.state, "transcripts", None),
     )
+
+
+async def get_discussion_store(request: Request) -> DiscussionStore:
+    """Get the app's per-task discussion logs."""
+    return request.app.state.discussions
+
+
+async def get_transcript_files(request: Request) -> TranscriptFiles:
+    """Get the app's transcript files."""
+    return request.app.state.transcripts
 
 
 # ---------------------------------------------------------------------------

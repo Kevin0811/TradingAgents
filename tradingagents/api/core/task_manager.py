@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from uuid import uuid4
 
+from tradingagents.api.core.discussion_log import DiscussionStore
 from tradingagents.api.schemas.task import (
     FINISHED_STATUSES,
     TaskCreateRequest,
@@ -43,13 +44,22 @@ class TaskManager:
     so every access to ``_tasks`` is guarded by ``_lock``.
     """
 
-    def __init__(self, ttl_minutes: int = 60, max_tasks: int = 100):
+    def __init__(
+        self,
+        ttl_minutes: int = 60,
+        max_tasks: int = 100,
+        discussions: DiscussionStore | None = None,
+    ):
         """Initialize the task manager.
 
         Args:
             ttl_minutes: Time-to-live for completed/failed tasks in minutes.
             max_tasks: Maximum number of tasks to keep in memory.
+            discussions: The tasks' discussion logs. Each log is created with
+                its task, gets the terminal ``task_status`` when the task ends,
+                and is dropped with the task (deleted or past its TTL).
         """
+        self._discussions = discussions
         self._tasks: dict[str, TaskResponse] = {}
         self._ttl = ttl_minutes
         self._max_tasks = max_tasks
@@ -142,6 +152,8 @@ class TaskManager:
             )
             self._tasks[task_id] = task
             self._cancel_events[task_id] = threading.Event()
+            if self._discussions is not None:
+                self._discussions.create(task_id)
             logger.info("Created new task %s for %s/%s/%s", task_id, request.ticker, request.trade_date, request.asset_type)
             return task, True
 
@@ -205,6 +217,8 @@ class TaskManager:
             status = kwargs.get("status")
             if status in FINISHED_STATUSES:
                 task.completed_at = datetime.now()
+                if self._discussions is not None:
+                    self._discussions.finish(task_id, TaskStatus(status).value)
                 # A cancelled task's one INFO line comes from whoever cancelled
                 # or stopped it; this would only repeat it.
                 logger.log(
@@ -293,6 +307,8 @@ class TaskManager:
             task.status = TaskStatus.CANCELLED
             task.message = CANCELLED_BEFORE_START
             task.completed_at = now
+            if self._discussions is not None:
+                self._discussions.finish(task_id, TaskStatus.CANCELLED.value)
             logger.info("Task %s cancelled before it started", task_id)
             return CancelOutcome.CANCELLED
 
@@ -330,6 +346,8 @@ class TaskManager:
         self._cancel_events.pop(task_id, None)
         self._futures.pop(task_id, None)
         self._deleted.discard(task_id)
+        if self._discussions is not None:
+            self._discussions.drop(task_id)
 
     def cleanup(self) -> int:
         """Remove expired completed/failed/cancelled tasks.
