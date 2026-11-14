@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from tradingagents.api.core.discussion_log import DiscussionLog, DiscussionStore
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.core.task_manager import (
@@ -14,6 +15,7 @@ from tradingagents.api.core.task_manager import (
 )
 from tradingagents.api.domain.services.analysis_service import AnalysisService
 from tradingagents.api.domain.services.config_overrides import resolve_overrides
+from tradingagents.api.infrastructure.transcript_files import TranscriptFiles
 from tradingagents.api.schemas.task import TaskCreateRequest, TaskStatus
 from tradingagents.api.schemas.token_usage import token_usage_model
 
@@ -31,15 +33,22 @@ class TaskService:
         self,
         task_manager: TaskManager,
         analysis_service: AnalysisService,
+        discussions: DiscussionStore | None = None,
+        transcripts: TranscriptFiles | None = None,
     ):
         """Initialize the task service.
 
         Args:
             task_manager: Task manager instance.
             analysis_service: Analysis service instance.
+            discussions: The tasks' discussion logs; a task's run records its
+                discussion in its log.
+            transcripts: Where a finished run's transcript is written.
         """
         self._task_manager = task_manager
         self._analysis_service = analysis_service
+        self._discussions = discussions
+        self._transcripts = transcripts
 
     def create_task(
         self, request: TaskCreateRequest
@@ -81,6 +90,7 @@ class TaskService:
         if cancel_event is None:
             logger.info("Task %s was cancelled or deleted before it started; skipping", task_id)
             return
+        log = self._discussions.get(task_id) if self._discussions is not None else None
         try:
             logger.info("Task %s started processing", task_id)
 
@@ -92,6 +102,7 @@ class TaskService:
                 selected_analysts=tuple(request.selected_analysts),
                 overrides=resolve_overrides(request),
                 cancel_event=cancel_event,
+                **({"events": log} if log is not None else {}),
             )
 
             # Update task with result
@@ -132,6 +143,28 @@ class TaskService:
                 status=TaskStatus.FAILED,
                 error=error_text(e),
             )
+
+        self._save_transcript(task_id, request.ticker, log)
+
+    def _save_transcript(self, task_id: str, ticker: str, log: DiscussionLog | None) -> None:
+        """Write a finished run's transcript next to its results.
+
+        Skipped for a task deleted meanwhile (its log is gone from the store)
+        and for one whose run never started. Never raises: the task's own
+        outcome is already recorded, and a transcript failure is only logged.
+        """
+        if log is None or self._transcripts is None or self._discussions is None:
+            return
+        try:
+            if self._discussions.get(task_id) is not log or not log.finished:
+                return
+            transcript = log.transcript()
+            if transcript["run_started"] is None:
+                return
+            self._transcripts.write(ticker, transcript)
+        except Exception:  # noqa: BLE001 - the worker must never see this
+            # The task id only: the error could quote the transcript's content.
+            logger.warning("Could not save the discussion transcript of task %s", task_id)
 
     def get_task(self, task_id: str) -> Any:
         """Get task by ID.
