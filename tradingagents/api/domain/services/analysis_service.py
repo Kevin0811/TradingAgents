@@ -8,11 +8,17 @@ from typing import Any
 
 from langchain_core.runnables import Runnable, RunnableBinding, RunnableWithFallbacks
 
+from tradingagents.api.core.discussion_log import DiscussionLog
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
 from tradingagents.api.domain.services.config_overrides import CLEARED_KEYS
+from tradingagents.api.infrastructure.discussion_capture import (
+    DISCUSSION_EMITTER,
+    TaskEventEmitter,
+    analyst_agent_ids,
+)
 from tradingagents.api.infrastructure.llm_callbacks import (
     TIER_METADATA_KEY,
     TIERS,
@@ -69,6 +75,7 @@ class AnalysisService:
         selected_analysts: tuple[str, ...] = ("market", "social", "news", "fundamentals"),
         overrides: dict[str, Any] | None = None,
         cancel_event: threading.Event | None = None,
+        events: DiscussionLog | None = None,
     ) -> AnalysisResult:
         """Run the full trading analysis pipeline.
 
@@ -87,6 +94,9 @@ class AnalysisService:
                 be in the core's decision log (``memory_log.store_decision``)
                 when the run is cancelled. The API discards the result all the
                 same; it cannot undo that write (the core is not edited here).
+            events: The task's discussion log. When given, the run's turns and
+                tool calls are recorded there (see ``discussion_capture``); any
+                turn still open when the run ends is recorded as aborted.
 
         Returns:
             AnalysisResult with all reports and decisions, and the run's token
@@ -99,6 +109,10 @@ class AnalysisService:
             (``partial`` true).
         """
         usage: TokenUsageRecorder | None = None
+        # Set here, on the worker thread that runs the graph: a context
+        # variable set by whoever submitted the job would not reach it.
+        emitter = TaskEventEmitter(events) if events is not None else None
+        emitter_token = DISCUSSION_EMITTER.set(emitter) if emitter is not None else None
         try:
             effective_config = self._config
             if overrides:
@@ -110,9 +124,20 @@ class AnalysisService:
 
             # The config the core runs on: it falls back the same way.
             usage = TokenUsageRecorder(_tier_models(effective_config or DEFAULT_CONFIG))
+            # API names ('sentiment') -> the core's keys ('social').
+            core_analysts = to_core_analyst_keys(selected_analysts)
+            if emitter is not None:
+                run_config = effective_config or DEFAULT_CONFIG
+                emitter.start(
+                    ticker=ticker,
+                    trade_date=trade_date,
+                    analysts=analyst_agent_ids(core_analysts),
+                    debate_rounds=int(run_config.get("max_debate_rounds", 1)),
+                    risk_rounds=int(run_config.get("max_risk_discuss_rounds", 1)),
+                    checkpoint_enabled=bool(run_config.get("checkpoint_enabled")),
+                )
             graph = TradingAgentsGraph(
-                # API names ('sentiment') -> the core's keys ('social').
-                selected_analysts=to_core_analyst_keys(selected_analysts),
+                selected_analysts=core_analysts,
                 debug=self._debug,
                 config=effective_config,
                 callbacks=self._callbacks(effective_config, cancel_event, usage),
@@ -160,6 +185,12 @@ class AnalysisService:
                 detail=error_text(e),
                 token_usage=token_usage,
             ) from e
+        finally:
+            if emitter is not None:
+                try:
+                    emitter.close()
+                finally:
+                    DISCUSSION_EMITTER.reset(emitter_token)
 
     def _callbacks(
         self,

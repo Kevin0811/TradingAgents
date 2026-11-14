@@ -8,7 +8,10 @@ Usage:
     python run_server.py --reload          # Enable auto-reload for development
 
 Or use uvicorn directly:
-    uvicorn tradingagents.api:create_app --factory --host 0.0.0.0 --port 8000
+    uvicorn tradingagents.api:create_app --factory --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 5
+
+Without ``--timeout-graceful-shutdown``, uvicorn waits on open responses for
+as long as they last at shutdown; an SSE discussion stream lasts up to 300 s.
 """
 
 from __future__ import annotations
@@ -16,6 +19,9 @@ from __future__ import annotations
 import argparse
 import sys
 import os
+
+# Seconds uvicorn waits for open responses at shutdown before cancelling them.
+GRACEFUL_SHUTDOWN_SECONDS = 5
 
 # Add project root to path if run as script
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -101,6 +107,9 @@ def main():
         reload=args.reload,
         workers=1 if args.reload else args.workers,  # reload only supports 1 worker
         log_level=args.log_level,
+        # Open responses (discussion event streams) get this long to end
+        # before shutdown cancels them.
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
 
 

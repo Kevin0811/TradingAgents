@@ -13,6 +13,7 @@ from tradingagents.api.core.activity_middleware import (
     YahooActivityMiddleware,
     yahoo_backed_paths,
 )
+from tradingagents.api.core.discussion_log import DiscussionStore
 from tradingagents.api.core.error_handlers import register_exception_handlers
 from tradingagents.api.core.sync_runs import SyncRuns
 from tradingagents.api.core.task_manager import TaskManager
@@ -33,6 +34,7 @@ from tradingagents.api.infrastructure.repositories.file_symbol_cache_repository 
     FileSymbolCacheRepository,
 )
 from tradingagents.api.infrastructure.secret_keys import install as install_secret_keys
+from tradingagents.api.infrastructure.transcript_files import TranscriptFiles
 from tradingagents.api.infrastructure.yahoo_symbol_source import YahooSymbolSource
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,8 @@ async def lifespan(app: FastAPI):
     Ensures required directories exist, loads the supported-symbols cache
     (queueing a background refresh for missing/stale markets; startup never
     waits on the network), and on exit cancels the synchronous analyses in
-    flight and tears down the task worker.
+    flight, ends the open discussion event streams and tears down the task
+    worker.
     """
     config: ApiConfig = app.state.api_config
     config.ensure_directories()
@@ -59,6 +62,10 @@ async def lifespan(app: FastAPI):
         # Sync POST /analyze runs stop at their next LLM call; queued ones are
         # dropped with the worker's queue below.
         app.state.sync_runs.cancel_all()
+        # Open discussion event streams end now; clients resume with
+        # Last-Event-ID. (uvicorn drains connections before it runs this, so
+        # run_server.py also bounds that wait: timeout_graceful_shutdown.)
+        app.state.discussions.close()
         # Don't wait: an in-flight analysis can take minutes and would
         # otherwise hold up shutdown.
         app.state.task_worker.shutdown(wait=False)
@@ -146,6 +153,7 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     from tradingagents.api.routers.config import router as config_router
     from tradingagents.api.routers.data import router as data_router
     from tradingagents.api.routers.decisions import router as decisions_router
+    from tradingagents.api.routers.discussion import router as discussion_router
     from tradingagents.api.routers.symbols import router as symbols_router
 
     api_version = config.api_version
@@ -164,9 +172,14 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
     # Task state and the worker pool are per-app, not module globals, so tests
     # and reloads never share state. Created here rather than in the lifespan
     # handler so they exist even when the app is used without one.
+    # Each task's discussion log lives and expires with the task; a finished
+    # run's transcript is also written next to its results.
+    app.state.discussions = DiscussionStore()
+    app.state.transcripts = TranscriptFiles(config.results_dir)
     app.state.task_manager = TaskManager(
         ttl_minutes=config.config.get("task_ttl_minutes", 60),
         max_tasks=config.config.get("task_max_tasks", 100),
+        discussions=app.state.discussions,
     )
     # 1 by default with Ollama (see ApiConfig.task_max_concurrent). With
     # Ollama, synchronous POST /analyze runs queue on it too.
@@ -208,6 +221,7 @@ def create_app(overrides: dict[str, Any] | None = None) -> FastAPI:
 
     # Include routers with versioned prefix
     app.include_router(analyze_router, prefix=f"/api/{api_version}")
+    app.include_router(discussion_router, prefix=f"/api/{api_version}")
     app.include_router(analysts_router, prefix=f"/api/{api_version}")
     app.include_router(config_router, prefix=f"/api/{api_version}")
     app.include_router(data_router, prefix=f"/api/{api_version}")
