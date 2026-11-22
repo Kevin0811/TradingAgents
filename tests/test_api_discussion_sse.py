@@ -148,7 +148,7 @@ class TestEventStream:
                 elif line.startswith("data: "):
                     data.append(json.loads(line[len("data: "):])["data"])
         assert pings >= 3
-        assert data == [{"status": "cancelled"}]
+        assert data == [{"status": "cancelled", "cancel_reason": "TA_CANCELLED_BEFORE_START"}]
 
     def test_a_cursor_past_the_end_still_gets_the_rest_of_the_run(self, app, monkeypatch):
         release = threading.Event()
@@ -259,7 +259,8 @@ class TestEventStream:
         completed = {e["data"]["turn"] for e in events if e["type"] == "turn_completed"}
         aborted = {e["data"]["turn"] for e in events if e["type"] == "turn_aborted"}
         assert aborted and started == completed | aborted
-        assert events[-1]["data"] == {"status": "cancelled"}
+        assert events[-1]["data"] == {
+            "status": "cancelled", "cancel_reason": "TA_CANCELLED_WHILE_RUNNING"}
         assert events[-2]["type"] == "turn_aborted"
 
     def test_unknown_tasks_are_404(self, app):

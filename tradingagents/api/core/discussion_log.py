@@ -35,6 +35,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from tradingagents.api.core.error_codes import TA_CANCELLED_BEFORE_START
+
 SCHEMA_VERSION = 1
 
 # Persisted event types (all kept in the log and the transcript).
@@ -120,12 +122,16 @@ class DiscussionLog:
         with self._lock:
             self._notes[key] = value
 
-    def finish(self, status: str) -> dict[str, Any] | None:
-        """Append the terminal ``task_status`` and close the log. Idempotent."""
+    def finish(self, status: str, **codes: str) -> dict[str, Any] | None:
+        """Append the terminal ``task_status`` and close the log. Idempotent.
+
+        ``codes`` are the task's ``error_code`` / ``cancel_reason`` when set;
+        they go into the event's data as they are.
+        """
         with self._lock:
             if self._finished:
                 return None
-            data: dict[str, Any] = {"status": status, **self._notes}
+            data: dict[str, Any] = {"status": status, **self._notes, **codes}
             if self._dropped:
                 data["events_dropped"] = self._dropped
             self._status = status
@@ -311,18 +317,26 @@ class DiscussionStore:
         with self._lock:
             return self._logs.get(task_id)
 
-    def finish(self, task_id: str, status: str) -> None:
+    def finish(self, task_id: str, status: str, **codes: str) -> None:
         log = self.get(task_id)
         if log is not None:
-            log.finish(status)
+            log.finish(status, **codes)
 
     def drop(self, task_id: str) -> None:
         """Forget a task's log. A log not yet finished (a queued task deleted
-        before it ran) is first finished as cancelled, so an open stream on it
-        still receives a terminal ``task_status`` instead of hanging."""
+        before it ran, or a stale pending one removed by cleanup) is first
+        finished as cancelled, so an open stream on it still receives a
+        terminal ``task_status`` instead of hanging. A log that never left
+        ``queued`` carries ``cancel_reason`` ``TA_CANCELLED_BEFORE_START``; one
+        dropped after it started (not expected: the worker finishes its log
+        first) carries no ``cancel_reason``."""
         with self._lock:
             log = self._logs.pop(task_id, None)
-        if log is not None:
+        if log is None:
+            return
+        if log.status == STATUS_QUEUED:
+            log.finish("cancelled", cancel_reason=TA_CANCELLED_BEFORE_START)
+        else:
             log.finish("cancelled")
 
     def __len__(self) -> int:
