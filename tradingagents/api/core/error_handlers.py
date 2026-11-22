@@ -13,7 +13,9 @@ from tradingagents.api.core.exceptions import (
     DataNotFoundError,
     ExternalServiceError,
     InvalidRequestError,
+    StateLogUnreadableError,
     TradingAgentsAPIError,
+    UnprocessableRequestError,
 )
 from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.schemas.token_usage import token_usage_model
@@ -28,6 +30,18 @@ async def trading_agents_api_error_handler(
     request: Request, exc: TradingAgentsAPIError
 ) -> JSONResponse:
     """Handle TradingAgentsAPIError and subclasses."""
+    if isinstance(exc, StateLogUnreadableError | UnprocessableRequestError):
+        # A request's own outcome, not a failed analysis: the route logs what it
+        # needs (no file path), and there is no token usage to report.
+        if isinstance(exc, UnprocessableRequestError):
+            status_code = 422  # by number: Starlette renamed the constant
+        elif exc.retryable:
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return JSONResponse(
+            status_code=status_code, content={"error": exc.message, "detail": exc.detail})
+
     status_code = status.HTTP_400_BAD_REQUEST
     if isinstance(exc, DataNotFoundError):
         status_code = status.HTTP_404_NOT_FOUND

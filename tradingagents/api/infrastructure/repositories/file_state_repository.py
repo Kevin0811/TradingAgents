@@ -11,6 +11,13 @@ from typing import Any
 from tradingagents.api.domain.repositories import StateRepository
 from tradingagents.dataflows.symbols import safe_ticker_component
 
+# A full_states_log is a few hundred KiB; anything this big is not one to parse.
+MAX_STATE_LOG_BYTES = 64 * 1024 * 1024
+
+
+class StateLogTooLargeError(ValueError):
+    """A state log over :data:`MAX_STATE_LOG_BYTES`, refused before parsing."""
+
 
 class FileStateRepository(StateRepository):
     """File-based repository for loading saved analysis states from disk."""
@@ -58,17 +65,27 @@ class FileStateRepository(StateRepository):
     def load_state_logged(self, ticker: str, trade_date: str) -> tuple[dict[str, Any], datetime]:
         """The saved state, and when its file was last written (its mtime, UTC).
 
+        A log whose real path (symlinks resolved) is outside ``results_dir`` is
+        treated as missing. The size is checked before parsing.
+
         Raises:
-            ValueError: An unsafe ticker (``safe_ticker_component``), a file
-                that is not JSON or not UTF-8, or JSON that is not an object.
-            FileNotFoundError: If no state file exists.
+            FileNotFoundError: If no state file exists (or it lies outside ``results_dir``).
+            StateLogTooLargeError: The file is over :data:`MAX_STATE_LOG_BYTES`.
+            json.JSONDecodeError: The file is empty or not (yet) complete JSON.
+            ValueError: An unsafe ticker (``safe_ticker_component``), a file that
+                is not UTF-8, or JSON that is not an object.
             OSError: If the file cannot be read.
         """
         log_path = self._log_path(ticker, trade_date)
         if not log_path.is_file():
             raise FileNotFoundError(f"No state file found for {ticker} on {trade_date}.")
+        if not log_path.resolve().is_relative_to(self._results_dir.resolve()):
+            raise FileNotFoundError(f"No state file found for {ticker} on {trade_date}.")
         with open(log_path, encoding="utf-8") as f:
-            logged_at = datetime.fromtimestamp(os.fstat(f.fileno()).st_mtime, UTC)
+            info = os.fstat(f.fileno())
+            if info.st_size > MAX_STATE_LOG_BYTES:
+                raise StateLogTooLargeError(f"The state file is over {MAX_STATE_LOG_BYTES} bytes.")
+            logged_at = datetime.fromtimestamp(info.st_mtime, UTC)
             state = json.load(f)
         if not isinstance(state, dict):
             raise ValueError("The state file does not hold a JSON object.")

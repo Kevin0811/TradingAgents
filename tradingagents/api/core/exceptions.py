@@ -40,6 +40,24 @@ class InvalidRequestError(TradingAgentsAPIError):
     pass
 
 
+class UnprocessableRequestError(InvalidRequestError):
+    """A request value the API refuses (HTTP 422), in the ``{error, detail}`` shape."""
+
+    pass
+
+
+class StateLogUnreadableError(TradingAgentsAPIError):
+    """A saved state log that exists but cannot be read (HTTP 500, or 503 when retryable).
+
+    Not an analysis failure: no run failed and there is no token usage. ``retryable``
+    is true for an empty or truncated JSON file, which a run may still be writing.
+    """
+
+    def __init__(self, message: str, detail: str | None = None, *, retryable: bool = False):
+        super().__init__(message, detail)
+        self.retryable = retryable
+
+
 class ExternalServiceError(TradingAgentsAPIError):
     """Raised when an external service (LLM, Data Provider) fails."""
 

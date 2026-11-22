@@ -11,11 +11,23 @@ Pure: no I/O, no graph, no model. A log has no tools and no timings, so every
 turn has ``tools`` [], ``started_at``/``completed_at`` null and ``aborted`` false.
 
 Debates are split from their ``history`` (each turn is ``"<Speaker> Analyst: <text>"``,
-appended with ``"\\n"``). The split is kept only when it is provably exact: the
-speakers take turns in the graph's order, the count matches the run's rounds
-(when known), the turns joined with ``"\\n"`` give ``history`` back, and each
-speaker's turns give back its own ``<side>_history``. Otherwise each side
-becomes one turn (its whole side history) and ``rebuilt.split_exact`` is false.
+appended with ``"\\n"`` to ``history`` and to the speaker's ``<side>_history``).
+The speakers' side histories are boundary oracles: walking the speakers in the
+graph's order, a boundary is accepted only where ``history`` and that speaker's
+side history both continue with the same ``"\\n" + turn``, which splits exactly
+even when a turn quotes another speaker's prefix. Without every side history, a
+cut at every prefix is exact only when the run's known round count confirms it.
+``rebuilt.split_exact`` is true only when every boundary was confirmed (at 1
+round with every side history, one turn per side is exact). Otherwise each side
+is one turn, or, with sides missing, each piece of ``history`` goes to the
+speaker whose prefix it starts with; ``split_exact`` is false and no text is dropped.
+
+Empty fields: with ``run_settings`` the run's seats are known, and a seat whose
+field is empty keeps a turn with ``""`` content, as live capture records an
+empty ``on_chain_end`` (the analysts named in the settings, the research
+manager, the trader and the portfolio manager; a debate turn always holds its
+speaker's prefix). Without settings, an empty field is skipped, and the
+analysts are taken in the default order market, sentiment, news, fundamentals.
 """
 
 from __future__ import annotations
@@ -110,13 +122,55 @@ def _side_history(debate: dict[str, Any], keys: Sequence[str]) -> str:
     return ""
 
 
-def _split_debate(
-    debate: dict[str, Any], speakers: Sequence[_Speaker], rounds: int | None
-) -> list[tuple[str, str]] | None:
-    """The debate's turns ``(agent_id, text)`` split from ``history``, or None if inexact."""
-    history = _text(debate.get("history"))
-    if not history:
+_Turns = list[tuple[str, str]]
+
+
+def _starts_turn(text: str, at: int, prefixes: Sequence[str]) -> bool:
+    return any(text.startswith("\n" + p, at) for p in prefixes)
+
+
+def _oracle_split(history: str, sides: list[str], speakers: Sequence[_Speaker]) -> _Turns | None:
+    """The turns of ``history``, each boundary confirmed by its speaker's side history.
+
+    Every agent writes ``"\n" + turn`` to both ``history`` and its own side
+    history. Walking the speakers in the graph's order, a turn ends at the first
+    ``"\n" + <next speaker's prefix>`` (or the end) where the speaker's side
+    history continues with ``"\n" + turn`` and then its own next turn (or ends).
+    A cut short of the true end leaves the side on the next speaker's prefix,
+    never its own, so the first accepted cut is the true one: a turn quoting
+    another speaker's prefix is still split exactly. None when the log disagrees.
+    """
+    count = len(speakers)
+    side_at = [0] * count
+    turns: _Turns = []
+    at = 0
+    while at < len(history):
+        k = len(turns) % count
+        agent_id, _keys, own = speakers[k]
+        side = sides[k]
+        if not _starts_turn(history, at, own) or not _starts_turn(side, side_at[k], own):
+            return None
+        following = speakers[(len(turns) + 1) % count][2]
+        pattern = "\n(?=" + "|".join(re.escape(p) for p in following) + ")"
+        cuts = [m.start() for m in re.compile(pattern).finditer(history, at + 1)]
+        for cut in [*cuts, len(history)]:
+            piece = history[at + 1:cut]
+            after = side_at[k] + 1 + len(piece)
+            if side.startswith("\n" + piece, side_at[k]) and (
+                    after == len(side) or _starts_turn(side, after, own)):
+                break
+        else:
+            return None
+        turns.append((agent_id, piece))
+        side_at[k] = after
+        at = cut
+    if any(side_at[k] != len(side) for k, side in enumerate(sides)):
         return None
+    return turns
+
+
+def _pieces(history: str, speakers: Sequence[_Speaker]) -> list[str] | None:
+    """``history`` cut at every ``"\n" + <a speaker's prefix>``; None if they do not rejoin."""
     prefixes = [p for _, _, ps in speakers for p in ps]
     pattern = "\n(?=" + "|".join(re.escape(p) for p in prefixes) + ")"
     pieces = re.split(pattern, history)
@@ -125,34 +179,82 @@ def _split_debate(
         lead, pieces = "\n", pieces[1:] if pieces and pieces[0] == "" else pieces
     if not pieces or lead + "\n".join(pieces) != history:
         return None
-    if rounds is not None and len(pieces) != len(speakers) * rounds:
+    return pieces
+
+
+def _counted_split(
+    history: str, speakers: Sequence[_Speaker], rounds: int | None
+) -> _Turns | None:
+    """The cut at every prefix, confirmed by the known round count, or None.
+
+    Every true boundary is a cut, so as many cuts as the run had turns, each
+    on its speaker in the graph's order, leaves no room for a quoted prefix.
+    """
+    if rounds is None:
         return None
-    turns: list[tuple[str, str]] = []
+    pieces = _pieces(history, speakers)
+    if pieces is None or len(pieces) != len(speakers) * rounds:
+        return None
+    turns: _Turns = []
     for index, piece in enumerate(pieces):
         agent_id, _keys, own = speakers[index % len(speakers)]
         if not piece.startswith(own):
             return None
         turns.append((agent_id, piece))
-    # Each speaker's turns must give back its own side history, when the log has one.
-    for agent_id, keys, _prefixes in speakers:
-        side = _side_history(debate, keys)
-        if not side:
-            continue
-        own_turns = [text for a, text in turns if a == agent_id]
-        if "\n" + "\n".join(own_turns) != side and "\n".join(own_turns) != side:
-            return None
     return turns
 
 
-def _fallback_debate(
-    debate: dict[str, Any], speakers: Sequence[_Speaker]
-) -> list[tuple[str, str]]:
+def _by_prefix(history: str, speakers: Sequence[_Speaker]) -> _Turns:
+    """Unverified: each piece of ``history`` to the speaker whose prefix it starts with.
+
+    A piece with no speaker's prefix (text before the first turn) goes to the
+    first speaker, so no text is dropped.
+    """
+    text = history[1:] if history.startswith("\n") else history
+    prefixes = [p for _, _, ps in speakers for p in ps]
+    pattern = "\n(?=" + "|".join(re.escape(p) for p in prefixes) + ")"
+    turns: _Turns = []
+    for piece in re.split(pattern, text):
+        owner = next((agent_id for agent_id, _keys, own in speakers if piece.startswith(own)),
+                     speakers[0][0])
+        turns.append((owner, piece))
+    return turns
+
+
+def _split_debate(
+    debate: dict[str, Any], speakers: Sequence[_Speaker], rounds: int | None
+) -> tuple[_Turns, bool]:
+    """The debate's turns ``(agent_id, text)`` and whether every boundary was confirmed.
+
+    In order: one turn per side at 1 round, when ``history`` is the sides one
+    after the other (exact); the side histories as boundary oracles (exact);
+    the cut at every prefix with the known round count (exact). Otherwise not
+    exact: one turn per side when every side is there, else each piece of
+    ``history`` to the speaker whose prefix it starts with. Never drops text.
+    """
+    history = _text(debate.get("history"))
+    sides = [_side_history(debate, keys) for _agent_id, keys, _prefixes in speakers]
+    if not history and not any(sides):
+        return [], True  # nothing to split
+    if all(sides):
+        if rounds == 1 and "".join(sides) == history:
+            return _per_side(speakers, sides), True
+        turns = _oracle_split(history, sides, speakers)
+        if turns is not None and (rounds is None or len(turns) == len(speakers) * rounds):
+            return turns, True
+    counted = _counted_split(history, speakers, rounds)
+    if counted is not None:
+        return counted, True
+    if all(sides) or not history:
+        return _per_side(speakers, sides), False
+    return _by_prefix(history, speakers), False
+
+
+def _per_side(speakers: Sequence[_Speaker], sides: list[str]) -> _Turns:
     """One turn per side: its whole side history, without the leading newline."""
     turns = []
-    for agent_id, keys, _prefixes in speakers:
-        side = _side_history(debate, keys)
-        if side.startswith("\n"):
-            side = side[1:]
+    for (agent_id, _keys, _prefixes), side in zip(speakers, sides, strict=True):
+        side = side[1:] if side.startswith("\n") else side
         if side:
             turns.append((agent_id, side))
     return turns
@@ -160,21 +262,17 @@ def _fallback_debate(
 
 def _debate_turns(
     state: dict[str, Any], key: str, speakers: Sequence[_Speaker], rounds: int | None
-) -> tuple[list[tuple[str, str]], bool]:
-    """The debate's turns, and whether they are the exact split of its history."""
+) -> tuple[_Turns, bool]:
+    """The debate's turns, and whether every boundary between them was confirmed."""
     debate = state.get(key)
     if not isinstance(debate, dict):
         return [], True
-    split = _split_debate(debate, speakers, rounds)
-    if split is not None:
-        return split, True
-    fallback = _fallback_debate(debate, speakers)
-    # An empty debate is no split failure: there was nothing to split.
-    exact = not fallback and not _text(debate.get("history"))
-    return fallback, exact
+    return _split_debate(debate, speakers, rounds)
 
 
 def _analyst_turns(state: dict[str, Any], core_keys: list[str] | None) -> list[tuple[str, str]]:
+    """The analysts' turns: the run's, in its order (an empty report kept, as live
+    capture records it), or without settings the default order, non-empty only."""
     agent_ids = analyst_agent_ids(core_keys) if core_keys is not None else list(DEFAULT_ANALYSTS)
     turns = []
     for agent_id in agent_ids:
@@ -182,7 +280,7 @@ def _analyst_turns(state: dict[str, Any], core_keys: list[str] | None) -> list[t
         if seat is None or seat.phase != "analysis" or seat.content_path is None:
             continue
         text = _text(state.get(seat.content_path))
-        if text:
+        if text or core_keys is not None:
             turns.append((agent_id, text))
     return turns
 
@@ -241,7 +339,9 @@ def build_rebuilt_transcript(state: dict[str, Any], logged_at: datetime | None) 
         *risk,
         (FINAL_AGENT_ID, _text(state.get("final_trade_decision"))),
     ]
-    plan = [(agent_id, text) for agent_id, text in plan if text]
+    if settings is None:
+        # Who spoke is unknown: an empty field is taken as a seat the run never had.
+        plan = [(agent_id, text) for agent_id, text in plan if text]
 
     if settings is not None:
         analyst_ids = analyst_agent_ids(core_keys)

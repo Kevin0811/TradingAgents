@@ -6,24 +6,44 @@ is ``"<Speaker> Analyst: <text>"`` appended to the history with ``"\\n"``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import os
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tradingagents.agents import (
+    create_aggressive_debator,
+    create_bear_researcher,
+    create_bull_researcher,
+    create_conservative_debator,
+    create_neutral_debator,
+)
 from tradingagents.api import config as api_config
 from tradingagents.api.app import create_app
+from tradingagents.api.core.discussion_log import DiscussionLog
 from tradingagents.api.core.rebuilt_transcript import build_rebuilt_transcript
+from tradingagents.api.dependencies import get_state_repository
 from tradingagents.api.infrastructure.discussion_capture import (
     MAPPING,
     MAPPING_VERSION,
     MAX_TASK_CONTENT_BYTES,
     MAX_TURN_CONTENT_BYTES,
+    TaskEventEmitter,
+    analyst_agent_ids,
 )
+from tradingagents.api.infrastructure.repositories import file_state_repository
+from tradingagents.api.infrastructure.repositories.file_state_repository import (
+    FileStateRepository,
+)
+from tradingagents.api.routers import discussion
 from tradingagents.graph import trading_graph
+from tradingagents.graph.propagation import Propagator
 
 ROUTE = "/api/v1/analyze/rebuilt-transcript"
 TICKER = "SPKE"
@@ -198,28 +218,90 @@ class TestConverter:
         assert t["rebuilt"]["split_exact"] is False
 
     @pytest.mark.parametrize("settings", [True, False])
-    def test_a_speaker_prefix_inside_a_turn_falls_back_to_one_turn_per_side(self, settings):
+    def test_a_quoted_prefix_over_two_rounds_splits_exactly(self, settings):
+        # Each speaker quotes the other's prefix (and its own after it): the side
+        # histories still place every boundary.
+        def text(name, i):
+            if name == "Bear":
+                return f"rebuttal {i}\nBull Analyst: quoted"
+            return f"point {i}\nBear Analyst: you said\nBull Analyst: but"
+
+        research, turns = _debate(["Bull", "Bear"], 2, text=text)
+        log, _, _ = make_log(settings=settings, debate_rounds=2, investment_debate_state=research)
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+
+        debate = [turn for turn in t["turns"] if turn["phase"] == "research_debate"]
+        assert [turn["agent_id"] for turn in debate] == ["bull", "bear", "bull", "bear"]
+        assert [turn["content"] for turn in debate] == turns
+        assert t["rebuilt"]["split_exact"] is True
+        _assert_turn_shape(t)
+
+    def test_one_round_with_every_side_is_one_exact_turn_per_side(self):
+        def text(name, i):
+            return f"{name} says\nNeutral Analyst: quoted\nAggressive Analyst: too"
+
+        risk, turns = _debate(["Aggressive", "Conservative", "Neutral"], 1, text=text)
+        log, _, _ = make_log(risk_debate_state=risk)
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+
+        debate = [turn for turn in t["turns"] if turn["phase"] == "risk_debate"]
+        assert [turn["content"] for turn in debate] == turns
+        assert t["rebuilt"]["split_exact"] is True
+
+    def test_empty_sides_keep_all_the_debate_text_unverified(self):
         def text(name, i):
             return "rebuttal\nBull Analyst: quoted" if name == "Bear" else f"point {i}"
 
         research, _ = _debate(["Bull", "Bear"], 1, text=text)
-        log, _, _ = make_log(settings=settings, investment_debate_state=research)
+        research.update(bull_history="", bear_history="")
+        log, _, _ = make_log(settings=False, investment_debate_state=research)
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+
+        debate = [turn for turn in t["turns"] if turn["phase"] == "research_debate"]
+        # Each piece to the speaker whose prefix it starts with; nothing dropped.
+        assert [turn["agent_id"] for turn in debate] == ["bull", "bear", "bull"]
+        assert "\n" + "\n".join(turn["content"] for turn in debate) == research["history"]
+        assert t["rebuilt"]["split_exact"] is False
+
+    @pytest.mark.parametrize(("settings", "exact"), [(True, True), (False, False)])
+    def test_without_sides_only_the_known_round_count_confirms_the_split(self, settings, exact):
+        research, turns = _debate(["Bull", "Bear"], 2)
+        research.update(bull_history="", bear_history="")
+        log, _, _ = make_log(settings=settings, debate_rounds=2, investment_debate_state=research)
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+
+        debate = [turn for turn in t["turns"] if turn["phase"] == "research_debate"]
+        assert [turn["content"] for turn in debate] == turns
+        assert t["rebuilt"]["split_exact"] is exact
+
+    def test_a_count_that_disagrees_with_the_sides_is_not_exact(self):
+        research, _ = _debate(["Bull", "Bear"], 2)
+        research["bear_history"] = "\nBear Analyst: something else"
+        log, _, _ = make_log(settings=False, debate_rounds=2, investment_debate_state=research)
         t = build_rebuilt_transcript(log, LOGGED_AT)
 
         debate = [turn for turn in t["turns"] if turn["phase"] == "research_debate"]
         assert [turn["agent_id"] for turn in debate] == ["bull", "bear"]
-        assert debate[0]["content"] == "Bull Analyst: point 0"
-        assert debate[1]["content"] == "Bear Analyst: rebuttal\nBull Analyst: quoted"
         assert t["rebuilt"]["split_exact"] is False
-        _assert_turn_shape(t)
 
-    def test_empty_fields_are_skipped(self):
-        log, _, _ = make_log(investment_plan="", trader_investment_plan=None)
+    def test_with_settings_an_empty_field_keeps_its_seat_with_empty_content(self):
+        log, _, _ = make_log(investment_plan="", trader_investment_plan=None,
+                             sentiment_report="")
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+
+        assert len(t["turns"]) == t["run_started"]["expected_turns"] == 12
+        by_agent = {turn["agent_id"]: turn for turn in t["turns"]}
+        for agent_id in ("sentiment", "research_manager", "trader"):
+            assert by_agent[agent_id]["content"] == ""
+            assert by_agent[agent_id]["truncated"] is False
+
+    def test_without_settings_empty_fields_are_skipped(self):
+        log, _, _ = make_log(settings=False, investment_plan="", trader_investment_plan=None)
         t = build_rebuilt_transcript(log, LOGGED_AT)
 
         assert "research_manager" not in _agents(t) and "trader" not in _agents(t)
         assert [turn["turn"] for turn in t["turns"]] == list(range(1, 11))
-        assert t["run_started"]["expected_turns"] == 12  # from the settings
+        assert t["run_started"]["expected_turns"] == 10
 
     def test_a_turn_is_capped_at_32_kib_on_a_character_boundary(self):
         long = "界" * 20000  # 60000 bytes
@@ -273,6 +355,111 @@ class TestConverter:
         assert fingerprints["trader_investment_plan"] == hashlib.sha256(b"trader plan").hexdigest()
 
 
+# -- parity with live capture -------------------------------------------------
+
+NODE_BY_AGENT = {seat.agent_id: node for node, seat in MAPPING.items()}
+
+
+class _StubLLM:
+    """The only stub: the LLM boundary. Each call returns the next fixed text."""
+
+    def __init__(self, texts):
+        self._texts = iter(texts)
+
+    def invoke(self, prompt):
+        return SimpleNamespace(content=next(self._texts))
+
+
+def _live_and_logged(rounds, reports):
+    """One synthetic run, driven through the real debate nodes.
+
+    Every node's output goes to the live TaskEventEmitter as LangGraph reports
+    it and is merged into the state as the graph does; the managers, the trader
+    and the analysts (tool-using or structured-output nodes) have their fields
+    set directly. Returns the live transcript and the log ``_log_state`` writes.
+    """
+    core = ["market", "social", "news", "fundamentals"]
+    state = Propagator().create_initial_state(TICKER, TRADE_DATE)
+    log = DiscussionLog("parity")
+    emitter = TaskEventEmitter(log)
+    emitter.start(ticker=TICKER, trade_date=TRADE_DATE, analysts=analyst_agent_ids(core),
+                  debate_rounds=rounds, risk_rounds=rounds)
+    run_ids = iter(range(1000))
+
+    def step(agent_id, node_or_output):
+        node = NODE_BY_AGENT[agent_id]
+        run_id = next(run_ids)
+        emitter.on_chain_start({}, {}, run_id=run_id, name=node,
+                               metadata={"langgraph_node": node, "checkpoint_ns": ""})
+        output = node_or_output(state) if callable(node_or_output) else node_or_output
+        state.update(output)
+        emitter.on_chain_end(output, run_id=run_id)
+
+    research_says = [f"bull {i}" if i % 2 == 0 else f"bear {i}\nBull Analyst: quoted"
+                     for i in range(2 * rounds)]
+    risk_says = [f"risk {i}\nNeutral Analyst: quoted" for i in range(3 * rounds)]
+    research_llm, risk_llm = _StubLLM(research_says), _StubLLM(risk_says)
+    bull, bear = create_bull_researcher(research_llm), create_bear_researcher(research_llm)
+    debaters = [create_aggressive_debator(risk_llm), create_conservative_debator(risk_llm),
+                create_neutral_debator(risk_llm)]
+
+    for agent_id, field in [("market", "market_report"), ("sentiment", "sentiment_report"),
+                            ("news", "news_report"), ("fundamentals", "fundamentals_report")]:
+        step(agent_id, {field: reports.get(field, "")})
+    for _ in range(rounds):  # conditional_logic: bull, bear, ...
+        step("bull", bull)
+        step("bear", bear)
+    step("research_manager", {"investment_plan": "research manager plan"})
+    step("trader", {"trader_investment_plan": "trader plan"})
+    for _ in range(rounds):  # aggressive, conservative, neutral, ...
+        for agent_id, node in zip(["aggressive", "conservative", "neutral"], debaters,
+                                  strict=True):
+            step(agent_id, node)
+    step("portfolio_manager", {"final_trade_decision": "P" * 40000})
+    emitter.close()
+    log.finish("completed")
+
+    debate, risk = state["investment_debate_state"], state["risk_debate_state"]
+    logged = {  # the fields _log_state writes
+        "company_of_interest": state["company_of_interest"],
+        "trade_date": state["trade_date"],
+        **{field: state[field] for field in REPORT_FIELDS.values()},
+        "investment_debate_state": {
+            key: debate[key] for key in ("bull_history", "bear_history", "history",
+                                         "current_response")},
+        "trader_investment_plan": state["trader_investment_plan"],
+        "risk_debate_state": {
+            key: risk[key] for key in ("aggressive_history", "conservative_history",
+                                       "neutral_history", "history")},
+        "investment_plan": state["investment_plan"],
+        "final_trade_decision": state["final_trade_decision"],
+        "final_rating": "Hold",
+        "run_settings": {"analysts": core, "max_debate_rounds": rounds,
+                         "max_risk_discuss_rounds": rounds},
+    }
+    return log.transcript(), json.loads(json.dumps(logged, ensure_ascii=False))
+
+
+class TestParityWithLiveCapture:
+    @pytest.mark.parametrize("rounds", [1, 2])
+    def test_the_rebuilt_turns_equal_the_live_ones(self, rounds):
+        reports = {"market_report": "界" * 15000, "sentiment_report": "",  # capped; empty
+                   "news_report": "news body", "fundamentals_report": "fundamentals body"}
+        live, logged = _live_and_logged(rounds, reports)
+        rebuilt = build_rebuilt_transcript(logged, LOGGED_AT)
+
+        def view(transcript):
+            return [(t["agent_id"], t["role"], t["phase"], t["content"], t["truncated"])
+                    for t in transcript["turns"]]
+
+        assert len(live["turns"]) == 4 + 2 * rounds + 2 + 3 * rounds + 1
+        assert view(rebuilt) == view(live)
+        assert [set(t) for t in rebuilt["turns"]] == [set(t) for t in live["turns"]]
+        assert rebuilt["run_started"] == live["run_started"]
+        assert rebuilt["rebuilt"]["split_exact"] is True
+        assert live["turns"][0]["truncated"] and live["turns"][1]["content"] == ""
+
+
 # -- the route ----------------------------------------------------------------
 
 
@@ -323,6 +510,7 @@ class TestRoute:
         _write_log(results, "x", make_log()[0])  # a file a traversal could reach
         resp = client.get(ROUTE, params={"ticker": ticker, "trade_date": TRADE_DATE})
         assert resp.status_code == 422
+        assert resp.json() == {"error": "Invalid request", "detail": "ticker is not a valid symbol"}
 
     @pytest.mark.parametrize("trade_date", ["2026-13-01", "2026-02-30", "20260109",
                                             "2026-1-9", "../2026-01-09", ""])
@@ -330,20 +518,127 @@ class TestRoute:
         _write_log(results, TICKER, make_log()[0])
         resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": trade_date})
         assert resp.status_code == 422
+        if trade_date in ("2026-13-01", "2026-02-30"):  # past the query pattern: ours
+            assert resp.json() == {"error": "Invalid request",
+                                   "detail": "trade_date is not a valid YYYY-MM-DD date"}
+        else:  # FastAPI's own validation 422
+            assert isinstance(resp.json()["detail"], list)
 
-    @pytest.mark.parametrize("body", ['{"market_report": "cut sho', "[1, 2]", "not-utf8"])
-    def test_an_unreadable_log_is_a_safe_500(self, client, results, tmp_path, body):
-        path = _write_log(results, TICKER, "{}")
+    @pytest.mark.parametrize("body", ["[1, 2]", "not-utf8", "too-big"])
+    def test_an_unreadable_log_is_a_safe_500(self, client, results, tmp_path, body,
+                                             monkeypatch, caplog):
+        path = _write_log(results, TICKER, make_log()[0])
         if body == "not-utf8":
             path.write_bytes(b'{"market_report": "\xff\xfe"}')  # not UTF-8
+        elif body == "too-big":
+            monkeypatch.setattr(file_state_repository, "MAX_STATE_LOG_BYTES", 64)
         else:
             path.write_text(body, encoding="utf-8")
 
-        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+        with caplog.at_level(logging.WARNING):
+            resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
 
         assert resp.status_code == 500
-        assert set(resp.json()) == {"error", "detail"}
+        assert resp.json() == {
+            "error": "Could not read the saved state log",
+            "detail": "The state log for this ticker and date is unreadable or not valid JSON.",
+        }
         assert str(tmp_path) not in resp.text and "full_states_log" not in resp.text
+        # Not an analysis failure: one WARNING naming only the exception class.
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        warning = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warning) == 1 and str(tmp_path) not in warning[0]
+
+    def test_the_size_cap_is_checked_before_parsing(self, client, results, monkeypatch):
+        _write_log(results, TICKER, make_log()[0])
+        monkeypatch.setattr(file_state_repository, "MAX_STATE_LOG_BYTES", 64)
+        monkeypatch.setattr(file_state_repository.json, "load",
+                            lambda f: pytest.fail("parsed a file over the cap"))
+        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+        assert resp.status_code == 500
+
+    @pytest.mark.parametrize("body", ["", '{"market_report": "cut sho'])
+    def test_an_empty_or_truncated_log_is_read_again_then_a_503(self, client, results,
+                                                                 monkeypatch, body):
+        _write_log(results, TICKER, body)
+        sleeps = []
+        monkeypatch.setattr(discussion, "STATE_LOG_RETRY_DELAY", 0)
+        monkeypatch.setattr(discussion.time, "sleep", sleeps.append)
+
+        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+
+        assert resp.status_code == 503
+        assert resp.json() == {"error": "The saved state log is not complete JSON",
+                               "detail": "The saved state log is being written; try again."}
+        assert sleeps == [0]
+
+    def test_a_log_finished_during_the_retry_is_served(self, client, results, monkeypatch):
+        log, _, _ = make_log()
+        path = _write_log(results, TICKER, json.dumps(log)[:50])  # half written
+        monkeypatch.setattr(discussion.time, "sleep",
+                            lambda delay: path.write_text(json.dumps(log), encoding="utf-8"))
+
+        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["turns"]) == 12
+
+    @pytest.mark.parametrize("link", ["folder", "file"])
+    def test_a_symlink_out_of_results_is_not_found(self, client, results, tmp_path, link):
+        outside = _write_log(tmp_path / "outside", TICKER, make_log()[0])
+        if link == "folder":
+            results.mkdir(parents=True)
+            (results / TICKER).symlink_to(outside.parent.parent, target_is_directory=True)
+        else:
+            path = _write_log(results, TICKER, "{}")
+            path.unlink()
+            path.symlink_to(outside)
+
+        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+
+        assert resp.status_code == 404
+        assert set(resp.json()) == {"error", "detail"} and "outside" not in resp.text
+
+    def test_a_symlink_inside_results_is_followed(self, client, results):
+        target = _write_log(results, "OTHER", make_log()[0])
+        path = _write_log(results, TICKER, "{}")
+        path.unlink()
+        path.symlink_to(target)
+        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+        assert resp.status_code == 200
+
+    def test_the_rebuild_runs_off_the_event_loop(self, client, results, monkeypatch):
+        _write_log(results, TICKER, make_log()[0])
+        seen = []
+
+        def rebuild(state, logged_at):
+            try:
+                asyncio.get_running_loop()
+                seen.append("event loop")
+            except RuntimeError:
+                seen.append("worker thread")
+            return build_rebuilt_transcript(state, logged_at)
+
+        monkeypatch.setattr(discussion, "build_rebuilt_transcript", rebuild)
+        assert client.get(ROUTE, params={"ticker": TICKER,
+                                         "trade_date": TRADE_DATE}).status_code == 200
+        assert seen == ["worker thread"]
+
+    def test_an_unreadable_forex_log_falls_back_to_the_ticker_as_given(self, client, results):
+        _write_log(results, "USDTWD=X", "[1]")
+        log, _, _ = make_log(company_of_interest="USDTWD")
+        _write_log(results, "USDTWD", log)
+
+        resp = client.get(ROUTE, params={"ticker": "USDTWD", "trade_date": TRADE_DATE})
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["run_started"]["ticker"] == "USDTWD"
+
+    def test_with_no_readable_form_the_first_error_answers(self, client, results):
+        _write_log(results, "USDTWD=X", "[1]")
+        _write_log(results, "USDTWD", "")
+        resp = client.get(ROUTE, params={"ticker": "USDTWD", "trade_date": TRADE_DATE})
+        assert resp.status_code == 500
 
     def test_the_api_forex_rewrite_is_looked_up(self, client, results):
         # POST /analyze runs USDTWD as USDTWD=X, so its log is under that folder.
@@ -367,4 +662,11 @@ class TestRoute:
     def test_the_route_is_documented(self, client):
         operation = client.get("/api/v1/openapi.json").json()["paths"][ROUTE]["get"]
         assert "full_states_log" in operation["description"]
-        assert {"404", "422", "500"} <= set(operation["responses"])
+        assert {"404", "422", "500", "503"} <= set(operation["responses"])
+        assert "mtime" in operation["description"]
+        assert "market, sentiment, news, fundamentals" in operation["description"]
+
+
+def test_the_state_repository_dependencies_share_one_object():
+    repository = FileStateRepository(results_dir="unused")
+    assert asyncio.run(get_state_repository(repository)) is repository

@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any
@@ -20,7 +21,11 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from tradingagents.api.core.discussion_log import DiscussionLog, DiscussionStore
-from tradingagents.api.core.exceptions import AnalysisError, DataNotFoundError
+from tradingagents.api.core.exceptions import (
+    DataNotFoundError,
+    StateLogUnreadableError,
+    UnprocessableRequestError,
+)
 from tradingagents.api.core.rebuilt_transcript import build_rebuilt_transcript
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.dependencies import (
@@ -211,8 +216,13 @@ async def get_task_transcript(
 TRADE_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
 
-def _unprocessable(detail: str) -> HTTPException:
-    return HTTPException(status_code=422, detail=detail)
+# A state log that is empty or not complete JSON may still be being written:
+# it is read once more after this many seconds before the 503.
+STATE_LOG_RETRY_DELAY = 0.2
+
+
+def _unprocessable(detail: str) -> UnprocessableRequestError:
+    return UnprocessableRequestError(message="Invalid request", detail=detail)
 
 
 def state_log_tickers(ticker: str) -> list[str]:
@@ -231,14 +241,37 @@ def state_log_tickers(ticker: str) -> list[str]:
     return forms
 
 
-def _read_state_log(
+def _load_once_more(
+    repo: FileStateRepository, ticker: str, trade_date: str
+) -> tuple[dict[str, Any], datetime]:
+    """Load the log; an empty or truncated file (maybe being written) is read again once."""
+    try:
+        return repo.load_state_logged(ticker, trade_date)
+    except json.JSONDecodeError:
+        time.sleep(STATE_LOG_RETRY_DELAY)
+        return repo.load_state_logged(ticker, trade_date)
+
+
+def _rebuild(
     repo: FileStateRepository, tickers: list[str], trade_date: str
-) -> tuple[dict[str, Any], datetime] | None:
+) -> dict[str, Any] | None:
+    """The rebuilt transcript of the first readable log among ``tickers``; None if none exists.
+
+    An unreadable log under one ticker form does not hide a good one under the
+    next; when none is readable the first form's error is raised.
+    """
+    first_error: Exception | None = None
     for ticker in tickers:
         try:
-            return repo.load_state_logged(ticker, trade_date)
+            state, logged_at = _load_once_more(repo, ticker, trade_date)
         except FileNotFoundError:
             continue
+        except (OSError, ValueError) as exc:
+            first_error = first_error or exc
+            continue
+        return build_rebuilt_transcript(state, logged_at)
+    if first_error is not None:
+        raise first_error
     return None
 
 
@@ -254,13 +287,20 @@ def _read_state_log(
         "tools_dropped: 0, events_dropped: 0, rebuilt}`. Turns: the analysts "
         "(the run's order), the bull/bear debate, the research manager, the "
         "trader, the aggressive/conservative/neutral debate and the portfolio "
-        "manager; empty fields are skipped. A log has no tools or timings: "
+        "manager. With `run_settings` in the log, each seat the run had keeps "
+        "a turn, with `\"\"` content when its field is empty (as live capture "
+        "records it); without them, empty fields are skipped and the analysts "
+        "come in the default order market, sentiment, news, fundamentals. "
+        "A log has no tools or timings: "
         "`tools` is `[]`, `started_at`/`completed_at` are null. Content is "
         "capped as live (32 KiB a turn, the task budget, the final decision's "
         "share reserved).\n\n"
-        "`rebuilt`: `logged_at` (the log file's mtime, UTC ISO), "
-        "`settings_known` (the log has `run_settings`), `split_exact` (false when "
-        "a debate could not be split turn by turn and each side is one turn) and "
+        "`rebuilt`: `logged_at` (the log file's mtime, UTC ISO: when the run "
+        "wrote it, or when the file was last touched), "
+        "`settings_known` (the log has `run_settings`), `split_exact` (true only "
+        "when every debate boundary was confirmed by the speakers' side histories "
+        "or the run's round count; when false a debate is one turn per side, or "
+        "its pieces by speaker prefix, and no text is dropped) and "
         "`fingerprints` (sha256 hex of the raw UTF-8 text of `market_report`, "
         "`sentiment_report`, `news_report`, `fundamentals_report`, "
         "`investment_plan`, `trader_investment_plan`, `final_trade_decision`, "
@@ -268,9 +308,16 @@ def _read_state_log(
         "one log per ticker and date, overwritten by a re-run: compare the "
         "fingerprints to know it is your run's.\n\n"
         "The ticker is looked up as `POST /analyze` runs it (`USDTWD` -> "
-        "`USDTWD=X`), then as given. 404 when there is no log; 422 for a ticker "
-        "that is not a safe path component or a date not `YYYY-MM-DD`; 500 when "
-        "the log cannot be read or is not a JSON object.\n\n"
+        "`USDTWD=X`), then as given; an unreadable log under one form does not "
+        "hide a readable one under the other.\n\n"
+        "Errors are `{error, detail}`: 404 when there is no log (or its real "
+        "path, symlinks resolved, is outside the results directory); 422 for a "
+        "ticker that is not a safe path component or a date that is not a real "
+        "`YYYY-MM-DD` date (a missing parameter or one that fails the query "
+        "pattern is FastAPI's own 422, whose `detail` is a list); 503 when the "
+        "log is empty or not complete JSON after one retry (a run may be "
+        "writing it: transient, try again); 500 when it is not UTF-8, not a "
+        "JSON object, or over 64 MiB.\n\n"
         "Like every endpoint of this API, this one has no authentication: keep the "
         "API on a trusted network."
     ),
@@ -278,6 +325,7 @@ def _read_state_log(
         404: {"description": "No state log for this ticker and date"},
         422: {"description": "Invalid ticker or trade date"},
         500: {"description": "The state log could not be read"},
+        503: {"description": "The state log is empty or incomplete (being written); try again"},
     },
 )
 async def get_rebuilt_transcript(
@@ -296,19 +344,25 @@ async def get_rebuilt_transcript(
     except ValueError:
         raise _unprocessable("ticker is not a valid symbol") from None
     try:
-        found = await run_in_threadpool(_read_state_log, repo, tickers, trade_date)
+        # Read, parse and rebuild off the event loop.
+        transcript = await run_in_threadpool(_rebuild, repo, tickers, trade_date)
     except (OSError, ValueError) as exc:
-        # The exception text can name the file: it stays in the log.
+        # The exception text can name the file: only its class is logged.
         logger.warning("Could not read the state log of %s on %s: %s",
                        tickers[0], trade_date, type(exc).__name__)
-        raise AnalysisError(
+        if isinstance(exc, json.JSONDecodeError):
+            raise StateLogUnreadableError(
+                message="The saved state log is not complete JSON",
+                detail="The saved state log is being written; try again.",
+                retryable=True,
+            ) from None
+        raise StateLogUnreadableError(
             message="Could not read the saved state log",
             detail="The state log for this ticker and date is unreadable or not valid JSON.",
         ) from None
-    if found is None:
+    if transcript is None:
         raise DataNotFoundError(
             message=f"No state log for {tickers[0]} on {trade_date}",
             detail="Only completed runs have one.",
         )
-    state, logged_at = found
-    return build_rebuilt_transcript(state, logged_at)
+    return transcript
