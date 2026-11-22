@@ -40,11 +40,19 @@ async def get_llm_provider_factory(
     return LLMProviderFactory(config=config.config)
 
 
-async def get_state_repository(
+async def get_file_state_repository(
     config: ApiConfig = Depends(get_config),
-) -> StateRepository:
-    """Create a file-based state repository."""
+) -> FileStateRepository:
+    """Create the file-based state repository (typed as such: it also gives a log's mtime)."""
     return FileStateRepository(results_dir=config.results_dir)
+
+
+async def get_state_repository(
+    repository: FileStateRepository = Depends(get_file_state_repository),
+) -> StateRepository:
+    """The state repository: the same object as :func:`get_file_state_repository`
+    within a request (FastAPI caches a dependency per request)."""
+    return repository
 
 
 # ---------------------------------------------------------------------------
