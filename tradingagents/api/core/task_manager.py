@@ -15,6 +15,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 from tradingagents.api.core.discussion_log import DiscussionStore
+from tradingagents.api.core.error_codes import TA_CANCELLED_BEFORE_START
 from tradingagents.api.schemas.task import (
     FINISHED_STATUSES,
     TaskCreateRequest,
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 CANCELLED_BEFORE_START = "Cancelled before it started."
 CANCELLED_WHILE_RUNNING = "Cancelled while running; stopped at its next LLM call."
+
+
+def _terminal_codes(task: TaskResponse) -> dict[str, str]:
+    """The task's ``error_code`` / ``cancel_reason`` that are set, for the
+    terminal ``task_status`` event of its discussion log."""
+    codes = {"error_code": task.error_code, "cancel_reason": task.cancel_reason}
+    return {key: value for key, value in codes.items() if value is not None}
 
 
 class CancelOutcome(StrEnum):
@@ -218,7 +226,9 @@ class TaskManager:
             if status in FINISHED_STATUSES:
                 task.completed_at = datetime.now()
                 if self._discussions is not None:
-                    self._discussions.finish(task_id, TaskStatus(status).value)
+                    self._discussions.finish(
+                        task_id, TaskStatus(status).value, **_terminal_codes(task)
+                    )
                 # A cancelled task's one INFO line comes from whoever cancelled
                 # or stopped it; this would only repeat it.
                 logger.log(
@@ -306,9 +316,12 @@ class TaskManager:
                 future.cancel()
             task.status = TaskStatus.CANCELLED
             task.message = CANCELLED_BEFORE_START
+            task.cancel_reason = TA_CANCELLED_BEFORE_START
             task.completed_at = now
             if self._discussions is not None:
-                self._discussions.finish(task_id, TaskStatus.CANCELLED.value)
+                self._discussions.finish(
+                    task_id, TaskStatus.CANCELLED.value, **_terminal_codes(task)
+                )
             logger.info("Task %s cancelled before it started", task_id)
             return CancelOutcome.CANCELLED
 

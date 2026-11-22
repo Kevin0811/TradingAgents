@@ -120,12 +120,16 @@ class DiscussionLog:
         with self._lock:
             self._notes[key] = value
 
-    def finish(self, status: str) -> dict[str, Any] | None:
-        """Append the terminal ``task_status`` and close the log. Idempotent."""
+    def finish(self, status: str, **codes: str) -> dict[str, Any] | None:
+        """Append the terminal ``task_status`` and close the log. Idempotent.
+
+        ``codes`` are the task's ``error_code`` / ``cancel_reason`` when set;
+        they go into the event's data as they are.
+        """
         with self._lock:
             if self._finished:
                 return None
-            data: dict[str, Any] = {"status": status, **self._notes}
+            data: dict[str, Any] = {"status": status, **self._notes, **codes}
             if self._dropped:
                 data["events_dropped"] = self._dropped
             self._status = status
@@ -311,10 +315,10 @@ class DiscussionStore:
         with self._lock:
             return self._logs.get(task_id)
 
-    def finish(self, task_id: str, status: str) -> None:
+    def finish(self, task_id: str, status: str, **codes: str) -> None:
         log = self.get(task_id)
         if log is not None:
-            log.finish(status)
+            log.finish(status, **codes)
 
     def drop(self, task_id: str) -> None:
         """Forget a task's log. A log not yet finished (a queued task deleted

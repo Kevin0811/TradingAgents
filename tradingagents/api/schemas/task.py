@@ -66,8 +66,33 @@ class TaskResponse(BaseModel):
     updated_at: datetime | None = None
     completed_at: datetime | None = None
     error: str | None = None
+    error_code: str | None = Field(
+        default=None,
+        description=(
+            "Why the task failed, as a stable code; set only when status is 'failed' "
+            "(null otherwise). 'error' keeps the free-text detail. One of: "
+            "TA_LLM_TIMEOUT (an LLM call timed out), TA_LLM_UNREACHABLE (the LLM "
+            "provider could not be reached), TA_LLM_AUTH (the provider rejected the "
+            "key: 401/403), TA_LLM_MODEL_NOT_FOUND (the configured model does not "
+            "exist: 404, or Ollama's 'model ... not found'), TA_LLM_RATE_LIMITED "
+            "(429), TA_LLM_RESPONSE_INVALID (the model's reply did not validate or "
+            "parse), TA_DATA_VENDOR_FAILED (a market data vendor failed), "
+            "TA_RUN_FAILED (anything else). New codes may be added; treat an "
+            "unknown one as TA_RUN_FAILED."
+        ),
+    )
     result: dict | None = None
     message: str | None = None
+    cancel_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why the task was cancelled, as a stable code; set only when status is "
+            "'cancelled' (null otherwise). 'message' keeps the free text. One of: "
+            "TA_CANCELLED_BEFORE_START (cancelled while pending or queued; it never "
+            "ran), TA_CANCELLED_WHILE_RUNNING (cancelled while processing; it stopped "
+            "at its next LLM call)."
+        ),
+    )
     cancel_requested: bool = Field(
         default=False,
         description=(
