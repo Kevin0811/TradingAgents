@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from tradingagents.api.core.discussion_log import DiscussionLog, DiscussionStore
+from tradingagents.api.core.error_codes import TA_CANCELLED_WHILE_RUNNING, classify_error
 from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.core.task_manager import (
@@ -121,6 +122,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.CANCELLED,
                 message=CANCELLED_WHILE_RUNNING,
+                cancel_reason=TA_CANCELLED_WHILE_RUNNING,
                 token_usage=token_usage_model(e.token_usage),
             )
 
@@ -130,6 +132,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.FAILED,
                 error=str(e.detail) if e.detail else str(e),
+                error_code=classify_error(e),
                 token_usage=token_usage_model(e.token_usage),
             )
 
@@ -142,6 +145,7 @@ class TaskService:
                 task_id,
                 status=TaskStatus.FAILED,
                 error=error_text(e),
+                error_code=classify_error(e),
             )
 
         self._save_transcript(task_id, request.ticker, log)
