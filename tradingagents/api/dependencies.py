@@ -47,6 +47,13 @@ async def get_state_repository(
     return FileStateRepository(results_dir=config.results_dir)
 
 
+async def get_file_state_repository(
+    config: ApiConfig = Depends(get_config),
+) -> FileStateRepository:
+    """The file state repository itself (for the file's mtime too)."""
+    return FileStateRepository(results_dir=config.results_dir)
+
+
 # ---------------------------------------------------------------------------
 # Domain service dependencies
 # ---------------------------------------------------------------------------

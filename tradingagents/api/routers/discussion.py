@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -18,14 +20,24 @@ from fastapi.responses import StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from tradingagents.api.core.discussion_log import DiscussionLog, DiscussionStore
+from tradingagents.api.core.exceptions import AnalysisError, DataNotFoundError
+from tradingagents.api.core.rebuilt_transcript import build_rebuilt_transcript
 from tradingagents.api.core.task_manager import TaskManager
 from tradingagents.api.dependencies import (
     get_discussion_store,
+    get_file_state_repository,
     get_task_manager,
     get_transcript_files,
 )
+from tradingagents.api.domain.symbols import api_forex_symbol
 from tradingagents.api.infrastructure.discussion_capture import MAPPING_VERSION
+from tradingagents.api.infrastructure.repositories.file_state_repository import (
+    FileStateRepository,
+)
 from tradingagents.api.infrastructure.transcript_files import TranscriptFiles
+from tradingagents.dataflows.symbols import safe_ticker_component
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/analyze", tags=["Analysis"])
 
@@ -194,3 +206,109 @@ async def get_task_transcript(
     if data is None:
         raise _not_found(task_id)
     return data
+
+
+TRADE_DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+
+
+def _unprocessable(detail: str) -> HTTPException:
+    return HTTPException(status_code=422, detail=detail)
+
+
+def state_log_tickers(ticker: str) -> list[str]:
+    """The ticker folders a run of ``ticker`` may have logged under, in lookup order.
+
+    First the form ``POST /analyze`` hands the graph (stripped; a forex pair
+    the core leaves alone rewritten, ``USDTWD`` -> ``USDTWD=X``, as
+    ``validate_ticker_shape`` does), then the ticker as given. Raises
+    ValueError when one is not a safe path component.
+    """
+    raw = ticker.strip()
+    forms: list[str] = []
+    for form in (api_forex_symbol(raw) or raw, raw):
+        if form not in forms:
+            forms.append(safe_ticker_component(form))
+    return forms
+
+
+def _read_state_log(
+    repo: FileStateRepository, tickers: list[str], trade_date: str
+) -> tuple[dict[str, Any], datetime] | None:
+    for ticker in tickers:
+        try:
+            return repo.load_state_logged(ticker, trade_date)
+        except FileNotFoundError:
+            continue
+    return None
+
+
+@router.get(
+    "/rebuilt-transcript",
+    summary="Rebuild a run's discussion transcript from its saved state log",
+    description=(
+        "The discussion of a completed run, rebuilt from the core's "
+        "`full_states_log_<trade_date>.json` for runs that have no live transcript. "
+        "Read-only: no graph, no model, no network.\n\n"
+        "The body has the `/tasks/{task_id}/transcript` shape without `task_id`: "
+        "`{v, mapping_version, status: \"completed\", run_started, turns, "
+        "tools_dropped: 0, events_dropped: 0, rebuilt}`. Turns: the analysts "
+        "(the run's order), the bull/bear debate, the research manager, the "
+        "trader, the aggressive/conservative/neutral debate and the portfolio "
+        "manager; empty fields are skipped. A log has no tools or timings: "
+        "`tools` is `[]`, `started_at`/`completed_at` are null. Content is "
+        "capped as live (32 KiB a turn, the task budget, the final decision's "
+        "share reserved).\n\n"
+        "`rebuilt`: `logged_at` (the log file's mtime, UTC ISO), "
+        "`settings_known` (the log has `run_settings`), `split_exact` (false when "
+        "a debate could not be split turn by turn and each side is one turn) and "
+        "`fingerprints` (sha256 hex of the raw UTF-8 text of `market_report`, "
+        "`sentiment_report`, `news_report`, `fundamentals_report`, "
+        "`investment_plan`, `trader_investment_plan`, `final_trade_decision`, "
+        "for each present; the same names as the `/analyze` result). There is "
+        "one log per ticker and date, overwritten by a re-run: compare the "
+        "fingerprints to know it is your run's.\n\n"
+        "The ticker is looked up as `POST /analyze` runs it (`USDTWD` -> "
+        "`USDTWD=X`), then as given. 404 when there is no log; 422 for a ticker "
+        "that is not a safe path component or a date not `YYYY-MM-DD`; 500 when "
+        "the log cannot be read or is not a JSON object.\n\n"
+        "Like every endpoint of this API, this one has no authentication: keep the "
+        "API on a trusted network."
+    ),
+    responses={
+        404: {"description": "No state log for this ticker and date"},
+        422: {"description": "Invalid ticker or trade date"},
+        500: {"description": "The state log could not be read"},
+    },
+)
+async def get_rebuilt_transcript(
+    ticker: str = Query(..., description="Ticker symbol, as analysed"),
+    trade_date: str = Query(
+        ..., pattern=TRADE_DATE_PATTERN, description="Trading date in YYYY-MM-DD format"),
+    repo: FileStateRepository = Depends(get_file_state_repository),
+) -> dict[str, Any]:
+    """Return the transcript rebuilt from the run's state log."""
+    try:
+        datetime.strptime(trade_date, "%Y-%m-%d")
+    except ValueError:
+        raise _unprocessable("trade_date is not a valid YYYY-MM-DD date") from None
+    try:
+        tickers = state_log_tickers(ticker)
+    except ValueError:
+        raise _unprocessable("ticker is not a valid symbol") from None
+    try:
+        found = await run_in_threadpool(_read_state_log, repo, tickers, trade_date)
+    except (OSError, ValueError) as exc:
+        # The exception text can name the file: it stays in the log.
+        logger.warning("Could not read the state log of %s on %s: %s",
+                       tickers[0], trade_date, type(exc).__name__)
+        raise AnalysisError(
+            message="Could not read the saved state log",
+            detail="The state log for this ticker and date is unreadable or not valid JSON.",
+        ) from None
+    if found is None:
+        raise DataNotFoundError(
+            message=f"No state log for {tickers[0]} on {trade_date}",
+            detail="Only completed runs have one.",
+        )
+    state, logged_at = found
+    return build_rebuilt_transcript(state, logged_at)
