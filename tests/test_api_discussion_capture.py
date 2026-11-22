@@ -529,13 +529,16 @@ def test_transcript_folds_events_into_turns():
 
 def test_dropping_an_unfinished_log_finishes_it_as_cancelled():
     # A queued task deleted before it ran: its log is dropped without a run,
-    # and an open stream on it must still get a terminal task_status.
+    # and an open stream on it must still get a terminal task_status (with the
+    # before-start cancel reason, since the log never left ``queued``).
     store = DiscussionStore()
     log = store.create("6f1c6a52-0b7e-4d39-9d2c-1f1e7a3d0c11")
     store.drop("6f1c6a52-0b7e-4d39-9d2c-1f1e7a3d0c11")
     assert log.finished
     assert log.read()[-1]["type"] == "task_status"
-    assert log.read()[-1]["data"] == {"status": "cancelled"}
+    assert log.read()[-1]["data"] == {
+        "status": "cancelled", "cancel_reason": "TA_CANCELLED_BEFORE_START",
+    }
     assert store.get("6f1c6a52-0b7e-4d39-9d2c-1f1e7a3d0c11") is None
 
 

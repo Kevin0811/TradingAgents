@@ -9,13 +9,18 @@ in memory: no network, no LLM.
 
 from __future__ import annotations
 
+import socket
 import threading
+import types
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import anthropic
 import httpx
 import openai
 import pytest
+import requests
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from google.genai import errors as genai_errors
 from langchain_core.exceptions import OutputParserException
@@ -23,6 +28,7 @@ from pydantic import BaseModel, ValidationError
 
 from tradingagents.api import config as api_config
 from tradingagents.api.app import create_app
+from tradingagents.api.core import error_codes
 from tradingagents.api.core.discussion_log import DiscussionStore
 from tradingagents.api.core.error_codes import (
     CANCEL_REASONS,
@@ -85,11 +91,15 @@ def _validation_error() -> ValidationError:
 
 
 class _OllamaResponseError(Exception):
-    """Stands in for ``ollama.ResponseError`` (not installed): a status_code attribute."""
+    """Stands in for ``ollama.ResponseError`` (not installed): a status_code attribute
+    (-1 when the server sent none) and the real class's module."""
 
     def __init__(self, error: str, status_code: int):
         super().__init__(error)
         self.status_code = status_code
+
+
+_OllamaResponseError.__module__ = "ollama._types"
 
 
 class _YFRateLimitError(Exception):
@@ -153,7 +163,8 @@ CASES = [
     ("ollama ResponseError 404",
      _OllamaResponseError("model 'llama9' not found", 404), TA_LLM_MODEL_NOT_FOUND),
     ("ollama text, no status (last resort)",
-     RuntimeError('model "llama9" not found, try pulling it first'), TA_LLM_MODEL_NOT_FOUND),
+     _OllamaResponseError('model "llama9" not found, try pulling it first', -1),
+     TA_LLM_MODEL_NOT_FOUND),
     # rate limited
     ("openai.RateLimitError", _status_error(openai.RateLimitError, 429), TA_LLM_RATE_LIMITED),
     ("anthropic.RateLimitError", _status_error(anthropic.RateLimitError, 429), TA_LLM_RATE_LIMITED),
@@ -175,6 +186,14 @@ CASES = [
     ("google-genai ServerError 500", genai_errors.ServerError(500, {}), TA_RUN_FAILED),
     ("openai 500", _status_error(openai.InternalServerError, 500), TA_RUN_FAILED),
     ("bare AnalysisError", AnalysisError("Analysis failed", detail="x"), TA_RUN_FAILED),
+    # model-not-found text on anything but an Ollama/OpenAI client error
+    ("RuntimeError 'model ... not found'",
+     RuntimeError('model "llama9" not found, try pulling it first'), TA_RUN_FAILED),
+    ("RuntimeError naming a pydantic model",
+     RuntimeError("Pydantic model 'Decision' field rating not found"), TA_RUN_FAILED),
+    # a status code on a non-LLM-client error
+    ("fastapi.HTTPException 404", HTTPException(404), TA_RUN_FAILED),
+    ("fastapi.HTTPException 429", HTTPException(429), TA_RUN_FAILED),
 ]
 
 
@@ -221,6 +240,119 @@ class TestClassifyError:
                 raise ValueError("no text")
 
         assert classify_error(Weird()) == TA_RUN_FAILED
+
+    def test_the_cause_comes_before_the_context(self):
+        """Both followed (breadth first, cause first) when the context is not suppressed."""
+        exc = RuntimeError("outer")
+        exc.__cause__ = openai.APITimeoutError(request=REQ)
+        exc.__context__ = _status_error(openai.RateLimitError, 429)
+        exc.__suppress_context__ = False
+        assert classify_error(exc) == TA_LLM_TIMEOUT
+
+    def test_raise_from_none_hides_the_context(self):
+        try:
+            try:
+                raise _status_error(openai.RateLimitError, 429)
+            except openai.RateLimitError:
+                raise RuntimeError("handled, then failed for another reason") from None
+        except RuntimeError as caught:
+            exc = caught
+        assert exc.__context__ is not None and exc.__suppress_context__
+        assert classify_error(exc) == TA_RUN_FAILED
+
+    @pytest.mark.parametrize(("wrappers", "code"), [
+        (error_codes._MAX_CHAIN - 1, TA_LLM_RATE_LIMITED),   # the typed one is the 32nd
+        (error_codes._MAX_CHAIN, TA_RUN_FAILED),             # the 33rd: past the guard
+    ])
+    def test_the_depth_guard(self, wrappers, code):
+        chain = [RuntimeError(str(i)) for i in range(wrappers)]
+        chain.append(_status_error(openai.RateLimitError, 429))
+        for outer, inner in zip(chain, chain[1:], strict=False):
+            outer.__cause__ = inner
+        assert classify_error(chain[0]) == code
+
+    def test_a_broken_sdk_import_is_skipped_and_logged(self, monkeypatch, caplog):
+        def boom(name):
+            raise RuntimeError(f"{name} broke at import")
+
+        monkeypatch.setattr(error_codes, "importlib", types.SimpleNamespace(import_module=boom))
+        with caplog.at_level("DEBUG", logger=error_codes.__name__):
+            assert error_codes._optional_types("broken_sdk:Error") == ()
+        assert "broken_sdk:Error unavailable" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# classify_error: errors raised inside a data vendor (by traceback frame)
+# ---------------------------------------------------------------------------
+
+_FAKE_VENDOR = types.ModuleType("tradingagents.dataflows.fake_vendor")
+exec(  # noqa: S102 - a fixed snippet: a function whose frames run in the fake module
+    compile("def fetch(make):\n    raise make()\n", "<fake_vendor>", "exec"),
+    _FAKE_VENDOR.__dict__,
+)
+
+
+def _raised_in_vendor(make) -> BaseException:
+    try:
+        _FAKE_VENDOR.fetch(make)
+    except BaseException as exc:  # noqa: BLE001
+        return exc
+    raise AssertionError("unreachable")
+
+
+def _http_error(status: int) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status
+    return requests.HTTPError(f"{status} Client Error", response=response)
+
+
+VENDOR_RAISED = [
+    ("requests.ReadTimeout", lambda: requests.ReadTimeout("read timed out")),
+    ("requests.ConnectionError", lambda: requests.ConnectionError("reset")),
+    ("requests.HTTPError 429", lambda: _http_error(429)),
+    ("socket.timeout", lambda: socket.timeout("timed out")),  # noqa: UP041 - the alias, on purpose
+    ("builtin TimeoutError", lambda: TimeoutError("timed out")),
+    ("builtin ConnectionError", lambda: ConnectionError("reset")),
+]
+
+
+@pytest.mark.unit
+class TestVendorFrames:
+    @pytest.mark.parametrize("make", [c[1] for c in VENDOR_RAISED], ids=[c[0] for c in VENDOR_RAISED])
+    def test_raised_in_a_vendor_is_the_vendors(self, make):
+        exc = _raised_in_vendor(make)
+        assert classify_error(exc) == TA_DATA_VENDOR_FAILED
+        # ... also under the API's AnalysisError, as the worker sees it
+        wrapped = _raised_from(AnalysisError("Analysis failed", detail="x"), exc)
+        assert classify_error(wrapped) == TA_DATA_VENDOR_FAILED
+
+    def test_the_same_errors_raised_elsewhere_keep_their_codes(self):
+        for make, code in ((lambda: socket.timeout("t"), TA_LLM_TIMEOUT),  # noqa: UP041
+                           (lambda: ConnectionError("r"), TA_LLM_UNREACHABLE),
+                           (lambda: _http_error(429), TA_RUN_FAILED)):
+            try:
+                raise make()
+            except BaseException as exc:  # noqa: BLE001
+                assert classify_error(exc) == code
+
+    def test_an_openai_timeout_raised_normally_is_the_llms(self):
+        try:
+            raise openai.APITimeoutError(request=REQ)
+        except openai.APITimeoutError as exc:
+            assert classify_error(exc) == TA_LLM_TIMEOUT
+
+    def test_an_llm_call_from_a_vendor_frame_is_still_the_llms(self):
+        """An LLM SDK error in the chain wins over a vendor frame."""
+        exc = _raised_in_vendor(lambda: openai.APITimeoutError(request=REQ))
+        assert classify_error(exc) == TA_LLM_TIMEOUT
+
+        def wrapped():
+            try:
+                _FAKE_VENDOR.fetch(lambda: _status_error(openai.RateLimitError, 429))
+            except openai.RateLimitError as inner:
+                raise RuntimeError("vendor summary failed") from inner
+
+        assert classify_error(_raised_in_vendor(wrapped)) == TA_LLM_RATE_LIMITED
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +443,51 @@ class TestLifecycle:
         assert store.get(task.task_id).read()[-1]["data"] == {
             "status": "cancelled", "cancel_reason": TA_CANCELLED_WHILE_RUNNING,
         }
+
+    def test_a_cancel_then_a_failure_is_failed(self):
+        """The race: cancel requested, then the run fails on its own error."""
+        store = DiscussionStore()
+        tm = TaskManager(discussions=store)
+        task, _ = tm.create_task(_request())
+        analysis = MagicMock()
+
+        def run(**kwargs):
+            tm.cancel_task(task.task_id)
+            raise _raised_from(
+                AnalysisError("Analysis failed", detail="x"), _status_error(openai.RateLimitError, 429)
+            )
+
+        analysis.run_analysis.side_effect = run
+        TaskService(task_manager=tm, analysis_service=analysis, discussions=store).execute_analysis(
+            task.task_id, _request()
+        )
+        done = tm.get_task(task.task_id)
+        assert done.cancel_requested is True
+        assert done.status == TaskStatus.FAILED
+        assert done.cancel_reason is None
+        assert done.error_code == TA_LLM_RATE_LIMITED
+        assert store.get(task.task_id).read()[-1]["data"] == {
+            "status": "failed", "error_code": TA_LLM_RATE_LIMITED,
+        }
+
+    def test_cleanup_of_a_stale_pending_task_ends_its_log_before_start(self):
+        store = DiscussionStore()
+        tm = TaskManager(discussions=store, ttl_minutes=1)
+        task, _ = tm.create_task(_request())
+        log = store.get(task.task_id)
+        tm._tasks[task.task_id].created_at = datetime.now() - timedelta(minutes=5)
+        assert tm.cleanup() == 1
+        assert store.get(task.task_id) is None
+        assert log.read()[-1]["data"] == {
+            "status": "cancelled", "cancel_reason": TA_CANCELLED_BEFORE_START,
+        }
+
+    def test_a_started_log_dropped_has_no_cancel_reason(self):
+        store = DiscussionStore()
+        log = store.create("t1")
+        log.append("task_status", {"status": "running"})
+        store.drop("t1")
+        assert log.read()[-1]["data"] == {"status": "cancelled"}
 
     def test_a_completed_task_has_neither(self):
         analysis = MagicMock()

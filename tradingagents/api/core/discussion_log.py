@@ -35,6 +35,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from tradingagents.api.core.error_codes import TA_CANCELLED_BEFORE_START
+
 SCHEMA_VERSION = 1
 
 # Persisted event types (all kept in the log and the transcript).
@@ -322,11 +324,19 @@ class DiscussionStore:
 
     def drop(self, task_id: str) -> None:
         """Forget a task's log. A log not yet finished (a queued task deleted
-        before it ran) is first finished as cancelled, so an open stream on it
-        still receives a terminal ``task_status`` instead of hanging."""
+        before it ran, or a stale pending one removed by cleanup) is first
+        finished as cancelled, so an open stream on it still receives a
+        terminal ``task_status`` instead of hanging. A log that never left
+        ``queued`` carries ``cancel_reason`` ``TA_CANCELLED_BEFORE_START``; one
+        dropped after it started (not expected: the worker finishes its log
+        first) carries no ``cancel_reason``."""
         with self._lock:
             log = self._logs.pop(task_id, None)
-        if log is not None:
+        if log is None:
+            return
+        if log.status == STATUS_QUEUED:
+            log.finish("cancelled", cancel_reason=TA_CANCELLED_BEFORE_START)
+        else:
             log.finish("cancelled")
 
     def __len__(self) -> int:
