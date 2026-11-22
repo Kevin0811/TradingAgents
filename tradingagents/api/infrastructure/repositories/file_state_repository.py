@@ -19,6 +19,14 @@ class StateLogTooLargeError(ValueError):
     """A state log over :data:`MAX_STATE_LOG_BYTES`, refused before parsing."""
 
 
+class StateLogIncompleteError(json.JSONDecodeError):
+    """An empty or truncated state log, with its file's mtime (UTC) in ``logged_at``."""
+
+    def __init__(self, error: json.JSONDecodeError, logged_at: datetime):
+        super().__init__(error.msg, error.doc, error.pos)
+        self.logged_at = logged_at
+
+
 class FileStateRepository(StateRepository):
     """File-based repository for loading saved analysis states from disk."""
 
@@ -71,7 +79,8 @@ class FileStateRepository(StateRepository):
         Raises:
             FileNotFoundError: If no state file exists (or it lies outside ``results_dir``).
             StateLogTooLargeError: The file is over :data:`MAX_STATE_LOG_BYTES`.
-            json.JSONDecodeError: The file is empty or not (yet) complete JSON.
+            StateLogIncompleteError: The file is empty or not (yet) complete
+                JSON (a ``json.JSONDecodeError`` carrying the file's mtime).
             ValueError: An unsafe ticker (``safe_ticker_component``), a file that
                 is not UTF-8, or JSON that is not an object.
             OSError: If the file cannot be read.
@@ -86,7 +95,10 @@ class FileStateRepository(StateRepository):
             if info.st_size > MAX_STATE_LOG_BYTES:
                 raise StateLogTooLargeError(f"The state file is over {MAX_STATE_LOG_BYTES} bytes.")
             logged_at = datetime.fromtimestamp(info.st_mtime, UTC)
-            state = json.load(f)
+            try:
+                state = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise StateLogIncompleteError(exc, logged_at) from None
         if not isinstance(state, dict):
             raise ValueError("The state file does not hold a JSON object.")
         return state, logged_at

@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -281,8 +282,40 @@ class TestConverter:
         t = build_rebuilt_transcript(log, LOGGED_AT)
 
         debate = [turn for turn in t["turns"] if turn["phase"] == "research_debate"]
-        assert [turn["agent_id"] for turn in debate] == ["bull", "bear"]
+        # The sides lack history's bear turns: history by prefix, nothing of it dropped.
+        assert [turn["agent_id"] for turn in debate] == ["bull", "bear", "bull", "bear"]
+        assert "\n" + "\n".join(turn["content"] for turn in debate) == research["history"]
         assert t["rebuilt"]["split_exact"] is False
+
+    def test_sides_holding_all_of_a_disagreeing_history_are_one_turn_each(self):
+        research, _ = _debate(["Bull", "Bear"], 2)
+        research["bear_history"] += "\nBear Analyst: a turn history lacks"
+        log, _, _ = make_log(settings=False, investment_debate_state=research)
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+
+        debate = [turn for turn in t["turns"] if turn["phase"] == "research_debate"]
+        assert [turn["agent_id"] for turn in debate] == ["bull", "bear"]
+        assert debate[1]["content"] == research["bear_history"][1:]
+        assert t["rebuilt"]["split_exact"] is False
+
+    @pytest.mark.parametrize("shape", ["20000 one-character turns", "a 1 MB turn of quotes"])
+    def test_the_split_is_linear_on_pathological_logs(self, shape):
+        if shape.startswith("20000"):
+            research, turns = _debate(["Bull", "Bear"], 10_000, text=lambda name, i: "x")
+        else:
+            quote = "q\nBear Analyst: q"  # a prefix of the next speaker, quoted
+            research, turns = _debate(
+                ["Bull", "Bear"], 1,
+                text=lambda name, i: quote * (1_000_000 // len(quote)) if i == 0 else "y")
+        log, _, _ = make_log(settings=False, investment_debate_state=research)
+
+        began = time.perf_counter()
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+        elapsed = time.perf_counter() - began
+
+        assert t["rebuilt"]["split_exact"] is True
+        assert sum(turn["phase"] == "research_debate" for turn in t["turns"]) == len(turns)
+        assert elapsed < 1.5, f"{shape}: {elapsed:.2f}s"
 
     def test_with_settings_an_empty_field_keeps_its_seat_with_empty_content(self):
         log, _, _ = make_log(investment_plan="", trader_investment_plan=None,
@@ -560,7 +593,8 @@ class TestRoute:
     @pytest.mark.parametrize("body", ["", '{"market_report": "cut sho'])
     def test_an_empty_or_truncated_log_is_read_again_then_a_503(self, client, results,
                                                                  monkeypatch, body):
-        _write_log(results, TICKER, body)
+        path = _write_log(results, TICKER, body)
+        os.utime(path)  # written just now: maybe still being written
         sleeps = []
         monkeypatch.setattr(discussion, "STATE_LOG_RETRY_DELAY", 0)
         monkeypatch.setattr(discussion.time, "sleep", sleeps.append)
@@ -572,9 +606,45 @@ class TestRoute:
                                "detail": "The saved state log is being written; try again."}
         assert sleeps == [0]
 
+    @pytest.mark.parametrize("body", ["", '{"market_report": "cut sho'])
+    def test_an_old_empty_or_truncated_log_is_a_500_without_a_retry(self, client, results,
+                                                                     monkeypatch, body):
+        path = _write_log(results, TICKER, body)
+        old = time.time() - discussion.STATE_LOG_FRESH_SECONDS - 5
+        os.utime(path, (old, old))  # corrupt, not being written
+        monkeypatch.setattr(discussion.time, "sleep",
+                            lambda delay: pytest.fail("retried an old corrupt log"))
+
+        resp = client.get(ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+
+        assert resp.status_code == 500
+        assert resp.json()["error"] == "Could not read the saved state log"
+
+    def test_a_converter_bug_is_a_real_500_with_its_traceback(self, results, monkeypatch,
+                                                               caplog):
+        _write_log(results, TICKER, make_log()[0])
+
+        def broken(state, logged_at):
+            raise ValueError("converter bug")
+
+        monkeypatch.setattr(discussion, "build_rebuilt_transcript", broken)
+        app = create_app(overrides={"results_dir": str(results)})
+        try:
+            with caplog.at_level(logging.ERROR):
+                resp = TestClient(app, raise_server_exceptions=False).get(
+                    ROUTE, params={"ticker": TICKER, "trade_date": TRADE_DATE})
+        finally:
+            app.state.task_worker.shutdown(wait=True)
+
+        assert resp.status_code == 500
+        assert resp.json()["error"] == "Internal server error"
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors and errors[0].exc_info is not None
+
     def test_a_log_finished_during_the_retry_is_served(self, client, results, monkeypatch):
         log, _, _ = make_log()
         path = _write_log(results, TICKER, json.dumps(log)[:50])  # half written
+        os.utime(path)
         monkeypatch.setattr(discussion.time, "sleep",
                             lambda delay: path.write_text(json.dumps(log), encoding="utf-8"))
 
@@ -665,6 +735,7 @@ class TestRoute:
         assert {"404", "422", "500", "503"} <= set(operation["responses"])
         assert "mtime" in operation["description"]
         assert "market, sentiment, news, fundamentals" in operation["description"]
+        assert "must not compare turn numbers" in operation["description"]
 
 
 def test_the_state_repository_dependencies_share_one_object():

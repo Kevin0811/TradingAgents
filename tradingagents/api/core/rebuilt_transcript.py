@@ -33,6 +33,7 @@ analysts are taken in the default order market, sentiment, news, fundamentals.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -139,29 +140,41 @@ def _oracle_split(history: str, sides: list[str], speakers: Sequence[_Speaker]) 
     A cut short of the true end leaves the side on the next speaker's prefix,
     never its own, so the first accepted cut is the true one: a turn quoting
     another speaker's prefix is still split exactly. None when the log disagrees.
+
+    Linear time: the cuts are found lazily, and each character of a turn is
+    compared with its side once (``matched`` only grows; a mismatch below a
+    cut fails every later cut too).
     """
     count = len(speakers)
+    cut_patterns = [
+        re.compile("\n(?=" + "|".join(re.escape(p) for p in prefixes) + ")")
+        for _agent_id, _keys, prefixes in speakers
+    ]
     side_at = [0] * count
     turns: _Turns = []
     at = 0
     while at < len(history):
         k = len(turns) % count
         agent_id, _keys, own = speakers[k]
-        side = sides[k]
-        if not _starts_turn(history, at, own) or not _starts_turn(side, side_at[k], own):
+        side, start = sides[k], side_at[k]
+        if not _starts_turn(history, at, own) or not _starts_turn(side, start, own):
             return None
-        following = speakers[(len(turns) + 1) % count][2]
-        pattern = "\n(?=" + "|".join(re.escape(p) for p in following) + ")"
-        cuts = [m.start() for m in re.compile(pattern).finditer(history, at + 1)]
-        for cut in [*cuts, len(history)]:
-            piece = history[at + 1:cut]
-            after = side_at[k] + 1 + len(piece)
-            if side.startswith("\n" + piece, side_at[k]) and (
-                    after == len(side) or _starts_turn(side, after, own)):
-                break
+        following = cut_patterns[(len(turns) + 1) % count].finditer(history, at + 1)
+        matched = 0  # history[at + 1:][:matched] == side[start + 1:][:matched]
+        for cut in itertools.chain((m.start() for m in following), (len(history),)):
+            length = cut - at - 1
+            after = start + 1 + length
+            if after > len(side):
+                return None  # the side ends inside this cut, and every later one
+            if after != len(side) and not _starts_turn(side, after, own):
+                continue
+            if history[at + 1 + matched:cut] != side[start + 1 + matched:after]:
+                return None
+            matched = length
+            break
         else:
             return None
-        turns.append((agent_id, piece))
+        turns.append((agent_id, history[at + 1:cut]))
         side_at[k] = after
         at = cut
     if any(side_at[k] != len(side) for k, side in enumerate(sides)):
@@ -230,7 +243,8 @@ def _split_debate(
     after the other (exact); the side histories as boundary oracles (exact);
     the cut at every prefix with the known round count (exact). Otherwise not
     exact: one turn per side when every side is there, else each piece of
-    ``history`` to the speaker whose prefix it starts with. Never drops text.
+    ``history`` to the speaker whose prefix it starts with. Never drops text of
+    ``history``: the sides stand in for it only when they hold all of it.
     """
     history = _text(debate.get("history"))
     sides = [_side_history(debate, keys) for _agent_id, keys, _prefixes in speakers]
@@ -245,9 +259,12 @@ def _split_debate(
     counted = _counted_split(history, speakers, rounds)
     if counted is not None:
         return counted, True
-    if all(sides) or not history:
+    if not history:
         return _per_side(speakers, sides), False
-    return _by_prefix(history, speakers), False
+    pieces = _by_prefix(history, speakers)
+    if all(sides) and all(any(text in side for side in sides) for _agent_id, text in pieces):
+        return _per_side(speakers, sides), False
+    return pieces, False
 
 
 def _per_side(speakers: Sequence[_Speaker], sides: list[str]) -> _Turns:
