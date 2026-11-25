@@ -13,7 +13,9 @@ from tradingagents.api.core.exceptions import AnalysisCancelled, AnalysisError
 from tradingagents.api.core.safe_errors import error_text, traceback_is_safe
 from tradingagents.api.domain.analysts import to_core_analyst_keys
 from tradingagents.api.domain.entities import AnalysisResult
+from tradingagents.api.domain.horizon import horizon_context
 from tradingagents.api.domain.services.config_overrides import CLEARED_KEYS
+from tradingagents.api.domain.services.decision_service import pm_time_horizon
 from tradingagents.api.infrastructure.discussion_capture import (
     DISCUSSION_EMITTER,
     TaskEventEmitter,
@@ -76,6 +78,7 @@ class AnalysisService:
         overrides: dict[str, Any] | None = None,
         cancel_event: threading.Event | None = None,
         events: DiscussionLog | None = None,
+        investment_horizon: str | None = None,
     ) -> AnalysisResult:
         """Run the full trading analysis pipeline.
 
@@ -97,6 +100,11 @@ class AnalysisService:
             events: The task's discussion log. When given, the run's turns and
                 tool calls are recorded there (see ``discussion_capture``); any
                 turn still open when the run ends is recorded as aborted.
+            investment_horizon: The caller's horizon ("1w", "1m", "3m", "6m",
+                "12m"), passed to the core as its ``portfolio`` input (see
+                ``tradingagents.api.domain.horizon``), which also keeps a
+                checkpoint from resuming across horizons. None passes no
+                portfolio, as before.
 
         Returns:
             AnalysisResult with all reports and decisions, and the run's token
@@ -144,7 +152,15 @@ class AnalysisService:
             )
             _tag_tiers(graph)
 
-            final_state, signal = graph.propagate(ticker, trade_date, asset_type=asset_type)
+            # Horizon only, never an empty PortfolioContext ("No current position").
+            # Without a horizon the call is exactly the one made before horizons.
+            portfolio = horizon_context(investment_horizon)
+            final_state, signal = graph.propagate(
+                ticker,
+                trade_date,
+                asset_type=asset_type,
+                **({"portfolio": portfolio} if portfolio is not None else {}),
+            )
             if cancel_event is not None and cancel_event.is_set():
                 # Cancelled after its last LLM call: the result is discarded.
                 raise AnalysisCancelled("analysis cancelled")
@@ -161,6 +177,8 @@ class AnalysisService:
                 trader_investment_plan=final_state.get("trader_investment_plan"),
                 final_trade_decision=final_state.get("final_trade_decision"),
                 signal=signal,
+                investment_horizon=portfolio.horizon if portfolio is not None else None,
+                time_horizon=pm_time_horizon(final_state.get("final_trade_decision")),
                 token_usage=usage.summary(partial=False),
             )
 

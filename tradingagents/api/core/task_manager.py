@@ -83,7 +83,11 @@ class TaskManager:
         self._lock = threading.RLock()
 
     def find_active_task(
-        self, ticker: str, trade_date: str, asset_type: str
+        self,
+        ticker: str,
+        trade_date: str,
+        asset_type: str,
+        investment_horizon: str | None = None,
     ) -> TaskResponse | None:
         """Find an existing task with the same parameters that is still running.
 
@@ -91,6 +95,8 @@ class TaskManager:
             ticker: Ticker symbol.
             trade_date: Trade date in YYYY-MM-DD format.
             asset_type: Asset type ('stock' or 'crypto').
+            investment_horizon: The request's horizon (None when unset). A
+                different horizon is a different run, never a duplicate.
 
         Returns:
             Existing TaskResponse if found, None otherwise.
@@ -102,6 +108,7 @@ class TaskManager:
                     and task.ticker == ticker
                     and task.trade_date == trade_date
                     and task.asset_type == asset_type
+                    and task.investment_horizon == investment_horizon
                     and task.status
                     in (TaskStatus.PENDING, TaskStatus.QUEUED, TaskStatus.PROCESSING)
                     # A task being cancelled is not reused: a new request
@@ -132,7 +139,10 @@ class TaskManager:
         with self._lock:
             # Check for duplicate active task
             existing = self.find_active_task(
-                request.ticker, request.trade_date, request.asset_type
+                request.ticker,
+                request.trade_date,
+                request.asset_type,
+                request.investment_horizon,
             )
             if existing is not None:
                 return existing, False
@@ -155,6 +165,7 @@ class TaskManager:
                 ticker=request.ticker,
                 trade_date=request.trade_date,
                 asset_type=request.asset_type,
+                investment_horizon=request.investment_horizon,
                 created_at=now,
                 updated_at=now,
             )

@@ -69,6 +69,65 @@ class ParsedPortfolioDecision(BaseModel):
     time_horizon: str | None = None
 
 
+# What the core writes for a field the Portfolio Manager left out
+# (agents.schemas.render_pm_decision): "**Time Horizon**: not provided".
+_NOT_PROVIDED = "not provided"
+
+
+def parse_portfolio_decision(text: str) -> ParsedPortfolioDecision:
+    """Parse a portfolio decision from markdown text.
+
+    Args:
+        text: Markdown-formatted portfolio decision.
+
+    Returns:
+        Parsed PortfolioDecision. ``rating`` is ``"REVIEW"`` rather than a
+        fabricated ``"Hold"`` when no recognizable rating is found (see
+        tradingagents.agents.rating.extract_rating). ``time_horizon`` is None
+        when the decision has none, or names it "not provided" (the core's
+        rendering of an absent one).
+    """
+    executive_summary = ""
+    investment_thesis = ""
+    price_target = None
+    time_horizon = None
+
+    for line in text.splitlines():
+        line_stripped = line.strip()
+        line_lower = line_stripped.lower()
+        if "**executive summary**" in line_lower or "executive summary:" in line_lower:
+            executive_summary = line_stripped.split(":", 1)[-1].strip()
+        elif "**investment thesis**" in line_lower or "investment thesis:" in line_lower:
+            investment_thesis = line_stripped.split(":", 1)[-1].strip()
+        elif "**price target**" in line_lower or "price target:" in line_lower:
+            price_target = _parse_price(line_stripped.split(":", 1)[-1].strip())
+        elif "**time horizon**" in line_lower or "time horizon:" in line_lower:
+            time_horizon = line_stripped.split(":", 1)[-1].strip()
+
+    if not time_horizon or time_horizon.lower() == _NOT_PROVIDED:
+        time_horizon = None
+    rating = extract_rating(text) or RATING_REVIEW
+
+    return ParsedPortfolioDecision(
+        rating=rating,
+        executive_summary=executive_summary or "Could not parse executive summary from report.",
+        investment_thesis=investment_thesis or "Could not parse investment thesis from report.",
+        price_target=price_target,
+        time_horizon=time_horizon,
+    )
+
+
+def pm_time_horizon(final_trade_decision: str | None) -> str | None:
+    """The portfolio manager's ``time_horizon`` from a run's ``final_trade_decision``.
+
+    The core keeps the decision only as rendered markdown in the state, with a
+    ``**Time Horizon**`` line; None when there is no decision or no horizon.
+    """
+    if not final_trade_decision:
+        return None
+    return parse_portfolio_decision(final_trade_decision).time_horizon
+
+
 class DecisionService:
     """Service for parsing and managing trading decisions."""
 
@@ -195,42 +254,8 @@ class DecisionService:
         )
 
     def parse_portfolio_decision(self, text: str) -> ParsedPortfolioDecision:
-        """Parse a portfolio decision from markdown text.
-
-        Args:
-            text: Markdown-formatted portfolio decision.
-
-        Returns:
-            Parsed PortfolioDecision. ``rating`` is ``"REVIEW"`` rather than a
-            fabricated ``"Hold"`` when no recognizable rating is found (see
-            tradingagents.agents.rating.extract_rating).
-        """
-        executive_summary = ""
-        investment_thesis = ""
-        price_target = None
-        time_horizon = None
-
-        for line in text.splitlines():
-            line_stripped = line.strip()
-            line_lower = line_stripped.lower()
-            if "**executive summary**" in line_lower or "executive summary:" in line_lower:
-                executive_summary = line_stripped.split(":", 1)[-1].strip()
-            elif "**investment thesis**" in line_lower or "investment thesis:" in line_lower:
-                investment_thesis = line_stripped.split(":", 1)[-1].strip()
-            elif "**price target**" in line_lower or "price target:" in line_lower:
-                price_target = _parse_price(line_stripped.split(":", 1)[-1].strip())
-            elif "**time horizon**" in line_lower or "time horizon:" in line_lower:
-                time_horizon = line_stripped.split(":", 1)[-1].strip()
-
-        rating = extract_rating(text) or RATING_REVIEW
-
-        return ParsedPortfolioDecision(
-            rating=rating,
-            executive_summary=executive_summary or "Could not parse executive summary from report.",
-            investment_thesis=investment_thesis or "Could not parse investment thesis from report.",
-            price_target=price_target,
-            time_horizon=time_horizon,
-        )
+        """Parse a portfolio decision from markdown text (see :func:`parse_portfolio_decision`)."""
+        return parse_portfolio_decision(text)
 
     def parse_sentiment_report(self, text: str) -> SentimentReport:
         """Parse a sentiment report from markdown text.

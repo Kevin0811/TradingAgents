@@ -7,12 +7,18 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from tradingagents.api.schemas.enums import InvestmentHorizon
 from tradingagents.api.schemas.overrides import RunOverridesMixin
+from tradingagents.api.schemas.request import (
+    INVESTMENT_HORIZON_DESCRIPTION,
+    TRADE_DATE_DESCRIPTION,
+)
 from tradingagents.api.schemas.token_usage import TokenUsage
 from tradingagents.api.schemas.validators import (
     normalize_asset_type,
     validate_ticker_shape,
     validate_ticker_supported,
+    validate_trade_date,
 )
 
 
@@ -35,7 +41,7 @@ class TaskCreateRequest(RunOverridesMixin):
     """Request body for creating an analysis task."""
 
     ticker: str = Field(..., description="Ticker symbol to analyze (e.g. 'AAPL', 'BTC')")
-    trade_date: str = Field(..., description="Trading date in YYYY-MM-DD format")
+    trade_date: str = Field(..., description=TRADE_DATE_DESCRIPTION)
     asset_type: str = Field(
         default="stock",
         description="Asset type: 'stock' or 'crypto'",
@@ -48,8 +54,13 @@ class TaskCreateRequest(RunOverridesMixin):
         ),
     )
     debug: bool = Field(default=False, description="Enable debug mode with verbose output")
+    investment_horizon: InvestmentHorizon | None = Field(
+        default=None,
+        description=INVESTMENT_HORIZON_DESCRIPTION,
+    )
 
     _validate_ticker = field_validator("ticker")(validate_ticker_shape)
+    _validate_trade_date = field_validator("trade_date")(validate_trade_date)
     _normalize_asset_type = field_validator("asset_type", mode="before")(normalize_asset_type)
     _check_ticker_supported = model_validator(mode="after")(validate_ticker_supported)
 
@@ -62,6 +73,14 @@ class TaskResponse(BaseModel):
     ticker: str
     trade_date: str
     asset_type: str
+    investment_horizon: InvestmentHorizon | None = Field(
+        default=None,
+        description=(
+            "The request's investment_horizon (null when none was sent). Two "
+            "requests with different horizons are different tasks; the result "
+            "echoes it too."
+        ),
+    )
     created_at: datetime
     updated_at: datetime | None = None
     completed_at: datetime | None = None

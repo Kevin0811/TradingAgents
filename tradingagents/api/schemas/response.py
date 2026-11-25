@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # Re-use structured schemas from agents package
 from tradingagents.agents.schemas import SentimentReport, TraderProposal
+from tradingagents.api.schemas.enums import InvestmentHorizon
 from tradingagents.api.schemas.token_usage import TokenUsage
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,17 @@ class AnalyzeResponse(BaseModel):
     trader_investment_plan: str | None = None
     final_trade_decision: str | None = None
     signal: str | None = None
+    investment_horizon: InvestmentHorizon | None = Field(
+        default=None,
+        description="The request's investment_horizon, echoed; null when none was sent.",
+    )
+    time_horizon: str | None = Field(
+        default=None,
+        description=(
+            "The portfolio manager's recommended holding period, free text as it wrote "
+            "it (e.g. '3-6 months'); null when it gave none."
+        ),
+    )
     token_usage: TokenUsage | None = Field(
         default=None,
         description=(

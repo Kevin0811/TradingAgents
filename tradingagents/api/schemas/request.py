@@ -8,6 +8,7 @@ from tradingagents.api.schemas.enums import (
     AnalystType,
     AssetType,
     IndicatorName,
+    InvestmentHorizon,
     ReportFreq,
     ReportType,
 )
@@ -16,6 +17,19 @@ from tradingagents.api.schemas.validators import (
     normalize_asset_type,
     validate_ticker_shape,
     validate_ticker_supported,
+    validate_trade_date,
+)
+
+# Shared by the run requests (AnalyzeRequest, TaskCreateRequest, SingleAnalystRequest).
+TRADE_DATE_DESCRIPTION = (
+    "Trading date in YYYY-MM-DD format; not after today (the server's date, UTC in "
+    "the container). A non-canonical or future date is refused with 422."
+)
+INVESTMENT_HORIZON_DESCRIPTION = (
+    "Optional holding horizon the decision agents (trader, risk debaters, portfolio "
+    "manager) weigh the call against: '1w', '1m', '3m', '6m' or '12m'. Omitted or "
+    "null: no horizon is given to the agents. Echoed in the result as "
+    "`investment_horizon`, beside the portfolio manager's own `time_horizon`."
 )
 
 
@@ -23,7 +37,7 @@ class AnalyzeRequest(RunOverridesMixin):
     """Request body for the full analysis pipeline."""
 
     ticker: str = Field(..., description="Ticker symbol to analyze (e.g. 'AAPL', 'BTC')")
-    trade_date: str = Field(..., description="Trading date in YYYY-MM-DD format")
+    trade_date: str = Field(..., description=TRADE_DATE_DESCRIPTION)
     asset_type: AssetType = Field(
         default=AssetType.STOCK,
         description="Asset type: 'stock' or 'crypto'",
@@ -41,8 +55,13 @@ class AnalyzeRequest(RunOverridesMixin):
         ),
     )
     debug: bool = Field(default=False, description="Enable debug mode with verbose output")
+    investment_horizon: InvestmentHorizon | None = Field(
+        default=None,
+        description=INVESTMENT_HORIZON_DESCRIPTION,
+    )
 
     _validate_ticker = field_validator("ticker")(validate_ticker_shape)
+    _validate_trade_date = field_validator("trade_date")(validate_trade_date)
     _normalize_asset_type = field_validator("asset_type", mode="before")(normalize_asset_type)
     _check_ticker_supported = model_validator(mode="after")(validate_ticker_supported)
 
@@ -51,11 +70,15 @@ class SingleAnalystRequest(BaseModel):
     """Request body for individual analyst endpoints."""
 
     ticker: str = Field(..., description="Ticker symbol to analyze")
-    trade_date: str = Field(..., description="Trading date in YYYY-MM-DD format")
+    trade_date: str = Field(..., description=TRADE_DATE_DESCRIPTION)
     asset_type: AssetType = Field(
         default=AssetType.STOCK,
         description="Asset type: 'stock' or 'crypto'",
     )
+
+    # The graph-backed analysts start from the core's create_run_state, which
+    # refuses such a date; the market analyst is held to the same rule.
+    _validate_trade_date = field_validator("trade_date")(validate_trade_date)
 
 
 class StockDataRequest(BaseModel):

@@ -43,6 +43,10 @@ class AnalysisResult:
     trader_investment_plan: str | None = None
     final_trade_decision: str | None = None
     signal: str | None = None
+    # The request's investment horizon ("1w" ... "12m"), echoed; None when unset.
+    investment_horizon: str | None = None
+    # The portfolio manager's own time horizon, as written; None when it gave none.
+    time_horizon: str | None = None
     # The run's token usage (see schemas.token_usage.TokenUsage).
     token_usage: dict[str, Any] | None = None
 
@@ -64,6 +68,8 @@ class AnalysisResult:
             "trader_investment_plan": self.trader_investment_plan,
             "final_trade_decision": self.final_trade_decision,
             "signal": self.signal,
+            "investment_horizon": self.investment_horizon,
+            "time_horizon": self.time_horizon,
         }
 
 

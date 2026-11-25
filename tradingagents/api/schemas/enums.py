@@ -28,6 +28,21 @@ class AnalystType(StrEnum):
     FUNDAMENTALS = "fundamentals"
 
 
+class InvestmentHorizon(StrEnum):
+    """How far ahead the caller will hold the position an analysis is for.
+
+    A run input, not a config key: it reaches the trader, the risk debaters and
+    the portfolio manager as a fixed sentence per value (see
+    ``tradingagents.api.domain.horizon``), never as caller text.
+    """
+
+    ONE_WEEK = "1w"
+    ONE_MONTH = "1m"
+    THREE_MONTHS = "3m"
+    SIX_MONTHS = "6m"
+    TWELVE_MONTHS = "12m"
+
+
 class ReportType(StrEnum):
     """Type of fundamental data to retrieve."""
 
