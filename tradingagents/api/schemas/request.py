@@ -23,7 +23,9 @@ from tradingagents.api.schemas.validators import (
 # Shared by the run requests (AnalyzeRequest, TaskCreateRequest, SingleAnalystRequest).
 TRADE_DATE_DESCRIPTION = (
     "Trading date in YYYY-MM-DD format; not after today (the server's date, UTC in "
-    "the container). A non-canonical or future date is refused with 422."
+    "the container). A non-canonical or future date is refused with 422. The bound is "
+    "the server's date in UTC: a client east of UTC must send the UTC date, not its "
+    "local one."
 )
 INVESTMENT_HORIZON_DESCRIPTION = (
     "Optional holding horizon the decision agents (trader, risk debaters, portfolio "

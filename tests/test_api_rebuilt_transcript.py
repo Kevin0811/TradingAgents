@@ -382,6 +382,21 @@ class TestConverter:
         }
         assert t["turns"][-1]["truncated"]  # the turn is capped, its fingerprint is not
 
+    def test_the_horizons_beside_the_transcript(self):
+        """investment_horizon is unknown to a log; time_horizon is the PM's, parsed."""
+        log, _, _ = make_log(final_trade_decision=(
+            "**Rating**: Buy\n\n**Time Horizon**: 3-6 months"))
+        t = build_rebuilt_transcript(log, LOGGED_AT)
+        assert t["investment_horizon"] is None
+        assert t["time_horizon"] == "3-6 months"
+        assert "time_horizon" not in t["run_started"]
+        assert "investment_horizon" not in t["run_started"]
+
+        not_provided, _, _ = make_log(final_trade_decision=(
+            "**Rating**: Buy\n\n**Time Horizon**: not provided"))
+        assert build_rebuilt_transcript(not_provided, LOGGED_AT)["time_horizon"] is None
+        assert build_rebuilt_transcript(make_log()[0], LOGGED_AT)["time_horizon"] is None
+
     def test_old_trader_key_is_fingerprinted_under_the_result_name(self):
         log, _, _ = make_log(old=True)
         fingerprints = build_rebuilt_transcript(log, LOGGED_AT)["rebuilt"]["fingerprints"]
@@ -528,7 +543,8 @@ class TestRoute:
         body = resp.json()
         assert body == build_rebuilt_transcript(log, LOGGED_AT)
         assert set(body) == {"v", "mapping_version", "status", "run_started", "turns",
-                             "tools_dropped", "events_dropped", "rebuilt"}
+                             "tools_dropped", "events_dropped", "investment_horizon",
+                             "time_horizon", "rebuilt"}
         assert body["rebuilt"]["logged_at"] == "2026-01-10T03:04:05Z"
         assert len(body["turns"]) == 12
 

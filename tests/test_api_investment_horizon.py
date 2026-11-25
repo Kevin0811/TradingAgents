@@ -10,6 +10,7 @@ or in the future).
 
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -215,9 +216,17 @@ class TestThreadingAndResult:
     def test_absent_horizon_passes_no_portfolio(self):
         with patch(GRAPH, _graph()) as graph_cls:
             result = AnalysisService().run_analysis("AAPL", "2026-06-01")
-        assert _portfolio_passed(graph_cls) is None
+        # Not even portfolio=None: the call is exactly the one made before horizons.
+        assert "portfolio" not in graph_cls.return_value.propagate.call_args.kwargs
         assert result.to_dict()["investment_horizon"] is None
         assert result.to_dict()["time_horizon"] is None
+
+    def test_time_horizon_is_filled_without_a_request_horizon(self):
+        state = {"final_trade_decision": PM_DECISION}
+        with patch(GRAPH, _graph(state)):
+            result = AnalysisService().run_analysis("AAPL", "2026-06-01")
+        assert result.to_dict()["investment_horizon"] is None
+        assert result.to_dict()["time_horizon"] == "6-9 months"
 
     def test_horizon_reaches_propagate_and_result(self):
         state = {"final_trade_decision": PM_DECISION}
@@ -325,6 +334,38 @@ class TestTimeHorizon:
         parsed = parse_portfolio_decision("**Rating**: Buy\n**Time Horizon**: Not provided")
         assert parsed.time_horizon is None
 
+    def test_a_colon_inside_the_bold_leaves_no_stray_asterisks(self):
+        text = (
+            "**Rating:** Buy\n"
+            "**Executive Summary:** Add on weakness.\n"
+            "**Investment Thesis:** Margins recover.\n"
+            "**Price Target:** 210.5\n"
+            "**Time Horizon:** 6 months"
+        )
+        parsed = parse_portfolio_decision(text)
+        assert parsed.time_horizon == "6 months"
+        assert parsed.executive_summary == "Add on weakness."
+        assert parsed.investment_thesis == "Margins recover."
+        assert parsed.price_target == 210.5
+        assert pm_time_horizon("**Time Horizon:** not provided") is None
+
+    def test_portfolio_decision_route_gives_null_for_not_provided(self, tmp_path):
+        folder = tmp_path / "AAPL" / "TradingAgentsStrategy_logs"
+        folder.mkdir(parents=True)
+        decision = "**Rating**: Hold\n\n**Time Horizon**: not provided"
+        (folder / "full_states_log_2026-06-01.json").write_text(
+            json.dumps({"final_trade_decision": decision}), encoding="utf-8")
+        app = create_app(overrides={"results_dir": str(tmp_path)})
+        try:
+            resp = TestClient(app).get(
+                "/api/v1/decisions/portfolio-decision",
+                params={"ticker": "AAPL", "trade_date": "2026-06-01"})
+        finally:
+            app.state.task_worker.shutdown(wait=True)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["rating"] == "Hold"
+        assert resp.json()["time_horizon"] is None
+
 
 # ---------------------------------------------------------------------------
 # trade_date at request time
@@ -346,15 +387,20 @@ class TestTradeDate:
 
     @pytest.mark.parametrize("model", MODELS)
     def test_the_future_is_refused(self, model):
-        with pytest.raises(ValidationError, match="future"):
+        with pytest.raises(ValidationError, match="future") as excinfo:
             model(ticker="AAPL", trade_date=self._tomorrow())
+        (error,) = excinfo.value.errors()
+        assert error["type"] == "trade_date_in_future"
+        assert error["ctx"]["today"] == date_window.get_current_date()
 
     @pytest.mark.parametrize("model", MODELS)
     @pytest.mark.parametrize("bad", ["2026-1-5", "2026-02-30", "20260105", "2026/01/05",
                                      " 2026-01-05", ""])
     def test_non_canonical_is_refused(self, model, bad):
-        with pytest.raises(ValidationError, match="YYYY-MM-DD"):
+        with pytest.raises(ValidationError, match="YYYY-MM-DD") as excinfo:
             model(ticker="AAPL", trade_date=bad)
+        (error,) = excinfo.value.errors()
+        assert error["type"] == "trade_date_invalid"
 
     def test_the_bound_is_the_cores_clock(self, monkeypatch):
         monkeypatch.setattr(date_window, "get_current_date", lambda: "2026-03-01")
@@ -373,17 +419,27 @@ class TestTradeDate:
         assert trading_graph.get_current_date is date_window.get_current_date
 
     @pytest.mark.parametrize("path", [TASKS, "/api/v1/analyze"])
-    @pytest.mark.parametrize("bad", ["2026-1-5", "future"])
-    def test_refused_with_422_over_http(self, path, bad):
+    @pytest.mark.parametrize(
+        ("bad", "error_type"),
+        [("2026-1-5", "trade_date_invalid"), ("future", "trade_date_in_future")],
+    )
+    def test_refused_with_422_over_http(self, path, bad, error_type):
         trade_date = self._tomorrow() if bad == "future" else bad
         with patch(GRAPH, _graph()) as graph_cls:
             resp = TestClient(create_app()).post(
                 path, json={"ticker": "AAPL", "trade_date": trade_date})
         assert resp.status_code == 422, resp.text
         assert "trade_date" in resp.text
+        assert _error_types(resp) == [error_type]
         graph_cls.assert_not_called()
 
     def test_analyst_endpoint_refuses_the_future(self):
         resp = TestClient(create_app()).post(
             "/api/v1/analysts/news", json={"ticker": "AAPL", "trade_date": self._tomorrow()})
         assert resp.status_code == 422, resp.text
+        assert _error_types(resp) == ["trade_date_in_future"]
+
+
+def _error_types(resp) -> list[str]:
+    """The ``type`` of each error in a 422 body (FastAPI's ``detail`` list)."""
+    return [error["type"] for error in resp.json()["detail"]]

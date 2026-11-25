@@ -22,6 +22,11 @@ round with every side history, one turn per side is exact). Otherwise each side
 is one turn, or, with sides missing, each piece of ``history`` goes to the
 speaker whose prefix it starts with; ``split_exact`` is false and no text is dropped.
 
+Beside the transcript (not in ``run_started``, which stays equal to live capture's):
+``investment_horizon`` is always None, as the core's log keeps no
+``portfolio_context``; ``time_horizon`` is the portfolio manager's, read from the
+logged ``final_trade_decision`` (None when it gave none).
+
 Empty fields: with ``run_settings`` the run's seats are known, and a seat whose
 field is empty keeps a turn with ``""`` content, as live capture records an
 empty ``on_chain_end`` (the analysts named in the settings, the research
@@ -40,6 +45,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from tradingagents.api.core.discussion_log import SCHEMA_VERSION
+from tradingagents.api.domain.services.decision_service import pm_time_horizon
 from tradingagents.api.infrastructure.discussion_capture import (
     FINAL_AGENT_ID,
     MAPPING,
@@ -414,6 +420,10 @@ def build_rebuilt_transcript(state: dict[str, Any], logged_at: datetime | None) 
         "turns": turns,
         "tools_dropped": 0,
         "events_dropped": 0,
+        # As the /analyze result names them. The log has no portfolio_context, so
+        # the request's horizon is unknown; the PM's is read from its decision.
+        "investment_horizon": None,
+        "time_horizon": pm_time_horizon(_text(state.get("final_trade_decision"))),
         "rebuilt": {
             "logged_at": _iso(logged_at),
             "settings_known": settings is not None,

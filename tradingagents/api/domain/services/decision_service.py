@@ -74,6 +74,15 @@ class ParsedPortfolioDecision(BaseModel):
 _NOT_PROVIDED = "not provided"
 
 
+def _field_value(line: str) -> str:
+    """The text after a ``Label:`` line's first colon, without stray bold markers.
+
+    ``**Time Horizon:** 6 months`` (colon inside the bold) leaves ``** 6 months``
+    after the colon; the ``*`` around the value are dropped, so it reads ``6 months``.
+    """
+    return line.split(":", 1)[-1].strip().strip("*").strip()
+
+
 def parse_portfolio_decision(text: str) -> ParsedPortfolioDecision:
     """Parse a portfolio decision from markdown text.
 
@@ -96,13 +105,13 @@ def parse_portfolio_decision(text: str) -> ParsedPortfolioDecision:
         line_stripped = line.strip()
         line_lower = line_stripped.lower()
         if "**executive summary**" in line_lower or "executive summary:" in line_lower:
-            executive_summary = line_stripped.split(":", 1)[-1].strip()
+            executive_summary = _field_value(line_stripped)
         elif "**investment thesis**" in line_lower or "investment thesis:" in line_lower:
-            investment_thesis = line_stripped.split(":", 1)[-1].strip()
+            investment_thesis = _field_value(line_stripped)
         elif "**price target**" in line_lower or "price target:" in line_lower:
-            price_target = _parse_price(line_stripped.split(":", 1)[-1].strip())
+            price_target = _parse_price(_field_value(line_stripped))
         elif "**time horizon**" in line_lower or "time horizon:" in line_lower:
-            time_horizon = line_stripped.split(":", 1)[-1].strip()
+            time_horizon = _field_value(line_stripped)
 
     if not time_horizon or time_horizon.lower() == _NOT_PROVIDED:
         time_horizon = None

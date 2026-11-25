@@ -29,7 +29,8 @@ router = APIRouter(
         "produces a detailed market report.\n\n"
         "**Parameters:**\n"
         "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
-        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `trade_date`: Date in YYYY-MM-DD format; must be canonical YYYY-MM-DD and "
+        "not in the future (422)\n"
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
@@ -62,7 +63,8 @@ def market_analyst(
         "confidence level, and detailed narrative.\n\n"
         "**Parameters:**\n"
         "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
-        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `trade_date`: Date in YYYY-MM-DD format; must be canonical YYYY-MM-DD and "
+        "not in the future (422)\n"
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
@@ -95,7 +97,8 @@ def sentiment_analyst(
         "actionable insights.\n\n"
         "**Parameters:**\n"
         "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
-        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `trade_date`: Date in YYYY-MM-DD format; must be canonical YYYY-MM-DD and "
+        "not in the future (422)\n"
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
@@ -128,7 +131,8 @@ def news_analyst(
         "fundamentals report with valuation insights.\n\n"
         "**Parameters:**\n"
         "- `ticker`: Stock/crypto symbol (e.g., 'AAPL', 'BTC')\n"
-        "- `trade_date`: Date in YYYY-MM-DD format\n"
+        "- `trade_date`: Date in YYYY-MM-DD format; must be canonical YYYY-MM-DD and "
+        "not in the future (422)\n"
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock')"
     ),
 )
