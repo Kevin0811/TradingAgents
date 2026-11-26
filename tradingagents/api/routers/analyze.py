@@ -67,7 +67,15 @@ DISCONNECT_POLL_SECONDS = 1.0
         "- `asset_type`: 'stock' or 'crypto' (default: 'stock'), case-insensitive\n"
         "- `selected_analysts`: List of 'market', 'social', 'news', 'fundamentals' "
         "(default: all four; 'sentiment' is accepted as an alias of 'social')\n"
-        "- `debug`: Enable debug mode (default: false)\n\n"
+        "- `debug`: Enable debug mode (default: false)\n"
+        "- `investment_horizon`: optional '1w'/'1m'/'3m'/'6m'/'12m'; the trader, risk "
+        "debaters and portfolio manager weigh the call over that horizon. Echoed in "
+        "the response, beside the portfolio manager's own `time_horizon`\n\n"
+        "`trade_date` must be canonical YYYY-MM-DD and not in the future (422).\n\n"
+        "Runs that differ only in `investment_horizon` are separate runs, but the core "
+        "keeps one memory-log entry and one state log per ticker and trade_date, so "
+        "they share those: the later run overwrites the state log, and the memory log "
+        "keeps the first decision.\n\n"
         "**Performance overrides (all optional; see `GET /config` for current server "
         "defaults):**\n"
         "- `research_depth`: 'shallow'/'medium'/'deep' preset for debate/risk rounds "
@@ -142,6 +150,7 @@ async def analyze(
         selected_analysts=selected,
         overrides=overrides,
         cancel_event=cancel_event,
+        investment_horizon=request.investment_horizon,
     )
 
     sync_runs: SyncRuns = http_request.app.state.sync_runs
@@ -221,7 +230,8 @@ async def _await_run(
     description=(
         "Create a new analysis task that runs in the background. "
         "Returns immediately with a task_id. "
-        "If a task with the same ticker, trade_date, and asset_type is already "
+        "If a task with the same ticker, trade_date, asset_type and "
+        "investment_horizon is already "
         "active (pending, queued, or processing), returns the existing task_id instead "
         "of creating a duplicate.\n\n"
         "If the task queue is full (task_max_tasks limit exceeded), returns "
@@ -231,6 +241,15 @@ async def _await_run(
         "Use `GET /analyze/tasks/{task_id}` to check the status and retrieve "
         "results when completed, and `POST /analyze/tasks/{task_id}/cancel` to "
         "stop it.\n\n"
+        "`investment_horizon` (optional: '1w', '1m', '3m', '6m', '12m') is given to "
+        "the trader, the risk debaters and the portfolio manager; the completed "
+        "task's `result` echoes it as `investment_horizon` and carries the portfolio "
+        "manager's own `time_horizon` (free text, or null). `trade_date` must be "
+        "canonical YYYY-MM-DD and not in the future (422).\n\n"
+        "Runs that differ only in `investment_horizon` are separate tasks, but the core "
+        "keeps one memory-log entry and one state log per ticker and trade_date, so "
+        "they share those: the later run overwrites the state log, and the memory log "
+        "keeps the first decision.\n\n"
         "The ticker is checked against the supported-symbols list before anything is "
         "queued; see the 422 response (`ticker_not_supported`) and `GET /symbols/check`."
     ),

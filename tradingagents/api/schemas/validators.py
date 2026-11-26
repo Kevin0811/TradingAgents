@@ -27,13 +27,17 @@ Two layers:
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic_core import PydanticCustomError
 
 from tradingagents.api.domain.symbols import api_forex_symbol, is_bare_numeric
+from tradingagents.dataflows.date_window import get_current_date
 
 TICKER_NOT_SUPPORTED = "ticker_not_supported"
+TRADE_DATE_INVALID = "trade_date_invalid"
+TRADE_DATE_IN_FUTURE = "trade_date_in_future"
 TICKER_NOT_SUPPORTED_MESSAGE = (
     "'{ticker}' is not on the supported {market} symbol list (see GET /symbols).{hint}"
 )
@@ -82,6 +86,36 @@ def validate_ticker_shape(v: str) -> str:
             f"other exchanges.{hint}"
         )
     return api_forex_symbol(v) or v
+
+
+def validate_trade_date(v: str) -> str:
+    """Reject a run date the core would refuse: non-canonical, or in the future.
+
+    Canonical means exactly ``YYYY-MM-DD`` (``2026-1-5`` and ``2026-02-30`` are
+    refused). "Future" is after ``get_current_date()``, the same bound the core
+    checks, so a date accepted here is never refused by the run.
+
+    Raises a ``trade_date_invalid`` or ``trade_date_in_future`` error (HTTP 422);
+    ``ctx`` carries ``trade_date`` (as sent), and ``today`` for the latter.
+    """
+    try:
+        canonical = datetime.strptime(v, "%Y-%m-%d").strftime("%Y-%m-%d") == v
+    except ValueError:
+        canonical = False
+    if not canonical:
+        raise PydanticCustomError(
+            TRADE_DATE_INVALID,
+            "trade_date must be a date in YYYY-MM-DD format, got '{trade_date}'",
+            {"trade_date": v},
+        )
+    today = get_current_date()
+    if v > today:
+        raise PydanticCustomError(
+            TRADE_DATE_IN_FUTURE,
+            "trade_date cannot be in the future: {trade_date} is after {today}",
+            {"trade_date": v, "today": today},
+        )
+    return v
 
 
 def ticker_not_supported_error(decision: Any) -> PydanticCustomError:

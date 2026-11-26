@@ -103,6 +103,7 @@ class TaskService:
                 selected_analysts=tuple(request.selected_analysts),
                 overrides=resolve_overrides(request),
                 cancel_event=cancel_event,
+                investment_horizon=request.investment_horizon,
                 **({"events": log} if log is not None else {}),
             )
 
